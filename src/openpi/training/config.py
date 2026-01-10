@@ -640,6 +640,24 @@ _CONFIGS = [
             ),
         ),
     ),
+    TrainConfig(
+        name="pi05_droid_joinpos",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="droid"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+                outputs=[
+                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    droid_policy.DroidOutputs(),
+                ],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
     #
     # Fine-tuning Libero configs.
     #
