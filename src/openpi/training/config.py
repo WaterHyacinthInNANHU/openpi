@@ -663,6 +663,111 @@ _CONFIGS = [
         ),
     ),
     TrainConfig(
+        name="pi0_fast_droid_joinpos_simeval_test",
+        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="mingxuanyan/test_simeval_droid",
+            assets=AssetsConfig(),  # No asset_id so it uses repo_id path
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    # Repack LeRobot flat keys to observation/ prefixed format
+                    _transforms.RepackTransform({
+                        "observation/joint_position": "joint_position",
+                        "observation/gripper_position": "gripper_position",
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "actions": "actions",
+                        "prompt": "task",  # Map task to prompt
+                    }),
+                    droid_policy.DroidInputs(model_type=ModelType.PI0_FAST),
+                ],
+                outputs=[
+                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    droid_policy.DroidOutputs(),
+                ],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
+    TrainConfig(
+        name="pi05_droid_joinpos_simeval_test",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=SimpleDataConfig(
+            repo_id="mingxuanyan/test_simeval_droid",
+            assets=AssetsConfig(),  # No asset_id so it uses repo_id path
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    # Repack LeRobot flat keys to observation/ prefixed format
+                    _transforms.RepackTransform({
+                        "observation/joint_position": "joint_position",
+                        "observation/gripper_position": "gripper_position",
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "actions": "actions",
+                        "prompt": "task",  # Map task to prompt
+                    }),
+                    droid_policy.DroidInputs(model_type=ModelType.PI05),
+                ],
+                outputs=[
+                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    droid_policy.DroidOutputs(),
+                ],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
+    TrainConfig(
+        name="pi05_droid_simeval_lora",
+        model=pi0_config.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=SimpleDataConfig(
+            repo_id="mingxuanyan/test_simeval_droid",  # Change this to your dataset
+            assets=AssetsConfig(),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    # Repack LeRobot flat keys to observation/ prefixed format expected by DROID policy
+                    _transforms.RepackTransform({
+                        "observation/joint_position": "joint_position",
+                        "observation/gripper_position": "gripper_position",
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "actions": "actions",
+                        "prompt": "task",
+                    }),
+                    droid_policy.DroidInputs(model_type=ModelType.PI05),
+                ],
+                outputs=[
+                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute)
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    droid_policy.DroidOutputs(),
+                ],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        # Base π₀.5-DROID checkpoint (delta actions)
+        # For joinpos (absolute actions), use: "gs://openpi-assets/checkpoints/pi05_droid_joinpos/params"
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,  # Turn off EMA for LoRA fine-tuning
+        batch_size=8,  # Reduced batch size for memory efficiency
+        num_train_steps=5000,  # Adjust based on your dataset size
+    ),
+    TrainConfig(
         name="pi05_droid",
         model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
         data=SimpleDataConfig(
