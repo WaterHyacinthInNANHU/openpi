@@ -4,8 +4,9 @@ End-to-end fine-tuning script for SimEval DROID recordings.
 
 This script automates the complete pipeline:
 1. Convert HDF5 trajectories → LeRobot format
-2. Compute normalization statistics
-3. Fine-tune the model
+2. (Optional) Visualize dataset
+3. Compute normalization statistics
+4. Fine-tune the model
 
 Usage:
     python scripts/finetune_from_simeval.py \
@@ -20,6 +21,8 @@ Example:
         --repo_id mingxuanyan/simeval_scene1_droid \
         --config pi05_droid_simeval_lora \
         --exp_name scene1_lora_v1 \
+        --dataset_dir /data/datasets \
+        --visualize \
         --push_to_hub \
         --overwrite
 """
@@ -29,6 +32,11 @@ import subprocess
 import sys
 import os
 from pathlib import Path
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 
 def run_command(cmd: list, env: dict = None, description: str = ""):
@@ -44,7 +52,137 @@ def run_command(cmd: list, env: dict = None, description: str = ""):
     return result
 
 
-def convert_to_lerobot(input_dir: str, repo_id: str, push_to_hub: bool):
+def visualize_dataset(repo_id: str, output_dir: str = "dataset_visualizations", local_dir: str = None):
+    """Visualize the converted LeRobot dataset."""
+    print("\n" + "="*70)
+    print("OPTIONAL: Visualizing Dataset")
+    print("="*70)
+
+    try:
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+        # Load dataset
+        print(f"Loading dataset: {repo_id}")
+        load_kwargs = {"repo_id": repo_id}
+        if local_dir:
+            # Use the full path to the dataset
+            dataset_path = Path(local_dir) / repo_id
+            load_kwargs["root"] = str(dataset_path)
+            print(f"Using custom dataset directory: {dataset_path}")
+
+        dataset = LeRobotDataset(**load_kwargs)
+
+        # Create output directory
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Print dataset statistics
+        print("\n" + "-"*60)
+        print("Dataset Statistics")
+        print("-"*60)
+        print(f"Total frames: {len(dataset)}")
+        print(f"Number of episodes: {dataset.num_episodes}")
+        print(f"FPS: {dataset.fps}")
+
+        # Episode lengths
+        episode_lengths = []
+        for ep_idx in range(dataset.num_episodes):
+            start = dataset.episode_data_index["from"][ep_idx].item()
+            end = dataset.episode_data_index["to"][ep_idx].item()
+            episode_lengths.append(end - start)
+
+        print(f"\nEpisode lengths:")
+        print(f"  Min: {min(episode_lengths)} frames")
+        print(f"  Max: {max(episode_lengths)} frames")
+        print(f"  Mean: {np.mean(episode_lengths):.1f} frames")
+        print("-"*60)
+
+        # Visualize each episode
+        for ep_idx in range(min(dataset.num_episodes, 5)):  # Limit to first 5 episodes
+            print(f"\nVisualizing episode {ep_idx}...")
+
+            episode_start = dataset.episode_data_index["from"][ep_idx].item()
+            episode_end = dataset.episode_data_index["to"][ep_idx].item()
+            episode_length = episode_end - episode_start
+
+            # Sample frames evenly across episode
+            num_frames = min(8, episode_length)
+            frame_indices = np.linspace(episode_start, episode_end - 1, num_frames, dtype=int).tolist()
+
+            # Create visualization
+            fig = plt.figure(figsize=(20, 12))
+            gs = GridSpec(4, num_frames, figure=fig, hspace=0.4, wspace=0.3)
+
+            # Plot frames
+            for col_idx, frame_idx in enumerate(frame_indices):
+                frame = dataset[frame_idx]
+
+                # External camera
+                ax_ext = fig.add_subplot(gs[0, col_idx])
+                img_ext = frame["exterior_image_1_left"].permute(1, 2, 0).numpy()
+                ax_ext.imshow(img_ext)
+                ax_ext.set_title(f"Frame {frame_idx - episode_start}\nExternal", fontsize=8)
+                ax_ext.axis('off')
+
+                # Wrist camera
+                ax_wrist = fig.add_subplot(gs[1, col_idx])
+                img_wrist = frame["wrist_image_left"].permute(1, 2, 0).numpy()
+                ax_wrist.imshow(img_wrist)
+                ax_wrist.set_title("Wrist", fontsize=8)
+                ax_wrist.axis('off')
+
+            # Plot joint positions over time
+            ax_joints = fig.add_subplot(gs[2, :])
+            joint_positions = []
+            for idx in range(episode_start, episode_end):
+                joint_positions.append(dataset[idx]["joint_position"].numpy())
+            joint_positions = np.array(joint_positions)
+
+            for i in range(7):
+                ax_joints.plot(joint_positions[:, i], label=f"Joint {i+1}", alpha=0.7)
+            ax_joints.set_xlabel("Frame")
+            ax_joints.set_ylabel("Position (rad)")
+            ax_joints.set_title("Joint Positions Over Episode")
+            ax_joints.legend(ncol=7, fontsize=8)
+            ax_joints.grid(True, alpha=0.3)
+
+            # Plot actions over time
+            ax_actions = fig.add_subplot(gs[3, :])
+            actions = []
+            for idx in range(episode_start, episode_end):
+                actions.append(dataset[idx]["actions"].numpy())
+            actions = np.array(actions)
+
+            for i in range(min(8, actions.shape[1])):
+                label = f"Joint {i+1}" if i < 7 else "Gripper"
+                ax_actions.plot(actions[:, i], label=label, alpha=0.7)
+            ax_actions.set_xlabel("Frame")
+            ax_actions.set_ylabel("Action")
+            ax_actions.set_title("Actions Over Episode")
+            ax_actions.legend(ncol=8, fontsize=8)
+            ax_actions.grid(True, alpha=0.3)
+
+            task_name = dataset[episode_start]['task']
+            plt.suptitle(f"Episode {ep_idx}: {task_name}",
+                        fontsize=14, fontweight='bold')
+            plt.tight_layout()
+
+            output_file = output_path / f"episode_{ep_idx}_visualization.png"
+            plt.savefig(output_file, dpi=150, bbox_inches='tight')
+            print(f"  Saved: {output_file}")
+            plt.close()
+
+        if dataset.num_episodes > 5:
+            print(f"\n(Visualized first 5 of {dataset.num_episodes} episodes)")
+
+        print(f"\n✅ Visualizations saved to: {output_path}")
+
+    except Exception as e:
+        print(f"\n⚠️  Warning: Dataset visualization failed: {e}")
+        print("Continuing with pipeline...")
+
+
+def convert_to_lerobot(input_dir: str, repo_id: str, push_to_hub: bool, local_dir: str = None):
     """Convert HDF5 trajectories to LeRobot format."""
     print("\n" + "="*70)
     print("STEP 1: Converting HDF5 → LeRobot format")
@@ -59,6 +197,9 @@ def convert_to_lerobot(input_dir: str, repo_id: str, push_to_hub: bool):
 
     if push_to_hub:
         cmd.append("--push_to_hub")
+
+    if local_dir:
+        cmd.extend(["--local_dir", local_dir])
 
     run_command(cmd, description="Converting trajectories to LeRobot format")
     print("✅ Conversion complete!")
@@ -162,11 +303,7 @@ def print_next_steps(config: str, exp_name: str, repo_id: str):
     print(f"       --policy_host <your_host> \\")
     print(f"       --policy_port 9002")
 
-    print("\n4️⃣  Visualize dataset (optional):")
-    print("   " + "-"*66)
-    print(f"   cd ../RegraspGen/my_regrasp")
-    print(f"   # Edit visualize_simeval_dataset.py line 126 to use '{repo_id}'")
-    print(f"   python scripts/visualize_simeval_dataset.py")
+    print("\n💡 TIP: To visualize the dataset, re-run with --visualize flag")
 
     print("\n" + "="*70 + "\n")
 
@@ -183,6 +320,16 @@ Examples:
       --repo_id mingxuanyan/simeval_scene1_droid \\
       --config pi05_droid_simeval_lora \\
       --exp_name scene1_lora_v1 \\
+      --overwrite
+
+  # With custom dataset directory and visualization
+  python scripts/finetune_from_simeval.py \\
+      --input_dir ../RegraspGen/my_regrasp/recorded_trajectories/scene1 \\
+      --repo_id mingxuanyan/simeval_scene1_droid \\
+      --config pi05_droid_simeval_lora \\
+      --exp_name scene1_lora_v1 \\
+      --dataset_dir /data/datasets \\
+      --visualize \\
       --overwrite
 
   # With custom training parameters
@@ -246,6 +393,13 @@ Examples:
         help="Push converted dataset to HuggingFace Hub"
     )
     dataset_group.add_argument(
+        "--dataset_dir",
+        type=str,
+        default=None,
+        help="Custom directory for storing intermediate dataset (saves home dir disk space). "
+             "Dataset will be stored in <dataset_dir>/<repo_id>"
+    )
+    dataset_group.add_argument(
         "--skip_conversion",
         action="store_true",
         help="Skip conversion step (use if dataset already exists)"
@@ -254,6 +408,11 @@ Examples:
         "--skip_norm_stats",
         action="store_true",
         help="Skip norm stats computation (use if stats already exist)"
+    )
+    dataset_group.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Generate dataset visualizations after conversion"
     )
 
     # Training options
@@ -308,10 +467,13 @@ Examples:
     print("="*70)
     print(f"\n📂 Input directory:     {args.input_dir}")
     print(f"📦 Dataset repo ID:     {args.repo_id}")
+    if args.dataset_dir:
+        print(f"💾 Dataset directory:   {args.dataset_dir}/{args.repo_id}")
     print(f"⚙️  Training config:     {args.config}")
     print(f"🏷️  Experiment name:     {args.exp_name}")
     print(f"☁️  Push to hub:         {args.push_to_hub}")
     print(f"♻️  Overwrite existing:  {args.overwrite}")
+    print(f"📊 Visualize dataset:   {args.visualize}")
 
     if not args.skip_conversion:
         print(f"\n📊 Found {len(hdf5_files)} HDF5 file(s) to convert")
@@ -346,10 +508,19 @@ Examples:
             convert_to_lerobot(
                 args.input_dir,
                 args.repo_id,
-                args.push_to_hub
+                args.push_to_hub,
+                args.dataset_dir
             )
         else:
             print("\n⏭️  Skipping conversion (--skip_conversion specified)")
+
+        # Optional: Visualize dataset
+        if args.visualize:
+            visualize_dataset(
+                args.repo_id,
+                output_dir="dataset_visualizations",
+                local_dir=args.dataset_dir
+            )
 
         # Step 2: Compute norm stats
         if not args.skip_norm_stats:

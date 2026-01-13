@@ -113,6 +113,7 @@ def convert_trajectory_to_lerobot(
     input_dir: str,
     repo_id: str,
     push_to_hub: bool = False,
+    local_dir: str = None,
 ):
     """Convert SimEval trajectory to LeRobot dataset.
 
@@ -120,6 +121,7 @@ def convert_trajectory_to_lerobot(
         input_dir: Directory containing trajectory HDF5 files
         repo_id: LeRobot dataset repository ID
         push_to_hub: Whether to push to Hugging Face Hub
+        local_dir: Optional custom directory for storing dataset (saves home dir space)
     """
     input_path = Path(input_dir)
 
@@ -130,19 +132,31 @@ def convert_trajectory_to_lerobot(
 
     print(f"Found {len(traj_files)} trajectory file(s)")
 
-    # Clean up any existing dataset
-    output_path = HF_LEROBOT_HOME / repo_id
-    if output_path.exists():
-        print(f"Removing existing dataset at {output_path}")
-        shutil.rmtree(output_path)
+    # Determine output path
+    if local_dir:
+        output_path = Path(local_dir) / repo_id
+        print(f"Using custom dataset directory: {output_path}")
+        # Clean up existing dataset in custom location
+        if output_path.exists():
+            print(f"Removing existing dataset at {output_path}")
+            shutil.rmtree(output_path)
+        # Ensure parent directory exists, but let LeRobotDataset create the final directory
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output_path = HF_LEROBOT_HOME / repo_id
+        print(f"Using default dataset directory: {output_path}")
+        # Clean up existing dataset
+        if output_path.exists():
+            print(f"Removing existing dataset at {output_path}")
+            shutil.rmtree(output_path)
 
     # Create LeRobot dataset with DROID features
     print(f"Creating LeRobot dataset: {repo_id}")
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        robot_type="panda",
-        fps=15,  # Target FPS after downsampling
-        features={
+    create_kwargs = {
+        "repo_id": repo_id,
+        "robot_type": "panda",
+        "fps": 15,  # Target FPS after downsampling
+        "features": {
             "exterior_image_1_left": {
                 "dtype": "image",
                 "shape": (180, 320, 3),
@@ -189,9 +203,15 @@ def convert_trajectory_to_lerobot(
                 "names": ["actions"],
             },
         },
-        image_writer_threads=10,
-        image_writer_processes=5,
-    )
+        "image_writer_threads": 10,
+        "image_writer_processes": 5,
+    }
+
+    # Add root directory if specified (custom dataset location)
+    if local_dir:
+        create_kwargs["root"] = str(output_path)
+
+    dataset = LeRobotDataset.create(**create_kwargs)
 
     # Process all trajectory files
     total_episodes = 0
@@ -285,6 +305,13 @@ def main():
         action="store_true",
         help="Push dataset to Hugging Face Hub",
     )
+    parser.add_argument(
+        "--local_dir",
+        type=str,
+        default=None,
+        help="Custom directory for storing dataset (saves home dir space). "
+             "Dataset will be stored in <local_dir>/<repo_id>",
+    )
 
     args = parser.parse_args()
 
@@ -297,6 +324,7 @@ def main():
         input_dir=args.input_dir,
         repo_id=args.repo_id,
         push_to_hub=args.push_to_hub,
+        local_dir=args.local_dir,
     )
 
     print("\nConversion complete!")
