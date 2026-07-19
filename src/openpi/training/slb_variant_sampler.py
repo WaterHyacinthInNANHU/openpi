@@ -154,10 +154,17 @@ def episode_from_offsets(dataset) -> dict[int, int]:
         return {int(ep): int(off) for ep, off in enumerate(froms)}
     meta = getattr(base, "meta", None)
     episodes = getattr(meta, "episodes", None) if meta is not None else None
-    if episodes is not None and "dataset_from_index" in episodes:
-        idx = np.asarray(episodes["episode_index"]).astype(np.int64)
-        froms = np.asarray(episodes["dataset_from_index"]).astype(np.int64)
-        return {int(e): int(f) for e, f in zip(idx, froms, strict=True)}
+    if episodes is not None:
+        # LeRobot v3.0 stores per-episode offsets in meta.episodes, which may be a
+        # HuggingFace datasets.Dataset (column_names), a pandas DataFrame (columns),
+        # or a dict. Column access episodes[col] returns a list/Series either way.
+        cols = getattr(episodes, "column_names", None)
+        if cols is None:
+            cols = list(getattr(episodes, "columns", []) or (episodes.keys() if hasattr(episodes, "keys") else []))
+        if "dataset_from_index" in cols and "episode_index" in cols:
+            idx = np.asarray(episodes["episode_index"]).astype(np.int64)
+            froms = np.asarray(episodes["dataset_from_index"]).astype(np.int64)
+            return {int(e): int(f) for e, f in zip(idx, froms, strict=True)}
     raise RuntimeError(
         "Could not derive episode_from offsets from dataset "
         f"({type(base).__name__}); expected episode_data_index or meta.episodes"

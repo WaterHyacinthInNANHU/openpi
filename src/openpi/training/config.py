@@ -397,6 +397,7 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
                         "left_wrist_0_rgb": "observation.images.wrist",
                         "state": "observation.state",
                         "actions": "action",
+                        "prompt": "prompt",
                     }
                 )
             ]

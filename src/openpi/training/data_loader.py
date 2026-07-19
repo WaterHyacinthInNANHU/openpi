@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -150,7 +150,10 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        # LeRobot v3.0 exposes meta.tasks as a DataFrame (index=task string,
+        # column "task_index"); PromptFromLeRobotTask wants {task_index: task}.
+        tasks = {int(ti): str(task) for task, ti in dataset_meta.tasks["task_index"].items()}
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(tasks)])
 
     return dataset
 
