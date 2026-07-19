@@ -141,12 +141,19 @@ def create_torch_dataset(
     # camera_fixed folder inside a larger HF repo); load it by path via `root=`.
     root = getattr(data_config, "slb_dataset_root", None)
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+    extra_kwargs = {}
+    if root is not None:
+        # Our re-rendered SLB videos carry sub-millisecond frame-timestamp jitter that
+        # trips LeRobot v3.0's default tolerance_s=1e-4. Loosen to a quarter-frame
+        # (well under the half-frame that would risk matching the wrong frame).
+        extra_kwargs["tolerance_s"] = 0.25 / dataset_meta.fps
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         root=root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        **extra_kwargs,
     )
 
     if data_config.prompt_from_task:

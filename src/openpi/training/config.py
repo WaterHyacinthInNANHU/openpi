@@ -834,21 +834,21 @@ _CONFIGS = [
     #
     *[
         TrainConfig(
-            name=f"pi05_axis_slb_{variant}",
+            name=f"pi05_axis_slb_{task_id}_{variant}",
             model=pi0_config.Pi0Config(pi05=True),
             data=AxisFrankaSlbDataConfig(
                 repo_id="Devon018/Franka-Datasets-v2",
                 variant=variant,
-                # Single-task pilot (task 1424). The sidecar root defaults to the
-                # offline cache convention; manifest + local dataset root come from
-                # env so the committed config carries no machine-specific paths.
-                task_id=1424,
+                # Per-task pilot config. The sidecar root defaults to the offline cache
+                # convention; manifest + local dataset root come from env (keyed by
+                # task_id) so the committed config carries no machine-specific paths.
+                task_id=task_id,
                 sidecar_root=os.path.join(
                     os.environ.get("AXIS_DATALOADER_ROOT", os.path.expanduser("~/axis_dataloader_cache")),
                     "sidecars",
                 ),
-                manifest_path=os.environ.get("SLB_MANIFEST_1424"),
-                dataset_root=os.environ.get("SLB_DATASET_ROOT_1424"),
+                manifest_path=os.environ.get(f"SLB_MANIFEST_{task_id}"),
+                dataset_root=os.environ.get(f"SLB_DATASET_ROOT_{task_id}"),
                 base_config=DataConfig(prompt_from_task=True),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(
@@ -862,6 +862,8 @@ _CONFIGS = [
             ).get_freeze_filter(),
             ema_decay=None,
         )
+        # 1600 (rotate_the_camera) dropped: 0 success demos -> nothing to imitate.
+        for task_id in (1424, 1628, 1644, 1645)
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
     ],
     #
