@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -96,6 +97,22 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    # --- SLB variant bake-off (see openpi.training.slb_variant_sampler) ---
+    # When slb_sidecar_root is set, the JAX loader restricts/weights rows to the
+    # kept (attempt, window) set of the given WVM variant. Left None for all
+    # non-SLB configs, which keeps the default full-shuffle behaviour.
+    slb_variant: str = "vanilla"
+    slb_task_id: int | None = None
+    slb_sidecar_root: str | None = None
+    slb_manifest_path: str | None = None
+    # Local root of the (subfoldered) camera_fixed LeRobot dataset. When set, the
+    # loader passes it as `root=` so a HF sub-dataset can be loaded by path.
+    slb_dataset_root: str | None = None
+    # AWR weighting: w = min(exp(tau*delta), cap). tau retuned to our smoothed
+    # horizon Delta scale (~3) vs the paper's per-frame EEF scale (tau=10).
+    awr_tau: float = 3.0
+    awr_delta: float = 2.0
 
 
 class GroupFactory(Protocol):
@@ -361,6 +378,12 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
 
     variant: str = "vanilla"
     default_prompt: str | None = None
+    task_id: int | None = None
+    sidecar_root: str | None = None
+    manifest_path: str | None = None
+    dataset_root: str | None = None
+    awr_tau: float = 3.0
+    awr_delta: float = 2.0
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -389,6 +412,13 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=("action",),
+            slb_variant=self.variant,
+            slb_task_id=self.task_id,
+            slb_sidecar_root=self.sidecar_root,
+            slb_manifest_path=self.manifest_path,
+            slb_dataset_root=self.dataset_root,
+            awr_tau=self.awr_tau,
+            awr_delta=self.awr_delta,
         )
 
 
@@ -808,6 +838,16 @@ _CONFIGS = [
             data=AxisFrankaSlbDataConfig(
                 repo_id="Devon018/Franka-Datasets-v2",
                 variant=variant,
+                # Single-task pilot (task 1424). The sidecar root defaults to the
+                # offline cache convention; manifest + local dataset root come from
+                # env so the committed config carries no machine-specific paths.
+                task_id=1424,
+                sidecar_root=os.path.join(
+                    os.environ.get("AXIS_DATALOADER_ROOT", os.path.expanduser("~/axis_dataloader_cache")),
+                    "sidecars",
+                ),
+                manifest_path=os.environ.get("SLB_MANIFEST_1424"),
+                dataset_root=os.environ.get("SLB_DATASET_ROOT_1424"),
                 base_config=DataConfig(prompt_from_task=True),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(
@@ -821,7 +861,7 @@ _CONFIGS = [
             ).get_freeze_filter(),
             ema_decay=None,
         )
-        for variant in ("vanilla", "filt_bin", "top70", "cfg")
+        for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
     ],
     #
     # Fine-tuning Aloha configs.

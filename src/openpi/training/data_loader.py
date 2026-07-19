@@ -137,9 +137,13 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # An SLB config may point at a local subfoldered LeRobot dataset (a per-task
+    # camera_fixed folder inside a larger HF repo); load it by path via `root=`.
+    root = getattr(data_config, "slb_dataset_root", None)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -320,6 +324,13 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+        # SLB variant bake-off: restrict/weight rows to the kept (attempt, window)
+        # set of the configured WVM variant. Only engages when a sidecar root is
+        # set, so all other JAX configs keep full-shuffle behaviour.
+        if getattr(data_config, "slb_sidecar_root", None):
+            from openpi.training import slb_variant_sampler
+
+            sampler = slb_variant_sampler.build_sampler(dataset, data_config, seed=seed)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
