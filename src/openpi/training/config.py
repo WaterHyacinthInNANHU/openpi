@@ -859,9 +859,12 @@ _CONFIGS = [
                 base_config=DataConfig(prompt_from_task=True),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(
-                "gs://openpi-assets/checkpoints/pi05_base/params"
+                "gs://openpi-assets/checkpoints/pi05_droid/params"
             ),
             num_train_steps=30_000,
+            # LeRobot v3.0 decodes video per item; the default 2 workers starve both
+            # norm-stats and training. 8 matches --cpus-per-task=8 in the sbatch.
+            num_workers=8,
             freeze_filter=pi0_config.Pi0Config(
                 pi05=True,
                 paligemma_variant="gemma_2b_lora",
