@@ -356,6 +356,43 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class AxisFrankaSlbDataConfig(DataConfigFactory):
+    """SLB fine-tuning over HF-rendered Franka data (pi0.5)."""
+
+    variant: str = "vanilla"
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        from openpi.policies import axis_franka_policy
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "base_0_rgb": "observation.images.third_person",
+                        "left_wrist_0_rgb": "observation.images.wrist",
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[axis_franka_policy.AxisFrankaInputs(action_dim=model_config.action_dim)],
+            outputs=[axis_franka_policy.AxisFrankaOutputs()],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -761,6 +798,31 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    #
+    # Fine-tuning AXIS Franka SLB configs (pi0.5 LoRA, HF-rendered Franka dataset).
+    #
+    *[
+        TrainConfig(
+            name=f"pi05_axis_slb_{variant}",
+            model=pi0_config.Pi0Config(pi05=True),
+            data=AxisFrankaSlbDataConfig(
+                repo_id="Devon018/Franka-Datasets-v2",
+                variant=variant,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_base/params"
+            ),
+            num_train_steps=30_000,
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            ema_decay=None,
+        )
+        for variant in ("vanilla", "filt_bin", "top70", "cfg")
+    ],
     #
     # Fine-tuning Aloha configs.
     #
