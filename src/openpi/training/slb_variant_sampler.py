@@ -195,10 +195,20 @@ def _fps_and_ep_len(dataset, data_config) -> tuple[float, dict[int, int]]:
     )
     ep_len = {int(e): int(l) for e, l in zip(ep["episode_index"], ep["length"])}
     # uniformity guard: check one episode's timestamps step by ~1/fps.
-    data0 = pd.read_parquet(sorted(glob.glob(str(pathlib.Path(root) / "data" / "**" / "*.parquet"), recursive=True))[0])
+    # Read the `timestamp` column across ALL data chunk files in sorted (flat) order,
+    # then index by the flat dataset_from_index/dataset_to_index. This is robust to
+    # multi-chunk datasets where iloc on the first chunk alone would slice the wrong rows.
+    import numpy as np
+    data_files = sorted(
+        glob.glob(str(pathlib.Path(root) / "data" / "**" / "*.parquet"), recursive=True)
+    )
+    ts_all = np.concatenate([
+        pd.read_parquet(f, columns=["timestamp"])["timestamp"].to_numpy(dtype=float)
+        for f in data_files
+    ])
     e0 = int(ep["episode_index"].iloc[0])
     a, b = int(ep["dataset_from_index"].iloc[0]), int(ep["dataset_to_index"].iloc[0])
-    ts = data0.iloc[a:b]["timestamp"].to_numpy(float)
+    ts = ts_all[a:b]
     if len(ts) > 2:
         dt = np.diff(ts)
         if np.max(np.abs(dt - 1.0 / fps)) > 0.5 / fps:
