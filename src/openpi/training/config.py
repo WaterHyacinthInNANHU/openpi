@@ -835,7 +835,14 @@ _CONFIGS = [
     *[
         TrainConfig(
             name=f"pi05_axis_slb_{task_id}_{variant}",
-            model=pi0_config.Pi0Config(pi05=True),
+            # LoRA fine-tune: the model itself must carry the LoRA gemma variants
+            # (not just the freeze_filter), or training silently falls back to a
+            # full fine-tune. Must match the freeze_filter variants below.
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
             data=AxisFrankaSlbDataConfig(
                 repo_id="Devon018/Franka-Datasets-v2",
                 variant=variant,
