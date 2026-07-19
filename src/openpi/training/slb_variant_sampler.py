@@ -21,7 +21,9 @@ scipy/mujoco/overlay, so it is safe under the openpi venv.
 """
 from __future__ import annotations
 
+import json
 import logging
+import pathlib
 from typing import Mapping
 
 import numpy as np
@@ -39,6 +41,8 @@ def plan_indices(
     join_index,
     variant: str,
     *,
+    fps: float,
+    ep_len: Mapping[int, int],
     awr_tau: float = 3.0,
     awr_delta: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray | None]:
@@ -49,11 +53,14 @@ def plan_indices(
         sidecar: a ``VariantSidecar`` for (task, variant).
         join_index: a ``JoinIndex`` mapping attempt_id -> EpisodeRef.
         variant: one of vanilla/filt_bin/top70/awr/cfg.
+        fps: video frame rate of the LeRobot dataset (e.g. 15.0).
+        ep_len: episode_index -> number of frames in that episode.
         awr_tau, awr_delta: AWR temperature and cap (only used when variant=="awr").
 
     Returns:
-        (rows, weights). ``rows`` is an int64 array of flat dataset indices. For
-        AWR ``weights`` is a float64 array aligned to ``rows``; otherwise ``None``
+        (rows, weights). ``rows`` is an int64 array of flat dataset indices computed
+        as ``row = base + round(t_start[w] * fps)``, clamped to [base, base+ep_len[ep]-1].
+        For AWR ``weights`` is a float64 array aligned to ``rows``; otherwise ``None``
         (uniform sampling over the restricted rows).
     """
     rows: list[int] = []
@@ -73,9 +80,13 @@ def plan_indices(
             n_missing_ep += 1
             continue
         base = int(episode_from[ep])
+        hi = base + int(ep_len[ep]) - 1
         mask = sidecar.keep_mask(aid)
+        t_start = sidecar.t_start(aid)
         for w in np.nonzero(mask)[0]:
-            rows.append(base + int(w))
+            row = base + int(round(float(t_start[int(w)]) * fps))
+            row = min(max(row, base), hi)  # clamp into this episode
+            rows.append(row)
             if is_awr:
                 weights.append(awr_weight(sidecar.delta(aid, int(w)), awr_tau, awr_delta))
     if n_missing_ep:
@@ -171,6 +182,33 @@ def episode_from_offsets(dataset) -> dict[int, int]:
     )
 
 
+def _fps_and_ep_len(dataset, data_config) -> tuple[float, dict[int, int]]:
+    """Read fps + per-episode length, asserting the LeRobot dataset is uniform-fps."""
+    import glob
+    import pandas as pd
+    root = data_config.slb_dataset_root
+    info = json.loads((pathlib.Path(root) / "meta" / "info.json").read_text())
+    fps = float(info["fps"])
+    ep = pd.concat(
+        [pd.read_parquet(p) for p in sorted(glob.glob(str(pathlib.Path(root) / "meta" / "episodes" / "**" / "*.parquet"), recursive=True))],
+        ignore_index=True,
+    )
+    ep_len = {int(e): int(l) for e, l in zip(ep["episode_index"], ep["length"])}
+    # uniformity guard: check one episode's timestamps step by ~1/fps.
+    data0 = pd.read_parquet(sorted(glob.glob(str(pathlib.Path(root) / "data" / "**" / "*.parquet"), recursive=True))[0])
+    e0 = int(ep["episode_index"].iloc[0])
+    a, b = int(ep["dataset_from_index"].iloc[0]), int(ep["dataset_to_index"].iloc[0])
+    ts = data0.iloc[a:b]["timestamp"].to_numpy(float)
+    if len(ts) > 2:
+        dt = np.diff(ts)
+        if np.max(np.abs(dt - 1.0 / fps)) > 0.5 / fps:
+            raise RuntimeError(
+                f"LeRobot episode {e0} is not uniform-fps (fps={fps}); "
+                "sim_time->row arithmetic requires uniform fps"
+            )
+    return fps, ep_len
+
+
 def build_sampler(dataset, data_config, *, seed: int = 0) -> RowSampler:
     """Build the variant RowSampler for a transformed SLB dataset."""
     from benchmarks.dataloader.join_index import JoinIndex
@@ -182,13 +220,11 @@ def build_sampler(dataset, data_config, *, seed: int = 0) -> RowSampler:
     )
     join_index = JoinIndex.from_manifest(data_config.slb_manifest_path)
     episode_from = episode_from_offsets(dataset)
+    fps, ep_len = _fps_and_ep_len(dataset, data_config)
     rows, weights = plan_indices(
-        episode_from,
-        sidecar,
-        join_index,
-        variant,
-        awr_tau=data_config.awr_tau,
-        awr_delta=data_config.awr_delta,
+        episode_from, sidecar, join_index, variant,
+        fps=fps, ep_len=ep_len,
+        awr_tau=data_config.awr_tau, awr_delta=data_config.awr_delta,
     )
     logging.info(
         "slb_variant_sampler[%s]: %d rows (weighted=%s) over %d episodes",
