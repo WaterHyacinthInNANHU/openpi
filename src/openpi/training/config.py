@@ -840,6 +840,8 @@ _CONFIGS = [
             # full fine-tune. Must match the freeze_filter variants below.
             model=pi0_config.Pi0Config(
                 pi05=True,
+                action_dim=32,
+                action_horizon=16,
                 paligemma_variant="gemma_2b_lora",
                 action_expert_variant="gemma_300m_lora",
             ),
@@ -857,6 +859,10 @@ _CONFIGS = [
                 manifest_path=os.environ.get(f"SLB_MANIFEST_{task_id}"),
                 dataset_root=os.environ.get(f"SLB_DATASET_ROOT_{task_id}"),
                 base_config=DataConfig(prompt_from_task=True),
+                assets=AssetsConfig(  # reuse DROID norm stats — no compute_norm_stats
+                    assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                    asset_id="droid",
+                ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(
                 "gs://openpi-assets/checkpoints/pi05_droid/params"
