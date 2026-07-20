@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -200,7 +201,12 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Honour JAX_COMPILATION_CACHE_DIR when set. The hardcoded ~/.cache/jax lands on
+    # the HPC home quota (20 GB here), so cache writes fail with EDQUOT, nothing is
+    # cached, truncated entries are left behind, and every run re-pays ~190 s of JIT.
+    # Our sbatch scripts already export this to /bigdata.
+    _cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR") or "~/.cache/jax"
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path(_cache_dir).expanduser()))
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
