@@ -12,7 +12,7 @@
 #   dep it needs. datasets 3.6 + av 17 + torchcodec 0.4.0 already in the venv are
 #   sufficient to READ v3.0.
 #
-# RE-RUN THIS after any `uv sync`, which reverts lerobot to ../lerobot_local (v2.1).
+# RE-RUN THIS after any `uv sync`, which reverts lerobot to ../libs/lerobot_local (v2.1).
 #
 # RUNTIME: v3.0 decodes video via torchcodec, which needs FFmpeg .so on
 # LD_LIBRARY_PATH. Use `module load ffmpeg/4.3.0` (decoder4). Do NOT use ffmpeg/5.0:
