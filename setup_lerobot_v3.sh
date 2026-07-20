@@ -26,6 +26,11 @@ export VIRTUAL_ENV="${HERE}/.venv"
 uv pip install --no-deps 'lerobot @ git+https://github.com/huggingface/lerobot@v0.4.4'
 uv pip install 'accelerate==1.14.0'
 
+# lerobot 0.4.4's _query_hf_dataset tries a column-first lookup that ALWAYS raises
+# on datasets 3.6.0, but only after materialising the whole column -> O(total_frames)
+# wasted per sample (measured 1078x). Reorder it row-first. See patch_lerobot_query.py.
+"${VIRTUAL_ENV}/bin/python" "${HERE}/patch_lerobot_query.py"
+
 "${VIRTUAL_ENV}/bin/python" - <<'PY'
 import importlib.metadata as m
 import lerobot.datasets.lerobot_dataset as L
