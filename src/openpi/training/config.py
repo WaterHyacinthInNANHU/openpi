@@ -867,7 +867,23 @@ _CONFIGS = [
             weight_loader=weight_loaders.CheckpointWeightLoader(
                 "gs://openpi-assets/checkpoints/pi05_droid/params"
             ),
-            num_train_steps=30_000,
+            # 20k is the field consensus for single-task pi0.5 finetuning, chosen
+            # independently by four sources: openpi's own pi05_droid_finetune
+            # ("a custom (smaller) DROID dataset" -- our exact setting, and we already
+            # copy its init and norm-stats), RoboCasa's single-task pi05-og config,
+            # RLinf's robotwin single-task SFT, and the one RoboTwin config that
+            # overrides the default. The previous 30_000 was NOT a choice: it is the
+            # TrainConfig default at :579 restated, and `git log -L` on that line shows
+            # it was never revisited. RoboTwin inherits the same default the same way.
+            #
+            # Deliberately NOT changing the lr_schedule alongside it. The inherited
+            # CosineDecaySchedule has decay_steps=30_000, so stopping at 20k ends at
+            # ~34% of peak LR rather than the floor. Every one of those four sources
+            # runs exactly this truncated cosine, so matching them is the defensible
+            # choice; the truncation is a known divergence, not an oversight. (It WOULD
+            # be a problem at a much shorter budget -- at 4k the LR is still 97.7% of
+            # peak, i.e. no annealing at all.)
+            num_train_steps=20_000,
             # LeRobot v3.0 decodes video per item; the default 2 workers starve both
             # norm-stats and training. 8 matches --cpus-per-task=8 in the sbatch.
             num_workers=8,
