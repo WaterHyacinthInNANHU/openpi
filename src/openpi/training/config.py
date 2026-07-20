@@ -403,7 +403,7 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[axis_franka_policy.AxisFrankaInputs(action_dim=model_config.action_dim)],
+            inputs=[axis_franka_policy.AxisFrankaInputs()],
             outputs=[axis_franka_policy.AxisFrankaOutputs()],
         )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)

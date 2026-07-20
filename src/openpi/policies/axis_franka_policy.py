@@ -3,6 +3,20 @@
 State[8] = 7 arm + 1 gripper (DROID format); action[8] = absolute joint ctrl targets.
 Mirrors libero_policy. Images arrive already
 repacked to base_0_rgb / left_wrist_0_rgb by the DataConfig repack step.
+
+DO NOT PAD state/actions here. The pipeline order is
+    data_transforms.inputs -> Normalize -> model_transforms.inputs
+(`training/data_loader.py`), and `PadStatesAndActions(32)` already lives in
+`model_transforms`, i.e. AFTER `Normalize`. `LiberoInputs` -- which this mirrors --
+passes state/actions through unpadded for exactly this reason.
+
+Padding here instead made `Normalize` see 32 dims. pi0.5 uses quantile normalisation
+(`config.py:204`) and the reused `pi05_droid` action stats have q01 == q99 == 0 for
+dims 8-31, so each padded zero became
+    (0 - 0) / (0 - 0 + 1e-6) * 2 - 1 = -1.0
+turning 24 of 32 action dims into a constant -1.0 the pretrained decoder never emits,
+where pi05_droid saw 0.0. Benign under z-score, pathological under quantile.
+Regression-tested in benchmarks/dataloader/tests/test_axis_franka_policy.py.
 """
 from __future__ import annotations
 
@@ -11,12 +25,6 @@ import dataclasses
 import numpy as np
 
 from openpi import transforms as _transforms
-
-
-def _pad(vec: np.ndarray, dim: int) -> np.ndarray:
-    out = np.zeros(dim, dtype=np.float32)
-    out[: len(vec)] = vec
-    return out
 
 
 def _to_hwc_uint8(img) -> np.ndarray:
@@ -33,10 +41,16 @@ def _to_hwc_uint8(img) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class AxisFrankaInputs(_transforms.DataTransformFn):
-    action_dim: int
+    """Repack AXIS-Franka rows into the pi0.5 input layout.
+
+    Deliberately does NOT pad state/actions to the model action dim -- see the module
+    docstring. `PadStatesAndActions` in `model_transforms` does that, after `Normalize`.
+    """
 
     def __call__(self, data: dict) -> dict:
-        state = _pad(np.asarray(data["state"], dtype=np.float32), self.action_dim)
+        # Pass 8-D state through unpadded: Normalize runs next, and padding here would
+        # feed it 24 dims of zeros that quantile-normalize to -1.0 (see module docstring).
+        state = np.asarray(data["state"], dtype=np.float32)
         base = _to_hwc_uint8(data["base_0_rgb"])
         raw_wrist = data.get("left_wrist_0_rgb")
         has_wrist = raw_wrist is not None
@@ -57,8 +71,9 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
             },
         }
         if "actions" in data:
-            act = np.asarray(data["actions"], dtype=np.float32)
-            out["actions"] = np.stack([_pad(a, self.action_dim) for a in act])
+            # Unpadded, for the same reason as `state`. AxisFrankaOutputs slices the
+            # model's 32-D output back to 8 on the way out.
+            out["actions"] = np.asarray(data["actions"], dtype=np.float32)
         if "prompt" in data:
             out["prompt"] = data["prompt"]
         return out
