@@ -1,7 +1,7 @@
-"""AXIS Franka (robosuite) input/output transforms for pi0.5.
+"""AXIS Franka (DROID 8D) input/output transforms for pi0.5.
 
-State[9] = 7 arm + 2 finger qpos; action[9] = absolute joint ctrl targets.
-Mirrors libero_policy but for our 9-DoF Franka. Images arrive already
+State[8] = 7 arm + 1 gripper (DROID format); action[8] = absolute joint ctrl targets.
+Mirrors libero_policy. Images arrive already
 repacked to base_0_rgb / left_wrist_0_rgb by the DataConfig repack step.
 """
 from __future__ import annotations
@@ -67,4 +67,4 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class AxisFrankaOutputs(_transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"])[:, :9]}
+        return {"actions": np.asarray(data["actions"])[:, :8]}
