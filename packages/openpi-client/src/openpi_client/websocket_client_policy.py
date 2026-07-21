@@ -35,7 +35,18 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    additional_headers=headers,
+                    # The server runs inference synchronously in its asyncio handler, so
+                    # during a slow call (notably the first, which JIT-compiles the model
+                    # -- 30-90s for pi0.5) it cannot answer keepalive pings. With the
+                    # default 20s ping_timeout the client would drop the connection with
+                    # "sent 1011 keepalive ping timeout" mid-inference. Disable
+                    # client-initiated pings; a genuinely dead server is still detected
+                    # via the socket closing.
+                    ping_interval=None,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
