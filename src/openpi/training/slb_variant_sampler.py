@@ -39,6 +39,20 @@ def awr_weight(delta: float, tau: float, cap: float) -> float:
     return float(min(np.exp(tau * float(delta)), cap))
 
 
+# Frames the renderer emits per sim step before the one whose state matches the trace.
+# The renderer writes 3 frames per 0.2 s sim step and the trace's joint_qpos matches the
+# THIRD, so a window whose sim_time is t belongs at index round((t - t0)*fps) + 2 within
+# its episode, where t0 is the attempt's FIRST sim_time (most traces start at 0.2 s, not 0).
+#
+# Measured directly, not inferred: LeRobot observation.state[:7] holds the trace joint_qpos
+# bit-exactly, so the true window->row map is readable by nearest-neighbour search.
+# Over 90 (attempt, window) samples on task 1644, true_row minus this rule is 0 for 90/90,
+# while true_row minus the legacy `round(t*fps)` is -1 for 66 and +2 for 24 -- i.e. the
+# legacy rule is never correct. Median ||qpos - state|| is 0.00000 at the aligned row vs
+# 0.02491 at the legacy row.
+RENDER_FRAME_OFFSET = 2
+
+
 def plan_indices(
     episode_from: Mapping[int, int],
     sidecar,
@@ -49,6 +63,7 @@ def plan_indices(
     ep_len: Mapping[int, int],
     awr_tau: float = 3.0,
     awr_delta: float = 2.0,
+    render_aligned_rows: bool = False,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Map kept (attempt, window) pairs to flat rows (+ AWR weights).
 
@@ -87,8 +102,18 @@ def plan_indices(
         hi = base + int(ep_len[ep]) - 1
         mask = sidecar.keep_mask(aid)
         t_start = sidecar.t_start(aid)
+        t0 = float(t_start[0]) if len(t_start) else 0.0
         for w in np.nonzero(mask)[0]:
-            row = base + int(round(float(t_start[int(w)]) * fps))
+            if render_aligned_rows:
+                row = base + int(round((float(t_start[int(w)]) - t0) * fps)) + RENDER_FRAME_OFFSET
+            else:
+                # LEGACY, and measurably wrong by one frame (see RENDER_FRAME_OFFSET).
+                # Kept as the default ONLY so an in-flight bake-off stays self-consistent:
+                # switching the row map mid-sweep would give queued arms a different
+                # window->row mapping from the arms already trained, which biases the very
+                # comparison the sweep exists to make. Set render_aligned_rows=True for
+                # every NEW run.
+                row = base + int(round(float(t_start[int(w)]) * fps))
             row = min(max(row, base), hi)  # clamp into this episode
             rows.append(row)
             if is_awr:
@@ -292,6 +317,7 @@ def build_sampler(dataset, data_config, *, seed: int = 0) -> tuple[RowSampler, d
         episode_from, sidecar, join_index, variant,
         fps=fps, ep_len=ep_len,
         awr_tau=data_config.awr_tau, awr_delta=data_config.awr_delta,
+        render_aligned_rows=getattr(data_config, "slb_render_aligned_rows", False),
     )
     weights_by_row = None if weights is None else row_weight_map(rows, weights)
     logging.info(

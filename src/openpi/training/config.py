@@ -123,6 +123,13 @@ class DataConfig:
     # indistinguishable from vanilla. At tau=10, 12-15% reach the cap.
     awr_tau: float = 10.0
     awr_delta: float = 2.0
+    # Map sidecar windows to dataset rows with the RENDER-ALIGNED rule
+    # (round((t - t0)*fps) + RENDER_FRAME_OFFSET) instead of the legacy round(t*fps), which
+    # is measurably one frame late for ~95% of windows (see slb_variant_sampler).
+    # Defaults False ONLY to keep the in-flight bake-off self-consistent -- a mid-sweep
+    # change would give queued arms a different mapping from arms already trained. Set True
+    # for every NEW run, including the pretraining corpus.
+    slb_render_aligned_rows: bool = False
 
 
 class GroupFactory(Protocol):
