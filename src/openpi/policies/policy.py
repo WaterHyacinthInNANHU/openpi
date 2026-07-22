@@ -67,8 +67,17 @@ class Policy(BasePolicy):
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # JAX model setup.
+            # `guidance_scale` MUST be static: Pi0.sample_actions decides whether to
+            # batch-double via `bool(guidance_scale != 0.0 and ...)`, and a plain Python
+            # float handed to jax.jit becomes a tracer, so that `bool()` raises
+            # TracerBoolConversionError. Declared only when guidance is actually in play so
+            # the non-CFG path (and models whose sample_actions has no such parameter) keeps
+            # exactly the jit signature it had before.
+            jit_kwargs = (
+                {"static_argnames": ("guidance_scale",)} if "guidance_scale" in self._sample_kwargs else {}
+            )
+            self._sample_actions = nnx_utils.module_jit(model.sample_actions, **jit_kwargs)
             self._rng = rng or jax.random.key(0)
 
     @override

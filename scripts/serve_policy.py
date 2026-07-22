@@ -54,6 +54,14 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # SLB `cfg` variant: append "\nAdvantage: positive" to the prompt and build the paired
+    # unconditional branch. Only meaningful for a checkpoint trained with the cfg tag.
+    cfg_conditioning: bool = False
+
+    # Classifier-free guidance scale `w`. Inference-only, so a sweep re-serves the SAME
+    # checkpoint with a different value; w=0 is plain conditional sampling.
+    guidance_scale: float = 0.0
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -90,7 +98,11 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                cfg_conditioning=args.cfg_conditioning,
+                guidance_scale=args.guidance_scale,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
