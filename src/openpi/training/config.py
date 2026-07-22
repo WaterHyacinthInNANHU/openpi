@@ -389,8 +389,28 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         from openpi.policies import axis_franka_policy
 
+        # SLB `cfg`: advantage-conditioned CFG, injected into the VLM's language stream
+        # (RECAP / pi*0.6 style, mirroring RLinf's cfg_rl_openpi reference). Runs FIRST so
+        # it still sees `episode_index` / `frame_index`, which RepackTransform drops.
+        # Offline advantage only -- no critic, matching the reference's
+        # add_value_head/use_critic_model=False.
+        cfg_inputs: list[_transforms.DataTransformFn] = []
+        if self.slb_variant == "cfg" and self.slb_sidecar_root and self.slb_task_id is not None:
+            from openpi.training import slb_cfg
+
+            try:
+                cfg_inputs = [slb_cfg.build_conditioning(
+                    task_id=int(self.slb_task_id),
+                    sidecar_root=self.slb_sidecar_root,
+                    manifest_path=self.slb_manifest_path,
+                )]
+            except Exception as exc:  # noqa: BLE001
+                # Fail loudly: silently training `cfg` without conditioning would make it a
+                # byte-for-byte duplicate of vanilla and quietly invalidate that arm.
+                raise RuntimeError(f"SLB cfg conditioning unavailable for task {self.slb_task_id}: {exc}") from exc
+
         repack_transform = _transforms.Group(
-            inputs=[
+            inputs=cfg_inputs + [
                 _transforms.RepackTransform(
                     {
                         "base_0_rgb": "observation.images.third_person",
@@ -894,8 +914,13 @@ _CONFIGS = [
             ).get_freeze_filter(),
             ema_decay=None,
         )
-        # 1600 (rotate_the_camera) dropped: 0 success demos -> nothing to imitate.
-        for task_id in (1424, 1628, 1644, 1645)
+        # SLB v2 pilot pair. Only 24 of SLB's 86 tasks have rendered HF episodes at all;
+        # 1644/1645 are the two best of those -- 20 scene variants each (4x task 1424's 5),
+        # pools of 578/510 for 100 demos, and two DIFFERENT families (pnp vs directed
+        # rotation) so the bake-off is not measuring a single skill. 1424 dropped: 5
+        # variants and only 103 joinable demos for 100, the thinnest margin of any
+        # candidate. Extend once the full render finishes.
+        for task_id in (1644, 1645)
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
     ],
     #
