@@ -109,9 +109,19 @@ class DataConfig:
     # Local root of the (subfoldered) camera_fixed LeRobot dataset. When set, the
     # loader passes it as `root=` so a HF sub-dataset can be loaded by path.
     slb_dataset_root: str | None = None
-    # AWR weighting: w = min(exp(tau*delta), cap). tau retuned to our smoothed
-    # horizon Delta scale (~3) vs the paper's per-frame EEF scale (tau=10).
-    awr_tau: float = 3.0
+    # AWR weighting: w = min(exp(tau*Delta), cap), WVM Eq E.7.
+    #
+    # tau=10 is the paper's value for its SHORTEST chunk length (Table E.5: H=10 -> tau=10,
+    # H=50 -> tau=2, "set per task suite to account for the different per-frame value-change
+    # scales induced by different chunk lengths"). Our H=16 sits near the H=10 end.
+    #
+    # An earlier tau=3 was justified as matching "our smoothed horizon Delta scale", but the
+    # direction was backwards: our Delta is SMALLER than the paper's (their top-70% cut lands
+    # at kappa=0.02-0.06; ours at ~0.001-0.002), so it needs a LARGER tau, not smaller.
+    # Measured at tau=3 the weights were effectively uniform -- median weight 1.015, only
+    # 1.7% reaching the cap, effective-sample-size ratio 0.96 -- i.e. the awr arm was
+    # indistinguishable from vanilla. At tau=10, 12-15% reach the cap.
+    awr_tau: float = 10.0
     awr_delta: float = 2.0
 
 
@@ -396,7 +406,7 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
     sidecar_root: str | None = None
     manifest_path: str | None = None
     dataset_root: str | None = None
-    awr_tau: float = 3.0
+    awr_tau: float = 10.0   # WVM Eq E.7 / Table E.5; see DataConfig.awr_tau
     awr_delta: float = 2.0
 
     @override
