@@ -3,8 +3,12 @@
 This is the piece that makes the SLB variant bake-off non-trivial. The offline
 build materialises numpy-only sidecars keyed by (task, attempt, window); here we
 map each kept window back to a flat openpi row and hand the loader a torch
-`Sampler` that either restricts (hard filters + vanilla) or weights (AWR) which
-rows are drawn.
+`Sampler` that restricts which rows are drawn.
+
+EVERY variant, including AWR, draws its rows UNIFORMLY. AWR additionally returns a
+row -> weight map: WVM (arXiv 2606.24742) Eq E.5 puts the weights in the OBJECTIVE
+(a weighted LOSS), not in the sampler. See openpi.training.slb_awr_loss for the
+objective and for why weighted resampling is not the same estimator.
 
 Window semantics (see benchmarks/slb_pilot/adv_proxy.chunk_deltas): window index
 ``s`` is the sliding-window START frame ``s`` of the attempt's episode. So the
@@ -52,7 +56,7 @@ def plan_indices(
         episode_from: episode_index -> flat start row offset in the LeRobot dataset.
         sidecar: a ``VariantSidecar`` for (task, variant).
         join_index: a ``JoinIndex`` mapping attempt_id -> EpisodeRef.
-        variant: one of vanilla/filt_bin/top70/top30/awr/cfg.
+        variant: one of vanilla/filt_bin/top70/awr/cfg.
         fps: video frame rate of the LeRobot dataset (e.g. 15.0).
         ep_len: episode_index -> number of frames in that episode.
         awr_tau, awr_delta: AWR temperature and cap (only used when variant=="awr").
@@ -68,10 +72,7 @@ def plan_indices(
     is_awr = variant == "awr"
     # vanilla and cfg both keep every success window (keep_mask is all-True); cfg's
     # conditioning is injected in the action expert at train time, not by row
-    # restriction here. Only filt_bin/top70/top30 drop rows; only awr attaches weights.
-    # There is deliberately no variant allow-list here: which rows are dropped is decided
-    # entirely by sidecar.keep_mask (see sidecar_reader.MASK_VARIANTS), so a new filtering
-    # arm cannot half-register by being added in one place and not the other.
+    # restriction here. Only filt_bin/top70 drop rows; only awr attaches weights.
     n_missing_ep = 0
     for aid in sorted(sidecar._per_attempt):  # noqa: SLF001 - reader-owned map
         ref = join_index.episode_for(aid)
@@ -100,17 +101,23 @@ def plan_indices(
 
 
 class RowSampler(torch.utils.data.Sampler[int]):
-    """Sample flat rows uniformly (hard filters/vanilla) or by weight (AWR).
+    """Sample flat rows uniformly -- for EVERY variant, AWR included.
 
     Unlike ``WeightedRandomSampler`` -- which yields positions into its weight
     vector -- this yields the actual flat dataset rows, so the restricted index
     space maps straight onto the openpi dataset.
+
+    There is deliberately no weighted branch here any more. AWR used to draw with
+    ``torch.multinomial(weights, ..., replacement=True)``, which is a different
+    estimator from WVM Eq E.5 and additionally perturbs the epoch composition
+    (duplicates/omissions) independently of the weights. Eq E.5 is applied in the
+    training loss instead; see ``row_weight_map`` / ``WeightedRowDataset`` for how the
+    weight travels with each uniformly-drawn row.
     """
 
     def __init__(
         self,
         rows: np.ndarray,
-        weights: np.ndarray | None = None,
         *,
         num_samples: int | None = None,
         seed: int = 0,
@@ -118,7 +125,6 @@ class RowSampler(torch.utils.data.Sampler[int]):
         if len(rows) == 0:
             raise ValueError("RowSampler got an empty row set; check sidecar/join_index/episode_from")
         self._rows = torch.as_tensor(np.asarray(rows), dtype=torch.long)
-        self._weights = None if weights is None else torch.as_tensor(np.asarray(weights), dtype=torch.double)
         self._num_samples = int(num_samples) if num_samples is not None else len(self._rows)
         self._seed = int(seed)
         self._epoch = 0
@@ -130,16 +136,59 @@ class RowSampler(torch.utils.data.Sampler[int]):
         gen = torch.Generator()
         gen.manual_seed(self._seed + self._epoch)
         self._epoch += 1
-        if self._weights is None:
-            perm = torch.randperm(len(self._rows), generator=gen)
-            if self._num_samples > len(perm):
-                extra = torch.randint(len(self._rows), (self._num_samples - len(perm),), generator=gen)
-                pos = torch.cat([perm, extra])
-            else:
-                pos = perm[: self._num_samples]
+        perm = torch.randperm(len(self._rows), generator=gen)
+        if self._num_samples > len(perm):
+            extra = torch.randint(len(self._rows), (self._num_samples - len(perm),), generator=gen)
+            pos = torch.cat([perm, extra])
         else:
-            pos = torch.multinomial(self._weights, self._num_samples, replacement=True, generator=gen)
+            pos = perm[: self._num_samples]
         yield from self._rows[pos].tolist()
+
+
+def row_weight_map(rows: np.ndarray, weights: np.ndarray) -> dict[int, float]:
+    """Collapse the row-aligned AWR weight array into a row -> weight lookup.
+
+    Two windows can land on the same flat row (rounding, or the episode-end clamp).
+    Their multiplicity is already expressed by the row appearing twice in ``rows``,
+    which uniform sampling honours, so the weight of a shared row is the MEAN of the
+    colliding windows' weights rather than an arbitrary winner.
+    """
+    acc: dict[int, list[float]] = {}
+    for r, w in zip(rows.tolist(), weights.tolist(), strict=True):
+        acc.setdefault(int(r), []).append(float(w))
+    n_collisions = sum(1 for v in acc.values() if len(v) > 1)
+    if n_collisions:
+        logging.warning("slb_variant_sampler: %d rows carry >1 window; averaging their AWR weights", n_collisions)
+    return {r: float(np.mean(v)) for r, v in acc.items()}
+
+
+class WeightedRowDataset:
+    """Attach each row's Eq E.7 weight to the sample dict, under ``LOSS_WEIGHT_KEY``.
+
+    Wraps the FULLY TRANSFORMED dataset, so the weight cannot be dropped by a repack
+    transform, and is added only when a weight map exists (i.e. only for ``awr``);
+    every other variant's sample dict is untouched.
+    """
+
+    def __init__(self, dataset, weights_by_row: Mapping[int, float]):
+        # Imported here, not at module scope: slb_awr_loss pulls in jax, and this module
+        # must stay importable from the numpy/torch-only offline test venv.
+        from openpi.training.slb_awr_loss import LOSS_WEIGHT_KEY
+
+        self._dataset = dataset
+        self._weights_by_row = dict(weights_by_row)
+        self._key = LOSS_WEIGHT_KEY
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, index):
+        item = dict(self._dataset[index])
+        # A row outside the AWR keep-set can only be reached if something bypassed the
+        # sampler; weight 0 makes such a row contribute nothing rather than silently
+        # entering at weight 1.
+        item[self._key] = np.float32(self._weights_by_row.get(int(index), 0.0))
+        return item
 
 
 def _unwrap_to_base(dataset):
@@ -222,8 +271,13 @@ def _fps_and_ep_len(dataset, data_config) -> tuple[float, dict[int, int]]:
     return fps, ep_len
 
 
-def build_sampler(dataset, data_config, *, seed: int = 0) -> RowSampler:
-    """Build the variant RowSampler for a transformed SLB dataset."""
+def build_sampler(dataset, data_config, *, seed: int = 0) -> tuple[RowSampler, dict[int, float] | None]:
+    """Build the variant RowSampler (+ AWR row weights) for a transformed SLB dataset.
+
+    Returns ``(sampler, weights_by_row)``. ``weights_by_row`` is None for every variant
+    except ``awr``; when it is not None the caller must wrap the dataset in
+    ``WeightedRowDataset`` so Eq E.5 can be applied in the loss.
+    """
     from benchmarks.dataloader.join_index import JoinIndex
     from benchmarks.dataloader.sidecar_reader import VariantSidecar
 
@@ -239,11 +293,12 @@ def build_sampler(dataset, data_config, *, seed: int = 0) -> RowSampler:
         fps=fps, ep_len=ep_len,
         awr_tau=data_config.awr_tau, awr_delta=data_config.awr_delta,
     )
+    weights_by_row = None if weights is None else row_weight_map(rows, weights)
     logging.info(
-        "slb_variant_sampler[%s]: %d rows (weighted=%s) over %d episodes",
+        "slb_variant_sampler[%s]: %d rows, uniformly sampled (loss-weighted=%s) over %d episodes",
         variant,
         len(rows),
-        weights is not None,
+        weights_by_row is not None,
         len(episode_from),
     )
-    return RowSampler(rows, weights, seed=seed)
+    return RowSampler(rows, seed=seed), weights_by_row

@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.slb_awr_loss as _slb_awr_loss
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -340,7 +341,13 @@ def create_torch_data_loader(
         if getattr(data_config, "slb_sidecar_root", None):
             from openpi.training import slb_variant_sampler
 
-            sampler = slb_variant_sampler.build_sampler(dataset, data_config, seed=seed)
+            sampler, weights_by_row = slb_variant_sampler.build_sampler(dataset, data_config, seed=seed)
+            if weights_by_row is not None:
+                # `awr` only (WVM Eq E.5): rows are drawn uniformly like every other
+                # variant, and the per-row weight rides along in the sample dict so the
+                # training loss can reweight. No other variant gets this wrapper, so
+                # their batches keep exactly the keys they had before.
+                dataset = slb_variant_sampler.WeightedRowDataset(dataset, weights_by_row)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
@@ -558,4 +565,11 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            observation = _model.Observation.from_dict(batch)
+            if _slb_awr_loss.LOSS_WEIGHT_KEY in batch:
+                # SLB `awr` only: a third element carrying the per-row WVM Eq E.7 weight,
+                # which train_step feeds into the Eq E.5 weighted loss. Absent for every
+                # other config, which still yields the original 2-tuple.
+                yield observation, batch["actions"], batch[_slb_awr_loss.LOSS_WEIGHT_KEY]
+            else:
+                yield observation, batch["actions"]

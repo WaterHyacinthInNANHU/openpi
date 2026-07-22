@@ -974,18 +974,10 @@ _CONFIGS = [
     # same data, same LoRA setup, but the flow-matching gradient is cut at the prefix KV and
     # the VLM is instead trained by a FAST-token cross-entropy. Separate names so the
     # in-flight non-KI sweep is untouched and the pair is a clean A/B.
-    #
-    # `top30` is appended rather than slotted next to `top70` so the existing arms keep
-    # both their names and their construction arguments byte-identical while the sweep is
-    # in flight. It DROPS every window outside cfg's positive set, where `cfg` merely TAGS
-    # that same set: top70-vs-cfg confounds "filter vs condition" with "70% vs 30%",
-    # top30-vs-cfg (guidance scale 0) varies only the first. Both read the same per-phase
-    # threshold in benchmarks/dataloader/variant_selector, so the two arms cover exactly
-    # the same windows by construction.
     *[
         _axis_slb_config(task_id, variant, knowledge_insulation=ki)
         for task_id in (1644, 1645)
-        for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg", "top30")
+        for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
     ],
     #

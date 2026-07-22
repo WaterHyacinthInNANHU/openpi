@@ -25,6 +25,7 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
+import openpi.training.slb_awr_loss as _slb_awr_loss
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
@@ -139,24 +140,38 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions]
+    | tuple[_model.Observation, _model.Actions, at.Float[at.Array, "*b"]],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
     @at.typecheck
     def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+        model: _model.BaseModel,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        loss_weights: at.Float[at.Array, "*b"] | None = None,
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        # `loss_weights is None` returns literally jnp.mean(chunked_loss) -- the exact
+        # expression this line used before the SLB awr change -- so every non-awr config
+        # is bit-for-bit unchanged. The awr arm supplies WVM Eq E.7 weights and gets the
+        # Eq E.5 weighted objective instead.
+        return _slb_awr_loss.combine(chunked_loss, loss_weights)
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    # SLB `awr` yields a third batch element (the per-row Eq E.7 weight); every other
+    # config yields the original (observation, actions) pair.
+    observation, actions, *extra = batch
+    loss_weights = extra[0] if extra else None
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
+        model, train_rng, observation, actions, loss_weights
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
