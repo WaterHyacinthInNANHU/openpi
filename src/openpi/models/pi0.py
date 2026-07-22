@@ -102,13 +102,17 @@ class Pi0(_model.BaseModel):
         # keeps a learning signal once the action-expert gradient path is cut. Shared across
         # the supervised token positions, so this costs width*vocab params, not
         # width*num_tokens*vocab.
+        # Scalars are assigned unconditionally -- only the HEAD is conditional, because it is
+        # the only one that allocates parameters (and so changes the checkpoint). Gating the
+        # scalars too made `model.ki_num_action_tokens` an AttributeError on every non-KI
+        # model, which anything introspecting a stock Pi0 would hit.
         self.knowledge_insulation = config.knowledge_insulation
+        self.ki_fast_loss_weight = config.ki_fast_loss_weight
+        self.ki_num_action_tokens = config.ki_num_action_tokens
         if config.knowledge_insulation:
             self.discrete_action_head = nnx.Linear(
                 paligemma_config.width, config.ki_fast_vocab_size, rngs=rngs
             )
-            self.ki_fast_loss_weight = config.ki_fast_loss_weight
-            self.ki_num_action_tokens = config.ki_num_action_tokens
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True

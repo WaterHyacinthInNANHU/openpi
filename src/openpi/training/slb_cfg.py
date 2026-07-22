@@ -62,37 +62,26 @@ logger = logging.getLogger(__name__)
 # because no cfg checkpoint has been trained yet (the running sweep is the other 4 arms).
 ADVANTAGE_KEY = "Advantage"
 POSITIVE_TAG = "positive"
-NEGATIVE_TAG = "negative"
 NULL_LABEL = 2  # unconditional: no tag at all
-
-# POSITIVE-ONLY CONDITIONING, matching RLinf's CFG-RL reference for openpi pi0.5
-# (examples/offline_rl/config/cfg_rl_openpi.yaml: positive_only_conditional: true,
-# guidance_type: "positive"). Only high-advantage chunks carry the tag; everything else is
-# unconditional. CFG needs p(a|good) and p(a) to extrapolate
-#     p_guided = p(a|good) + w * (p(a|good) - p(a));
-# an explicit "bad" condition would instead ask the model to MODEL bad behaviour, which is
-# both unnecessary and a use of capacity we cannot afford on ~100 demos.
-POSITIVE_ONLY = True
 
 # Fraction of positive rows dropped to unconditional so the p(a) branch is learned.
 # 0.1 matches the RLinf reference (unconditional_prob: 0.1) and the usual CFG default.
 DEFAULT_COND_DROPOUT = 0.1
 
-# Inference-time guidance weight w. 1.0 is the reference default (cfgrl_guidance_scale).
-DEFAULT_GUIDANCE_SCALE = 1.0
-
 
 def tag_for_label(label: int) -> str | None:
     """Prompt suffix for a condition label, or None for the unconditional case.
 
-    Under POSITIVE_ONLY the sidecar's negative label (1) maps to unconditional rather than
-    to a "bad" tag -- the sidecar still stores 0/1, we simply do not condition on 1.
+    POSITIVE-ONLY, matching RLinf's CFG-RL reference for openpi pi0.5
+    (examples/offline_rl/config/cfg_rl_openpi.yaml: positive_only_conditional: true,
+    guidance_type: "positive"). Only high-advantage chunks carry a tag; the sidecar's
+    negative label (1) maps to unconditional. CFG needs p(a|good) and p(a) to extrapolate
+        p_guided = p(a|good) + w * (p(a|good) - p(a));
+    an explicit "bad" condition would instead ask the model to MODEL bad behaviour, which
+    is both unnecessary and a use of capacity we cannot afford on ~100 demos. That is why
+    there is no negative branch here.
     """
-    if int(label) == 0:
-        return POSITIVE_TAG
-    if int(label) == 1 and not POSITIVE_ONLY:
-        return NEGATIVE_TAG
-    return None
+    return POSITIVE_TAG if int(label) == 0 else None
 
 
 def apply_tag(prompt: str, label: int) -> str:
@@ -140,7 +129,6 @@ class SlbCfgConditioning(_transforms.DataTransformFn):
 
     labels: dict[tuple[int, int], int]
     cond_dropout: float = DEFAULT_COND_DROPOUT
-    train: bool = True
     seed: int = 0
 
     @override
@@ -158,7 +146,7 @@ class SlbCfgConditioning(_transforms.DataTransformFn):
         label = self.labels.get(key)
         if label is None:
             return data
-        if self.train and self.cond_dropout > 0.0:
+        if self.cond_dropout > 0.0:
             # Deterministic per window: the same window always drops (or not), so a rerun
             # with the same seed reproduces the run exactly.
             rng = np.random.default_rng(
@@ -175,17 +163,28 @@ def build_cfg_labels(sidecar, join_index, fps: float) -> dict[tuple[int, int], i
     frame_index uses the SAME round(t_start * fps) the sampler uses for its row offset,
     so a labelled window is exactly the window the sampler draws. If the two ever
     diverge, rows would carry a neighbouring window's label.
+
+    Read through VariantSidecar's PUBLIC api rather than its `_per_attempt` map: `label()`
+    additionally enforces variant == "cfg", so a sidecar of the wrong variant fails here
+    instead of silently yielding zeros that look like "everything is positive".
+
+    The frame index is CLAMPED to the episode, mirroring slb_variant_sampler.plan_indices.
+    Without the clamp a window whose t_start rounds past the last frame would key a row the
+    episode does not have, and that label would simply never match -- silently dropping the
+    conditioning for the tail of every episode.
     """
     out: dict[tuple[int, int], int] = {}
-    for aid in sorted(sidecar._per_attempt):  # noqa: SLF001 - reader-owned map
+    for aid, w in sidecar.window_ids():
         ref = join_index.episode_for(aid)
         if ref is None:
             continue
-        ep = int(ref.episode_index)
         t_start = sidecar.t_start(aid)
-        labels = np.asarray(sidecar._per_attempt[aid]).reshape(-1)  # noqa: SLF001
-        for w in range(min(len(t_start), len(labels))):
-            out[(ep, int(round(float(t_start[w]) * fps)))] = int(labels[w])
+        if w >= len(t_start):
+            continue
+        frame = int(round(float(t_start[w]) * fps))
+        if ref.frame_count:
+            frame = min(frame, int(ref.frame_count) - 1)
+        out[(int(ref.episode_index), frame)] = sidecar.label(aid, w)
     return out
 
 

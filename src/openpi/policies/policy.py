@@ -94,8 +94,15 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
-        if self._uncond_input_transform is not None and not self._is_pytorch_model:
-            uncond = self._uncond_input_transform(jax.tree.map(lambda x: x, obs))
+        # Gated on guidance being ON, not merely configured: sample_actions ignores
+        # uncond_observation when guidance_scale == 0, so without this check the whole second
+        # input chain runs and ships an unused ~1.2 MB Observation on every inference call.
+        if (
+            self._uncond_input_transform is not None
+            and not self._is_pytorch_model
+            and sample_kwargs.get("guidance_scale", 0.0) != 0.0
+        ):
+            uncond = self._uncond_input_transform(dict(obs))
             uncond = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], uncond)
             sample_kwargs["uncond_observation"] = _model.Observation.from_dict(uncond)
 
