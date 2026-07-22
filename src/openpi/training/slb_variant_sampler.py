@@ -52,7 +52,7 @@ def plan_indices(
         episode_from: episode_index -> flat start row offset in the LeRobot dataset.
         sidecar: a ``VariantSidecar`` for (task, variant).
         join_index: a ``JoinIndex`` mapping attempt_id -> EpisodeRef.
-        variant: one of vanilla/filt_bin/top70/awr/cfg.
+        variant: one of vanilla/filt_bin/top70/top30/awr/cfg.
         fps: video frame rate of the LeRobot dataset (e.g. 15.0).
         ep_len: episode_index -> number of frames in that episode.
         awr_tau, awr_delta: AWR temperature and cap (only used when variant=="awr").
@@ -68,7 +68,10 @@ def plan_indices(
     is_awr = variant == "awr"
     # vanilla and cfg both keep every success window (keep_mask is all-True); cfg's
     # conditioning is injected in the action expert at train time, not by row
-    # restriction here. Only filt_bin/top70 drop rows; only awr attaches weights.
+    # restriction here. Only filt_bin/top70/top30 drop rows; only awr attaches weights.
+    # There is deliberately no variant allow-list here: which rows are dropped is decided
+    # entirely by sidecar.keep_mask (see sidecar_reader.MASK_VARIANTS), so a new filtering
+    # arm cannot half-register by being added in one place and not the other.
     n_missing_ep = 0
     for aid in sorted(sidecar._per_attempt):  # noqa: SLF001 - reader-owned map
         ref = join_index.episode_for(aid)
