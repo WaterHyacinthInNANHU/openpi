@@ -218,4 +218,4 @@ def build_conditioning(
         "SLB cfg conditioning: task=%s windows=%d positive=%d (%.1f%%) dropout=%.2f",
         task_id, len(labels), n_pos, 100.0 * n_pos / max(1, len(labels)), cond_dropout,
     )
-    return SlbCfgConditioning(labels=labels, cond_dropout=cond_dropout, train=True, seed=seed)
+    return SlbCfgConditioning(labels=labels, cond_dropout=cond_dropout, seed=seed)
