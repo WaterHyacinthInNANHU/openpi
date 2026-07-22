@@ -142,17 +142,31 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
-                )
+                inputs: list[_transforms.DataTransformFn] = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+                if model_config.knowledge_insulation:
+                    # AFTER PadStatesAndActions on purpose: the discrete head must predict the
+                    # same padded chunk the flow-matching head regresses, otherwise the two
+                    # halves of KI supervise different action spaces.
+                    # PAD id = vocab_size - 1, so `ki_fast_vocab_size` must be strictly larger
+                    # than the FAST vocabulary (2048) -- see FASTActionTokenizer.
+                    inputs.append(
+                        _transforms.TokenizeFASTActionTargets(
+                            _tokenizer.FASTActionTokenizer(
+                                num_tokens=model_config.ki_num_action_tokens,
+                                pad_token_id=model_config.ki_fast_vocab_size - 1,
+                            ),
+                            vocab_size=model_config.ki_fast_vocab_size,
+                        )
+                    )
+                return _transforms.Group(inputs=inputs)
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -646,6 +660,88 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _axis_slb_config(task_id: int, variant: str, *, knowledge_insulation: bool = False) -> TrainConfig:
+    """One arm of the AXIS Franka SLB bake-off (pi0.5 LoRA, HF-rendered Franka dataset).
+
+    `knowledge_insulation` adds a SECOND, parallel family of arms rather than changing the
+    five existing ones: a sweep is running against those, so their configs must stay
+    byte-identical. With the flag off this returns exactly what the five arms were before
+    this helper existed.
+    """
+    ki_kwargs = {}
+    if knowledge_insulation:
+        ki_kwargs = {
+            "knowledge_insulation": True,
+            # 64, not the 32 default: a normalized 16x32 chunk FAST-compresses to ~40-50 ids,
+            # so 32 would truncate away the end of nearly every chunk.
+            "ki_num_action_tokens": 64,
+            # FAST's own vocabulary is 2048; the extra slot is the pad/end-of-chunk class, so
+            # padding never collides with a real action token.
+            "ki_fast_vocab_size": 2049,
+        }
+
+    return TrainConfig(
+        name=f"pi05_axis_slb_{task_id}_{variant}" + ("_ki" if knowledge_insulation else ""),
+        # LoRA fine-tune: the model itself must carry the LoRA gemma variants
+        # (not just the freeze_filter), or training silently falls back to a
+        # full fine-tune. Must match the freeze_filter variants below.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            **ki_kwargs,
+        ),
+        data=AxisFrankaSlbDataConfig(
+            repo_id="Devon018/Franka-Datasets-v2",
+            variant=variant,
+            # Per-task pilot config. The sidecar root defaults to the offline cache
+            # convention; manifest + local dataset root come from env (keyed by
+            # task_id) so the committed config carries no machine-specific paths.
+            task_id=task_id,
+            sidecar_root=os.path.join(
+                os.environ.get("AXIS_DATALOADER_ROOT", os.path.expanduser("~/axis_dataloader_cache")),
+                "sidecars",
+            ),
+            manifest_path=os.environ.get(f"SLB_MANIFEST_{task_id}"),
+            dataset_root=os.environ.get(f"SLB_DATASET_ROOT_{task_id}"),
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(  # reuse DROID norm stats — no compute_norm_stats
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        # 20k is the field consensus for single-task pi0.5 finetuning, chosen
+        # independently by four sources: openpi's own pi05_droid_finetune
+        # ("a custom (smaller) DROID dataset" -- our exact setting, and we already
+        # copy its init and norm-stats), RoboCasa's single-task pi05-og config,
+        # RLinf's robotwin single-task SFT, and the one RoboTwin config that
+        # overrides the default. The previous 30_000 was NOT a choice: it is the
+        # TrainConfig default at :579 restated, and `git log -L` on that line shows
+        # it was never revisited. RoboTwin inherits the same default the same way.
+        #
+        # Deliberately NOT changing the lr_schedule alongside it. The inherited
+        # CosineDecaySchedule has decay_steps=30_000, so stopping at 20k ends at
+        # ~34% of peak LR rather than the floor. Every one of those four sources
+        # runs exactly this truncated cosine, so matching them is the defensible
+        # choice; the truncation is a known divergence, not an oversight. (It WOULD
+        # be a problem at a much shorter budget -- at 4k the LR is still 97.7% of
+        # peak, i.e. no annealing at all.)
+        num_train_steps=20_000,
+        # LeRobot v3.0 decodes video per item; the default 2 workers starve both
+        # norm-stats and training. 8 matches --cpus-per-task=8 in the sbatch.
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -854,76 +950,22 @@ _CONFIGS = [
     #
     # Fine-tuning AXIS Franka SLB configs (pi0.5 LoRA, HF-rendered Franka dataset).
     #
+    # SLB v2 pilot pair. Only 24 of SLB's 86 tasks have rendered HF episodes at all;
+    # 1644/1645 are the two best of those -- 20 scene variants each (4x task 1424's 5),
+    # pools of 578/510 for 100 demos, and two DIFFERENT families (pnp vs directed
+    # rotation) so the bake-off is not measuring a single skill. 1424 dropped: 5
+    # variants and only 103 joinable demos for 100, the thinnest margin of any
+    # candidate. Extend once the full render finishes.
+    #
+    # Each arm also gets a `_ki` twin with knowledge insulation enabled (arXiv:2505.23705):
+    # same data, same LoRA setup, but the flow-matching gradient is cut at the prefix KV and
+    # the VLM is instead trained by a FAST-token cross-entropy. Separate names so the
+    # in-flight non-KI sweep is untouched and the pair is a clean A/B.
     *[
-        TrainConfig(
-            name=f"pi05_axis_slb_{task_id}_{variant}",
-            # LoRA fine-tune: the model itself must carry the LoRA gemma variants
-            # (not just the freeze_filter), or training silently falls back to a
-            # full fine-tune. Must match the freeze_filter variants below.
-            model=pi0_config.Pi0Config(
-                pi05=True,
-                action_dim=32,
-                action_horizon=16,
-                paligemma_variant="gemma_2b_lora",
-                action_expert_variant="gemma_300m_lora",
-            ),
-            data=AxisFrankaSlbDataConfig(
-                repo_id="Devon018/Franka-Datasets-v2",
-                variant=variant,
-                # Per-task pilot config. The sidecar root defaults to the offline cache
-                # convention; manifest + local dataset root come from env (keyed by
-                # task_id) so the committed config carries no machine-specific paths.
-                task_id=task_id,
-                sidecar_root=os.path.join(
-                    os.environ.get("AXIS_DATALOADER_ROOT", os.path.expanduser("~/axis_dataloader_cache")),
-                    "sidecars",
-                ),
-                manifest_path=os.environ.get(f"SLB_MANIFEST_{task_id}"),
-                dataset_root=os.environ.get(f"SLB_DATASET_ROOT_{task_id}"),
-                base_config=DataConfig(prompt_from_task=True),
-                assets=AssetsConfig(  # reuse DROID norm stats — no compute_norm_stats
-                    assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
-                    asset_id="droid",
-                ),
-            ),
-            weight_loader=weight_loaders.CheckpointWeightLoader(
-                "gs://openpi-assets/checkpoints/pi05_droid/params"
-            ),
-            # 20k is the field consensus for single-task pi0.5 finetuning, chosen
-            # independently by four sources: openpi's own pi05_droid_finetune
-            # ("a custom (smaller) DROID dataset" -- our exact setting, and we already
-            # copy its init and norm-stats), RoboCasa's single-task pi05-og config,
-            # RLinf's robotwin single-task SFT, and the one RoboTwin config that
-            # overrides the default. The previous 30_000 was NOT a choice: it is the
-            # TrainConfig default at :579 restated, and `git log -L` on that line shows
-            # it was never revisited. RoboTwin inherits the same default the same way.
-            #
-            # Deliberately NOT changing the lr_schedule alongside it. The inherited
-            # CosineDecaySchedule has decay_steps=30_000, so stopping at 20k ends at
-            # ~34% of peak LR rather than the floor. Every one of those four sources
-            # runs exactly this truncated cosine, so matching them is the defensible
-            # choice; the truncation is a known divergence, not an oversight. (It WOULD
-            # be a problem at a much shorter budget -- at 4k the LR is still 97.7% of
-            # peak, i.e. no annealing at all.)
-            num_train_steps=20_000,
-            # LeRobot v3.0 decodes video per item; the default 2 workers starve both
-            # norm-stats and training. 8 matches --cpus-per-task=8 in the sbatch.
-            num_workers=8,
-            freeze_filter=pi0_config.Pi0Config(
-                pi05=True,
-                paligemma_variant="gemma_2b_lora",
-                action_expert_variant="gemma_300m_lora",
-            ).get_freeze_filter(),
-            ema_decay=None,
-        )
-        # SLB v2 pilot pair. Only 24 of SLB's 86 tasks have rendered HF episodes at all;
-        # 1644/1645 are the two best of those -- 20 scene variants each (4x task 1424's 5),
-        # pools of 578/510 for 100 demos, and two DIFFERENT families (pnp vs directed
-        # rotation) so the bake-off is not measuring a single skill. 1424 dropped: 5
-        # variants and only 103 joinable demos for 100, the thinnest margin of any
-        # candidate. Extend once the full render finishes.
+        _axis_slb_config(task_id, variant, knowledge_insulation=ki)
         for task_id in (1644, 1645)
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
+        for ki in (False, True)
     ],
     #
     # Fine-tuning Aloha configs.

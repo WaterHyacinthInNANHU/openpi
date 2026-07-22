@@ -19,6 +19,8 @@ TWO THINGS THIS TEST HAS TO WORK AROUND, both of which silently make it pass vac
 The control assertion (`joint` MUST leak) is what keeps the above from passing silently.
 """
 
+import dataclasses
+
 import einops
 import flax.nnx as nnx
 import jax
@@ -62,19 +64,19 @@ def _bucket(path: str) -> str:
     return "heads"
 
 
-def _grads(model, obs, x_t, t, prefix, mode):
+def _grads(model, obs, x_t, t, prefix, mode, *, with_fast_ce=False):
     def loss(mod):
         pt, pm, pam = prefix
         st, sm, sam, ac = mod.embed_suffix(obs, x_t, t)
         if mode == "joint":
             im = jnp.concatenate([pm, sm], axis=1)
             am = jnp.concatenate([pam, sam], axis=0)
-            (_, so), _ = mod.PaliGemma.llm(
+            (po, so), _ = mod.PaliGemma.llm(
                 [pt, st], mask=make_attn_mask(im, am),
                 positions=jnp.cumsum(im, axis=1) - 1, adarms_cond=[None, ac],
             )
         else:
-            (_, _), kv = mod.PaliGemma.llm(
+            (po, _), kv = mod.PaliGemma.llm(
                 [pt, None], mask=make_attn_mask(pm, pam), positions=jnp.cumsum(pm, axis=1) - 1
             )
             if mode == "stop":
@@ -86,7 +88,12 @@ def _grads(model, obs, x_t, t, prefix, mode):
                 positions=jnp.sum(pm, axis=-1)[:, None] + jnp.cumsum(sm, axis=-1) - 1,
                 kv_cache=kv, adarms_cond=[None, ac],
             )
-        return jnp.mean(mod.action_out_proj(so[:, -_AH:]) ** 2)
+        action_loss = jnp.mean(mod.action_out_proj(so[:, -_AH:]) ** 2)
+        if not with_fast_ce:
+            return action_loss
+        # Same composition compute_loss uses: MSE + ki_fast_loss_weight * CE, with the CE read
+        # off the (stop-gradiented for the suffix, but NOT for itself) prefix output.
+        return action_loss + mod.ki_fast_loss_weight * jnp.mean(mod._fast_token_loss(po, obs))  # noqa: SLF001
 
     out: dict[str, float] = {}
     for path, v in jax.tree_util.tree_flatten_with_path(nnx.grad(loss)(model))[0]:
@@ -97,14 +104,33 @@ def _grads(model, obs, x_t, t, prefix, mode):
 
 
 @pytest.fixture(scope="module")
-def _setup():
+def _world():
+    """Model creation is the expensive part (~1 min on CPU), so it is built once per module."""
     model, cfg = _randomized_model()
     obs = cfg.fake_obs(batch_size=_B)
     x_t = jax.random.normal(jax.random.key(3), (_B, _AH, _AD))
     t = jnp.full((_B,), 0.5)
     pt, pm, pam = model.embed_prefix(obs)
     prefix = (jax.random.normal(jax.random.key(9), pt.shape), pm, pam)
-    return {m: _grads(model, obs, x_t, t, prefix, m) for m in ("joint", "2pass", "stop")}
+    # Stand-in for what TokenizeFASTActionTargets puts in the batch. Real FAST ids are not
+    # needed here -- the CE is over arbitrary class indices either way, and the gradient
+    # topology (which is what this file tests) does not depend on their values. Keeping this
+    # synthetic also keeps the test runnable with no network access.
+    obs_ki = dataclasses.replace(
+        obs,
+        fast_action_tokens=jax.random.randint(
+            jax.random.key(17), (_B, cfg.ki_num_action_tokens), 0, cfg.ki_fast_vocab_size, dtype=jnp.int32
+        ),
+    )
+    return model, cfg, obs, obs_ki, x_t, t, prefix
+
+
+@pytest.fixture(scope="module")
+def _setup(_world):
+    model, _, obs, obs_ki, x_t, t, prefix = _world
+    out = {m: _grads(model, obs, x_t, t, prefix, m) for m in ("joint", "2pass", "stop")}
+    out["stop+ce"] = _grads(model, obs_ki, x_t, t, prefix, "stop", with_fast_ce=True)
+    return out
 
 
 def test_control_joint_forward_leaks_into_vlm(_setup):
@@ -129,3 +155,35 @@ def test_action_expert_still_trains_under_insulation(_setup):
         _setup["joint"].get("expert", 0.0), rel=1e-3
     )
     assert _setup["stop"].get("heads", 0.0) > 1e-9
+
+
+def test_fast_token_loss_restores_the_vlm_gradient(_setup):
+    """THE property that separates knowledge insulation from backbone freezing.
+
+    Cutting the action gradient (test_stop_gradient_cuts_the_vlm_path) is only half of KI. If
+    that were the whole story the VLM would receive no gradient at all and would simply be
+    frozen. The discrete FAST-token CE has to put a gradient back into the *same* VLM
+    parameters the cut removed it from -- via a different path, so the representations are
+    shaped by token prediction rather than by flow-matching regression.
+
+    Same model, same batch, same stop_gradient: the ONLY difference from `stop` is the CE term.
+    """
+    assert _setup["stop"]["vlm_llm"] == 0.0, "precondition: the action path must be cut"
+    assert _setup["stop+ce"].get("vlm_llm", 0.0) > 1e-9
+
+
+def test_fast_token_loss_does_not_disturb_the_action_expert(_setup):
+    """The CE reads only the prefix stream, so adding it must leave the action expert's
+    gradient exactly where the pure flow-matching loss put it."""
+    assert _setup["stop+ce"].get("expert", 0.0) == pytest.approx(_setup["stop"].get("expert", 0.0), rel=1e-3)
+
+
+def test_missing_fast_action_tokens_is_a_hard_error(_world):
+    """`fast_action_tokens` is optional on Observation so every non-KI config is unaffected --
+    which means a KI run whose data pipeline forgot the transform would otherwise train as a
+    plain frozen backbone while still reporting itself as KI. That must fail loudly."""
+    model, cfg, obs, *_ = _world
+    assert obs.fast_action_tokens is None, "fake_obs must not supply KI targets by default"
+    prefix_out = jnp.zeros((_B, cfg.ki_num_action_tokens, model.discrete_action_head.in_features))
+    with pytest.raises(ValueError, match="fast_action_tokens"):
+        model._fast_token_loss(prefix_out, obs)  # noqa: SLF001

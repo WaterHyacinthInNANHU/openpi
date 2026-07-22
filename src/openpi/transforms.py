@@ -7,6 +7,7 @@ import flax.traverse_util as traverse_util
 import jax
 import numpy as np
 from openpi_client import image_tools
+from typing_extensions import override
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
@@ -286,6 +287,38 @@ class TokenizeFASTInputs(DataTransformFn):
             "token_ar_mask": ar_mask,
             "token_loss_mask": loss_mask,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeFASTActionTargets(DataTransformFn):
+    """Adds `fast_action_tokens`, the discrete target that trains the VLM under knowledge insulation.
+
+    Unlike `TokenizeFASTInputs` this does not touch the prompt: the FAST ids are a LABEL for a
+    separate head, not part of the language input. It is therefore additive -- every other key
+    the pi0.5 model transforms produce is left exactly as it was.
+
+    No-op when `actions` is absent (i.e. at inference), so the same transform group can serve
+    both training and serving.
+    """
+
+    tokenizer: _tokenizer.FASTActionTokenizer
+
+    # Ids >= this are impossible for the discrete head to emit, so a target outside the range
+    # would silently make the CE unlearnable. Checked rather than clipped.
+    vocab_size: int
+
+    @override
+    def __call__(self, data: DataDict) -> DataDict:
+        if (actions := data.get("actions")) is None:
+            return data
+
+        tokens = self.tokenizer.tokenize_actions(np.asarray(actions))
+        if int(tokens.max(initial=0)) >= self.vocab_size:
+            raise ValueError(
+                f"FAST action token id {int(tokens.max())} is outside the discrete head's vocabulary "
+                f"({self.vocab_size}); raise `ki_fast_vocab_size`."
+            )
+        return {**data, "fast_action_tokens": tokens}
 
 
 @dataclasses.dataclass(frozen=True)
