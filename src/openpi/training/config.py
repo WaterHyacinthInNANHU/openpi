@@ -395,19 +395,21 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
         # Offline advantage only -- no critic, matching the reference's
         # add_value_head/use_critic_model=False.
         cfg_inputs: list[_transforms.DataTransformFn] = []
-        if self.slb_variant == "cfg" and self.slb_sidecar_root and self.slb_task_id is not None:
+        # NB: these are the FACTORY's fields (`variant`, `task_id`, ...), not the DataConfig's
+        # `slb_`-prefixed ones -- the prefixed spellings raised AttributeError on every call.
+        if self.variant == "cfg" and self.sidecar_root and self.task_id is not None:
             from openpi.training import slb_cfg
 
             try:
                 cfg_inputs = [slb_cfg.build_conditioning(
-                    task_id=int(self.slb_task_id),
-                    sidecar_root=self.slb_sidecar_root,
-                    manifest_path=self.slb_manifest_path,
+                    task_id=int(self.task_id),
+                    sidecar_root=self.sidecar_root,
+                    manifest_path=self.manifest_path,
                 )]
             except Exception as exc:  # noqa: BLE001
                 # Fail loudly: silently training `cfg` without conditioning would make it a
                 # byte-for-byte duplicate of vanilla and quietly invalidate that arm.
-                raise RuntimeError(f"SLB cfg conditioning unavailable for task {self.slb_task_id}: {exc}") from exc
+                raise RuntimeError(f"SLB cfg conditioning unavailable for task {self.task_id}: {exc}") from exc
 
         repack_transform = _transforms.Group(
             inputs=cfg_inputs + [
