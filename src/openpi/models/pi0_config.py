@@ -34,6 +34,20 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # KNOWLEDGE INSULATION (arXiv:2505.23705). Two halves, and BOTH are required:
+    #   1. stop-gradient on the prefix KV so the action expert cannot backprop into the VLM
+    #   2. a discrete (FAST) action-token loss that trains the VLM instead
+    # Half 1 alone is NOT knowledge insulation -- with no other signal reaching it the VLM
+    # simply stops learning, which is plain backbone freezing. Upstream openpi implements
+    # neither (README: "we currently only support the flow matching head").
+    knowledge_insulation: bool = False
+    # Weight on the discrete-action CE relative to the flow-matching MSE.
+    ki_fast_loss_weight: float = 1.0
+    # Number of FAST action tokens supervised per example, and their vocabulary size.
+    # Must match whatever the data pipeline puts in Observation.fast_action_tokens.
+    ki_num_action_tokens: int = 32
+    ki_fast_vocab_size: int = 2048
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

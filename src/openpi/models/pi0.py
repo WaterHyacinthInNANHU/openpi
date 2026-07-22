@@ -98,6 +98,17 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        # KI half 2: predicts discrete (FAST) action tokens from the VLM stream, so the VLM
+        # keeps a learning signal once the action-expert gradient path is cut. Shared across
+        # the supervised token positions, so this costs width*vocab params, not
+        # width*num_tokens*vocab.
+        self.knowledge_insulation = config.knowledge_insulation
+        if config.knowledge_insulation:
+            self.discrete_action_head = nnx.Linear(
+                paligemma_config.width, config.ki_fast_vocab_size, rngs=rngs
+            )
+            self.ki_fast_loss_weight = config.ki_fast_loss_weight
+            self.ki_num_action_tokens = config.ki_num_action_tokens
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -199,19 +210,86 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
-        )
+
+        if self.knowledge_insulation:
+            prefix_out, suffix_out = self._forward_insulated(
+                prefix_tokens, prefix_mask, prefix_ar_mask,
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond,
+            )
+        else:
+            # one big forward pass of prefix + suffix at once
+            input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+            attn_mask = make_attn_mask(input_mask, ar_mask)
+            positions = jnp.cumsum(input_mask, axis=1) - 1
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if self.knowledge_insulation:
+            # Broadcasting over the action horizon leaves the mean unchanged, so the CE
+            # enters the total loss with exactly ki_fast_loss_weight.
+            loss = loss + self.ki_fast_loss_weight * self._fast_token_loss(prefix_out, observation)[:, None]
+        return loss
+
+    def _forward_insulated(
+        self, prefix_tokens, prefix_mask, prefix_ar_mask,
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond,
+    ):
+        """Prefix and suffix in two passes, with the VLM's KV detached between them.
+
+        The joint single-pass forward lets the flow-matching loss backprop through the
+        suffix's attention into every VLM activation. That is what KI exists to stop: the
+        gradient of a continuous action loss is what degrades the pretrained
+        representations. Splitting the forward gives us a seam to cut.
+
+        The cut is on the KV CACHE, not on `prefix_tokens`. Detaching the input embeddings
+        (as Shiduo-zh/openpi does) only protects the vision tower and embedder -- the LLM
+        layers processing the prefix would still receive action gradients through attention.
+        Detaching the cache severs every path, matching liushb9/TACO (JAX) and
+        TensorAuto/OpenTau (`past_key_values[...].detach()`).
+        """
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions
+        )
+        kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)
+
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_part = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        full_attn_mask = jnp.concatenate([prefix_part, suffix_attn_mask], axis=-1)
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens], mask=full_attn_mask, positions=positions,
+            kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+        )
+        return prefix_out, suffix_out
+
+    def _fast_token_loss(self, prefix_out, observation) -> at.Float[at.Array, " b"]:
+        """Cross-entropy on discrete FAST action tokens predicted from the VLM stream.
+
+        This is the ONLY signal training the VLM once the action gradient is cut, so a
+        missing target is a hard error: silently dropping it would turn `knowledge_insulation`
+        into plain backbone freezing while still reporting itself as KI.
+        """
+        targets = getattr(observation, "fast_action_tokens", None)
+        if targets is None:
+            raise ValueError(
+                "knowledge_insulation=True requires Observation.fast_action_tokens "
+                f"(int32 [b, {self.ki_num_action_tokens}]) from the data pipeline: with the "
+                "action-expert gradient path cut, the VLM would otherwise receive no gradient "
+                "at all, which is backbone freezing rather than knowledge insulation."
+            )
+        n = self.ki_num_action_tokens
+        logits = self.discrete_action_head(prefix_out[:, -n:])
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        picked = jnp.take_along_axis(logp, targets[..., None].astype(jnp.int32), axis=-1)[..., 0]
+        return -jnp.mean(picked, axis=-1)
 
     @override
     def sample_actions(
@@ -221,7 +299,25 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        guidance_scale: float = 0.0,
+        uncond_observation: _model.Observation | None = None,
     ) -> _model.Actions:
+        """Sample an action chunk, optionally with classifier-free guidance.
+
+        CFG (used by the SLB `cfg` variant, see training/slb_cfg.py) needs `uncond_observation`
+        to be identical to `observation` except for the tokenized prompt, which omits the
+        quality tag. The guided velocity is
+            v = v_uncond + (1 + guidance_scale) * (v_cond - v_uncond)
+        so guidance_scale=0 reproduces plain conditional sampling exactly.
+
+        It must be applied at EVERY denoising step: the flow ODE is integrated, so mixing
+        only the final actions of two separate rollouts is not guidance, it is an average of
+        two different trajectories. We therefore run both branches as one batch-doubled
+        forward -- cond and uncond share x_t, so the only thing that differs is the prefix.
+
+        Inference-only; no parameters are added, so checkpoints stay interchangeable with
+        the other SLB variants.
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -229,6 +325,16 @@ class Pi0(_model.BaseModel):
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Both branches are stacked along the batch axis and run through one forward pass,
+        # rather than two sequential passes, so guidance costs ~1 extra batch not ~2x latency.
+        do_cfg = bool(guidance_scale != 0.0 and uncond_observation is not None)
+        if do_cfg:
+            uncond_observation = _model.preprocess_observation(None, uncond_observation, train=False)
+            observation = jax.tree.map(
+                lambda c, u: jnp.concatenate([c, u], axis=0), observation, uncond_observation
+            )
+        eff_bs = 2 * batch_size if do_cfg else batch_size
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -238,8 +344,11 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            # Both branches denoise the SAME x_t; they differ only through the prefix they
+            # attend to, which is what makes the two velocities comparable.
+            x_in = jnp.concatenate([x_t, x_t], axis=0) if do_cfg else x_t
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_in, jnp.broadcast_to(time, eff_bs)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -251,7 +360,7 @@ class Pi0(_model.BaseModel):
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
-                batch_size,
+                eff_bs,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
@@ -267,6 +376,10 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            if do_cfg:
+                v_cond, v_uncond = jnp.split(v_t, 2, axis=0)
+                v_t = v_uncond + (1.0 + guidance_scale) * (v_cond - v_uncond)
 
             return x_t + dt * v_t, time + dt
 

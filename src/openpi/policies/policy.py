@@ -29,6 +29,7 @@ class Policy(BasePolicy):
         rng: at.KeyArrayLike | None = None,
         transforms: Sequence[_transforms.DataTransformFn] = (),
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
+        uncond_transforms: Sequence[_transforms.DataTransformFn] | None = None,
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
@@ -50,6 +51,12 @@ class Policy(BasePolicy):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
+        # For classifier-free guidance: a second input chain, identical except that it does
+        # NOT apply the quality tag, giving the unconditional branch. Built per-inference
+        # from the same raw obs so the two branches differ ONLY in the tokenized prompt.
+        self._uncond_input_transform = (
+            _transforms.compose(uncond_transforms) if uncond_transforms is not None else None
+        )
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
@@ -86,6 +93,11 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+
+        if self._uncond_input_transform is not None and not self._is_pytorch_model:
+            uncond = self._uncond_input_transform(jax.tree.map(lambda x: x, obs))
+            uncond = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], uncond)
+            sample_kwargs["uncond_observation"] = _model.Observation.from_dict(uncond)
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

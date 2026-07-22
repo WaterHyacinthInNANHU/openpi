@@ -52,9 +52,17 @@ import openpi.transforms as _transforms
 
 logger = logging.getLogger(__name__)
 
-# Tag appended to the prompt for the CONDITIONAL branch. An ordinary word (not a sentinel
-# symbol) so it tokenizes into something PaliGemma has representations for.
-POSITIVE_TAG = "good"
+# Tag appended to the prompt for the CONDITIONAL branch.
+#
+# The exact spelling "\nAdvantage: positive" is the de-facto standard across every
+# advantage-conditioned VLA implementation surveyed -- RLinf (cfg_model.py
+# TokenizePromptWithGuidance), Evo-RL (rl/acp_tags.py) and OpenTau (modeling_pi0.py) all
+# emit this identical string. Matching it costs nothing and makes our `cfg` arm directly
+# comparable to published results instead of using a private convention. Safe to adopt now
+# because no cfg checkpoint has been trained yet (the running sweep is the other 4 arms).
+ADVANTAGE_KEY = "Advantage"
+POSITIVE_TAG = "positive"
+NEGATIVE_TAG = "negative"
 NULL_LABEL = 2  # unconditional: no tag at all
 
 # POSITIVE-ONLY CONDITIONING, matching RLinf's CFG-RL reference for openpi pi0.5
@@ -83,15 +91,36 @@ def tag_for_label(label: int) -> str | None:
     if int(label) == 0:
         return POSITIVE_TAG
     if int(label) == 1 and not POSITIVE_ONLY:
-        return "bad"
+        return NEGATIVE_TAG
     return None
 
 
 def apply_tag(prompt: str, label: int) -> str:
-    """Append the quality tag. Null returns the prompt unchanged -- that IS the
+    """Append the advantage tag. Null returns the prompt unchanged -- that IS the
     unconditional prompt, so conditional and unconditional inputs differ only by the tag."""
     tag = tag_for_label(label)
-    return prompt if tag is None else f"{prompt}, quality: {tag}"
+    return prompt if tag is None else f"{prompt}\n{ADVANTAGE_KEY}: {tag}"
+
+
+@dataclasses.dataclass(frozen=True)
+class FixedCfgConditioning(_transforms.DataTransformFn):
+    """Apply a FIXED condition at inference, independent of any label.
+
+    Eval has no advantage label -- that is what we are trying to predict -- so the
+    conditional branch simply asks for the positive one (`label=0`), which is the whole
+    point of advantage conditioning, and the unconditional branch (`label=NULL_LABEL`)
+    leaves the prompt bare. Pair the two through Policy(uncond_transforms=...) so the
+    branches differ only in the tag.
+    """
+
+    label: int = 0
+
+    @override
+    def __call__(self, data: dict) -> dict:
+        prompt = data.get("prompt")
+        if prompt is None:
+            return data
+        return {**data, "prompt": apply_tag(str(prompt), self.label)}
 
 
 @dataclasses.dataclass(frozen=True)
