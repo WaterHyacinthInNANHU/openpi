@@ -707,7 +707,20 @@ def _axis_slb_config(task_id: int, variant: str, *, knowledge_insulation: bool =
             manifest_path=os.environ.get(f"SLB_MANIFEST_{task_id}"),
             dataset_root=os.environ.get(f"SLB_DATASET_ROOT_{task_id}"),
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(  # reuse DROID norm stats — no compute_norm_stats
+            # Reuse DROID's norm stats -- do NOT run compute_norm_stats for these configs.
+            # Init and stats then come from the SAME checkpoint, so the action expert is
+            # already calibrated to this scale; with LoRA on ~100 demos there is little
+            # capacity to relearn a different one. Measured cost of staying on DROID's
+            # scale: our actions span 54-79% of its normalized spread (<1 bit) and clip
+            # <0.65%/dim. Our own stats would be WORSE for the gripper -- dim 7 is an
+            # absolute command whose "open" level is task-specific (0.097-0.350), so
+            # per-task stats would map four different physical widths all to -1.0.
+            #
+            # DO NOT DELETE THIS BLOCK as redundant. Without it asset_id falls back to
+            # repo_id, and the stale 9-D POSITION-space norm_stats.json left in
+            # openpi/assets/pi05_axis_slb_*/ by the superseded slb_variant_4task.sbatch
+            # path would be loaded silently for this 8-D VELOCITY dataset.
+            assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
                 asset_id="droid",
             ),
