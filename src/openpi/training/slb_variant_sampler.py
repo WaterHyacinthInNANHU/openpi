@@ -63,7 +63,7 @@ def plan_indices(
     ep_len: Mapping[int, int],
     awr_tau: float = 3.0,
     awr_delta: float = 2.0,
-    render_aligned_rows: bool = False,
+    render_aligned_rows: bool = True,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Map kept (attempt, window) pairs to flat rows (+ AWR weights).
 
@@ -107,12 +107,8 @@ def plan_indices(
             if render_aligned_rows:
                 row = base + int(round((float(t_start[int(w)]) - t0) * fps)) + RENDER_FRAME_OFFSET
             else:
-                # LEGACY, and measurably wrong by one frame (see RENDER_FRAME_OFFSET).
-                # Kept as the default ONLY so an in-flight bake-off stays self-consistent:
-                # switching the row map mid-sweep would give queued arms a different
-                # window->row mapping from the arms already trained, which biases the very
-                # comparison the sweep exists to make. Set render_aligned_rows=True for
-                # every NEW run.
+                # LEGACY, measurably wrong by one frame (see RENDER_FRAME_OFFSET). Retained
+                # only to reproduce runs made before 2026-07-22; never use it for new work.
                 row = base + int(round(float(t_start[int(w)]) * fps))
             row = min(max(row, base), hi)  # clamp into this episode
             rows.append(row)

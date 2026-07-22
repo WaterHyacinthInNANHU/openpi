@@ -124,12 +124,10 @@ class DataConfig:
     awr_tau: float = 10.0
     awr_delta: float = 2.0
     # Map sidecar windows to dataset rows with the RENDER-ALIGNED rule
-    # (round((t - t0)*fps) + RENDER_FRAME_OFFSET) instead of the legacy round(t*fps), which
-    # is measurably one frame late for ~95% of windows (see slb_variant_sampler).
-    # Defaults False ONLY to keep the in-flight bake-off self-consistent -- a mid-sweep
-    # change would give queued arms a different mapping from arms already trained. Set True
-    # for every NEW run, including the pretraining corpus.
-    slb_render_aligned_rows: bool = False
+    # (round((t - t0)*fps) + RENDER_FRAME_OFFSET). The legacy round(t*fps) is measurably one
+    # frame late for ~95% of windows -- see slb_variant_sampler.RENDER_FRAME_OFFSET, which
+    # documents the qpos-based measurement. False only reproduces pre-2026-07-22 runs.
+    slb_render_aligned_rows: bool = True
 
 
 class GroupFactory(Protocol):

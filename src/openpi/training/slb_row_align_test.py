@@ -45,11 +45,12 @@ def test_legacy_rule_lands_one_frame_late():
     assert (_rows(False, t) - _rows(True, t)).tolist() == [1, 1, 1]
 
 
-def test_default_is_legacy_so_an_inflight_sweep_is_unperturbed():
+def test_default_is_render_aligned():
+    """The correct rule must be what you get without asking for it."""
     t = [0.2, 0.4, 0.6]
     rows, _ = S.plan_indices({0: 1000}, _Sidecar(t), _Join(), "vanilla",
                              fps=15.0, ep_len={0: 500})
-    assert list(rows) == list(_rows(False, t))
+    assert list(rows) == list(_rows(True, t))
 
 
 def test_trace_starting_at_zero_agrees_with_legacy_plus_offset():
