@@ -770,8 +770,52 @@ def _axis_slb_config(task_id: int, variant: str, *, knowledge_insulation: bool =
     )
 
 
+def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsdp_devices: int = 4) -> TrainConfig:
+    """FULL-WEIGHT pi0.5 fine-tune on real AXIS data -- built to MEASURE step throughput,
+    not to produce a checkpoint.
+
+    Differs from the LoRA SLB arms in exactly the two ways that matter for the 1M-trajectory
+    full-weight plan:
+      * gemma_2b / gemma_300m (NOT the _lora variants) and no freeze_filter -> all 3.35B
+        parameters train, with full-size AdamW optimizer state (2x params).
+      * fsdp_devices sharded across the 4 RTX Pro 6000 (Blackwell) so the optimizer state
+        and params fit; batch_size is the GLOBAL batch (per-GPU = batch_size / fsdp_devices).
+
+    It reuses the SLB data pipeline (one converted AXIS task) so data loading is realistic
+    -- the point is s/step under a real dataloader, not synthetic data. num_train_steps is
+    small on purpose; run ~200 steps and read the steady-state rate after compile+warmup.
+    Env: set AXIS_DATALOADER_ROOT, SLB_MANIFEST_<task_id>, SLB_DATASET_ROOT_<task_id> as for
+    the SLB arms.
+    """
+    return TrainConfig(
+        name="pi05_axis_fullweight_speedtest",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),  # full weight: no _lora
+        data=AxisFrankaSlbDataConfig(
+            repo_id="Devon018/Franka-Datasets-v2",
+            variant="vanilla",
+            task_id=task_id,
+            sidecar_root=os.path.join(
+                os.environ.get("AXIS_DATALOADER_ROOT", os.path.expanduser("~/axis_dataloader_cache")), "sidecars"
+            ),
+            manifest_path=os.environ.get(f"SLB_MANIFEST_{task_id}"),
+            dataset_root=os.environ.get(f"SLB_DATASET_ROOT_{task_id}"),
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=200,       # a speed probe, not a training run
+        batch_size=batch_size,     # GLOBAL; per-GPU = batch_size / fsdp_devices
+        fsdp_devices=fsdp_devices,  # 4x RTX Pro 6000 Blackwell
+        num_workers=8,
+        save_interval=100_000,     # do not checkpoint during the probe
+        ema_decay=None,
+        # NO freeze_filter -> all params trainable (full weight).
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    _axis_fullweight_speedtest(),
     #
     # Inference Aloha configs.
     #
