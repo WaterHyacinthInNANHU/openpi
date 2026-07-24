@@ -693,15 +693,16 @@ def _axis_slb_config(
     warmup to ~10% and decay over the whole run. At the 20k default the truncated cosine that
     matches the four reference recipes is kept unchanged.
     """
-    slb_lr = (
-        _optimizer.CosineDecaySchedule(
-            warmup_steps=max(100, num_train_steps // 10),
-            peak_lr=2.5e-5,
-            decay_steps=num_train_steps,
-            decay_lr=2.5e-6,
-        )
-        if num_train_steps <= 8_000
-        else _optimizer.CosineDecaySchedule()
+    # Budget-matched cosine: warmup ~10% of the run, decay over the WHOLE run so the LR
+    # actually anneals to the floor at this fixed-epoch budget (the inherited default
+    # warmup=1000/decay=30_000 neither warms nor anneals correctly at a few-thousand-step
+    # run). Applied at every SLB budget now that we train a fixed number of epochs rather
+    # than the old 20k truncated-cosine recipe.
+    slb_lr = _optimizer.CosineDecaySchedule(
+        warmup_steps=max(100, num_train_steps // 10),
+        peak_lr=2.5e-5,
+        decay_steps=num_train_steps,
+        decay_lr=2.5e-6,
     )
     ki_kwargs = {}
     if knowledge_insulation:
@@ -1054,13 +1055,15 @@ _CONFIGS = [
     # same data, same LoRA setup, but the flow-matching gradient is cut at the prefix KV and
     # the VLM is instead trained by a FAST-token cross-entropy. Separate names so the
     # in-flight non-KI sweep is untouched and the pair is a clean A/B.
-    # 50 epochs over each task's 25-demo homogeneous variant selection. Steps = 50 *
-    # ceil(vanilla_windows / batch_size 32): task 1644 has 1572 windows -> 2456 steps, task
-    # 1645 has 1855 -> 2898. Same step budget across all five variants of a task (fixed budget
-    # for a fair bake-off); it differs BETWEEN tasks only because their demo sets differ.
+    # 150 epochs over each task's 25-demo homogeneous variant selection (50 epochs was
+    # under-fit: dual-sim rollout was 0/20 across every 1644 arm, the policy reaching toward
+    # the objects but not completing the grasp/place). Steps = round(150 * windows / bs32):
+    # task 1644 has 1572 windows -> 7369 steps, task 1645 has 1855 -> 8695. Same step budget
+    # across all five variants of a task (fixed budget for a fair bake-off); differs BETWEEN
+    # tasks only because their demo sets differ.
     *[
         _axis_slb_config(task_id, variant, knowledge_insulation=ki,
-                         num_train_steps={1644: 2456, 1645: 2898}[task_id])
+                         num_train_steps={1644: 7369, 1645: 8695}[task_id])
         for task_id in (1644, 1645)
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
