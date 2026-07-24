@@ -675,14 +675,34 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
-def _axis_slb_config(task_id: int, variant: str, *, knowledge_insulation: bool = False) -> TrainConfig:
+def _axis_slb_config(
+    task_id: int, variant: str, *, knowledge_insulation: bool = False, num_train_steps: int = 20_000
+) -> TrainConfig:
     """One arm of the AXIS Franka SLB bake-off (pi0.5 LoRA, HF-rendered Franka dataset).
 
     `knowledge_insulation` adds a SECOND, parallel family of arms rather than changing the
     five existing ones: a sweep is running against those, so their configs must stay
     byte-identical. With the flag off this returns exactly what the five arms were before
     this helper existed.
+
+    `num_train_steps` lets a caller pin the budget to a fixed number of EPOCHS over a small
+    homogeneous demo set (e.g. 50 epochs over the 25-demo variant selection -> ~2.5k steps)
+    instead of the 20k default. At a short budget the inherited warmup=1000 / decay=30_000
+    cosine does not anneal (at ~2.5k steps LR is ~98% of peak) and warmup would eat ~40% of
+    the run -- the exact failure the num_train_steps comment below warns about -- so we scale
+    warmup to ~10% and decay over the whole run. At the 20k default the truncated cosine that
+    matches the four reference recipes is kept unchanged.
     """
+    slb_lr = (
+        _optimizer.CosineDecaySchedule(
+            warmup_steps=max(100, num_train_steps // 10),
+            peak_lr=2.5e-5,
+            decay_steps=num_train_steps,
+            decay_lr=2.5e-6,
+        )
+        if num_train_steps <= 8_000
+        else _optimizer.CosineDecaySchedule()
+    )
     ki_kwargs = {}
     if knowledge_insulation:
         ki_kwargs = {
@@ -757,7 +777,8 @@ def _axis_slb_config(task_id: int, variant: str, *, knowledge_insulation: bool =
         # choice; the truncation is a known divergence, not an oversight. (It WOULD
         # be a problem at a much shorter budget -- at 4k the LR is still 97.7% of
         # peak, i.e. no annealing at all.)
-        num_train_steps=20_000,
+        num_train_steps=num_train_steps,
+        lr_schedule=slb_lr,
         # LeRobot v3.0 decodes video per item; the default 2 workers starve both
         # norm-stats and training. 8 matches --cpus-per-task=8 in the sbatch.
         num_workers=8,
@@ -1033,8 +1054,13 @@ _CONFIGS = [
     # same data, same LoRA setup, but the flow-matching gradient is cut at the prefix KV and
     # the VLM is instead trained by a FAST-token cross-entropy. Separate names so the
     # in-flight non-KI sweep is untouched and the pair is a clean A/B.
+    # 50 epochs over each task's 25-demo homogeneous variant selection. Steps = 50 *
+    # ceil(vanilla_windows / batch_size 32): task 1644 has 1572 windows -> 2456 steps, task
+    # 1645 has 1855 -> 2898. Same step budget across all five variants of a task (fixed budget
+    # for a fair bake-off); it differs BETWEEN tasks only because their demo sets differ.
     *[
-        _axis_slb_config(task_id, variant, knowledge_insulation=ki)
+        _axis_slb_config(task_id, variant, knowledge_insulation=ki,
+                         num_train_steps={1644: 2456, 1645: 2898}[task_id])
         for task_id in (1644, 1645)
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
