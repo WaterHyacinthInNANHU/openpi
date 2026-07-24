@@ -129,6 +129,15 @@ class DataConfig:
     # documents the qpos-based measurement. False only reproduces pre-2026-07-22 runs.
     slb_render_aligned_rows: bool = True
 
+    # --- PSB/pretraining multi-task loader (see openpi.training.pretrain_sampler) ---
+    # Distinct from the single-task SLB path above. When pretrain_roots_index is set, the
+    # loader concatenates the per-task __droid8d LeRobot sub-datasets it names and restricts
+    # rows to the non-idle sample-ranges at pretrain_ranges_path (openpi's own ranges format,
+    # keyed "task_<id>--<episode_index>"). Left None for every non-pretraining config, which
+    # keeps the single-dataset behaviour. These never coexist with the slb_* fields.
+    pretrain_roots_index: str | None = None
+    pretrain_ranges_path: str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -471,6 +480,59 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
             slb_dataset_root=self.dataset_root,
             awr_tau=self.awr_tau,
             awr_delta=self.awr_delta,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisFrankaPretrainDataConfig(DataConfigFactory):
+    """pi0.5 pretraining over the FULL AXIS Franka corpus (~182 tasks, one demo/scene variant).
+
+    Unlike the single-task SLB factory this trains over many tasks at once. The per-task
+    __droid8d LeRobot sub-datasets are concatenated by the loader (roots named in
+    ``roots_index``) and rows are restricted to the non-idle sample-ranges in ``ranges_path``.
+    No SLB variant sidecars, no AWR/CFG conditioning.
+
+    Norm stats are the config's OWN (computed by scripts/compute_norm_stats.py), NOT DROID's:
+    a prior experiment showed DROID's stats do not fit this action/state distribution, and a
+    full-weight run over a large corpus can learn its own scale. So this factory deliberately
+    omits the ``assets=AssetsConfig(.../pi05_droid/assets, asset_id="droid")`` override the SLB
+    arms carry -- assets default to the config's own dir.
+    """
+
+    roots_index: str | None = None
+    ranges_path: str | None = None
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        from openpi.policies import axis_franka_policy
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "base_0_rgb": "observation.images.third_person",
+                        "left_wrist_0_rgb": "observation.images.wrist",
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[axis_franka_policy.AxisFrankaInputs()],
+            outputs=[axis_franka_policy.AxisFrankaOutputs()],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+            pretrain_roots_index=self.roots_index,
+            pretrain_ranges_path=self.ranges_path,
         )
 
 
@@ -835,9 +897,56 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
     )
 
 
+def _axis_pretrain_config(*, num_train_steps: int = 100_000, batch_size: int = 32) -> TrainConfig:
+    """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
+
+    Multi-task: the loader concatenates the per-task __droid8d sub-datasets named in
+    AXIS_PRETRAIN_ROOTS_INDEX and restricts rows to the non-idle ranges at
+    AXIS_PRETRAIN_RANGES (both produced offline by benchmarks.dataloader.build_pretrain_datasets
+    / pretrain_ranges). Paths come from env so the committed config carries no machine paths.
+
+    Norm stats are OWN (run scripts/compute_norm_stats.py --config-name pi05_axis_pretrain
+    before launch) -- NOT DROID's; see AxisFrankaPretrainDataConfig. Weight INIT is still the
+    pi05_droid checkpoint. Full-weight (no _lora, no freeze_filter): all 3.35B params train,
+    sharded over fsdp_devices=8; batch_size is GLOBAL (per-GPU = batch_size / 8).
+
+    num_train_steps is a placeholder: recompute it as ceil(total_selected_windows / batch_size)
+    * epochs against the FINAL downloaded corpus (see reports/fullweight_training_speed_estimate.md
+    and reports/pretrain_dataloader_design.md) before the real run.
+    """
+    return TrainConfig(
+        name="pi05_axis_pretrain",
+        # Full weight: default (non-lora) gemma variants, no freeze_filter.
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=AxisFrankaPretrainDataConfig(
+            repo_id="Devon018/Franka-Datasets-v2",
+            roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
+            ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
+            base_config=DataConfig(prompt_from_task=True),
+            # NB: deliberately NO assets override -> own norm stats (compute_norm_stats),
+            # NOT pi05_droid's. See the class docstring / reports/pretrain_dataloader_design.md.
+        ),
+        # Init from the DROID checkpoint (reuse of weights is fine; only the STATS are ours).
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=num_train_steps,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=max(1000, num_train_steps // 20),
+            peak_lr=2.5e-5,
+            decay_steps=num_train_steps,
+            decay_lr=2.5e-6,
+        ),
+        batch_size=batch_size,   # GLOBAL; per-GPU = batch_size / fsdp_devices
+        fsdp_devices=8,          # 8x A100-80GB single node
+        num_workers=8,
+        ema_decay=None,
+        # NO freeze_filter -> all params trainable (full weight).
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     _axis_fullweight_speedtest(),
+    _axis_pretrain_config(),
     #
     # Inference Aloha configs.
     #

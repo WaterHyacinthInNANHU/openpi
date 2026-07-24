@@ -138,6 +138,14 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    # A pretraining config trains over MANY tasks at once: concatenate the per-task __droid8d
+    # sub-datasets named in the roots index. Row restriction (the sample-ranges filter) is
+    # applied by the sampler in create_torch_data_loader, mirroring the SLB gate.
+    if getattr(data_config, "pretrain_roots_index", None):
+        from openpi.training import pretrain_dataset
+
+        return pretrain_dataset.build_pretrain_concat_dataset(data_config, action_horizon)
+
     # An SLB config may point at a local subfoldered LeRobot dataset (a per-task
     # camera_fixed folder inside a larger HF repo); load it by path via `root=`.
     root = getattr(data_config, "slb_dataset_root", None)
@@ -348,6 +356,16 @@ def create_torch_data_loader(
                 # training loss can reweight. No other variant gets this wrapper, so
                 # their batches keep exactly the keys they had before.
                 dataset = slb_variant_sampler.WeightedRowDataset(dataset, weights_by_row)
+        elif getattr(data_config, "pretrain_roots_index", None):
+            # Pretraining: restrict the concatenated multi-task dataset to the non-idle
+            # sample-ranges. Uniform draw over the kept flat rows (no weighting).
+            from openpi.training import pretrain_dataset
+            from openpi.training import slb_variant_sampler
+
+            rows = pretrain_dataset.plan_rows_from_roots(
+                data_config.pretrain_roots_index, data_config.pretrain_ranges_path
+            )
+            sampler = slb_variant_sampler.RowSampler(rows, seed=seed)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
