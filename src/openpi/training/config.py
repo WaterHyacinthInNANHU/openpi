@@ -743,23 +743,22 @@ def _axis_slb_config(
             manifest_path=os.environ.get(f"SLB_MANIFEST_{task_id}"),
             dataset_root=os.environ.get(f"SLB_DATASET_ROOT_{task_id}"),
             base_config=DataConfig(prompt_from_task=True),
-            # Reuse DROID's norm stats -- do NOT run compute_norm_stats for these configs.
-            # Init and stats then come from the SAME checkpoint, so the action expert is
-            # already calibrated to this scale; with LoRA on ~100 demos there is little
-            # capacity to relearn a different one. Measured cost of staying on DROID's
-            # scale: our actions span 54-79% of its normalized spread (<1 bit) and clip
-            # <0.65%/dim. Our own stats would be WORSE for the gripper -- dim 7 is an
-            # absolute command whose "open" level is task-specific (0.097-0.350), so
-            # per-task stats would map four different physical widths all to -1.0.
-            #
-            # DO NOT DELETE THIS BLOCK as redundant. Without it asset_id falls back to
-            # repo_id, and the stale 9-D POSITION-space norm_stats.json left in
-            # openpi/assets/pi05_axis_slb_*/ by the superseded slb_variant_4task.sbatch
-            # path would be loaded silently for this 8-D VELOCITY dataset.
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
-                asset_id="droid",
-            ),
+            # PER-TASK norm stats (NOT DROID's). Measured: AXIS 8-D velocity actions occupy
+            # only 45-96% of DROID's normalized range (DROID over-scales each dim 1.3-2.2x),
+            # so reusing DROID stats compresses the action signal the expert sees. We now run
+            # compute_norm_stats per task and load those instead.
+            #   * assets_dir=None + asset_id=None -> asset_id defaults to repo_id, and both
+            #     compute_norm_stats (writes config.assets_dirs/repo_id) and the loader (reads
+            #     assets_dirs/asset_id) resolve to the SAME per-CONFIG path
+            #     openpi/assets/<config_name>/<repo_id>/norm_stats.json. They MATCH, so the run
+            #     loads exactly what compute wrote.
+            #   * To keep all five variants of a task on ONE normalization (no confound), the
+            #     prep step computes stats on `vanilla` and COPIES the file into every variant
+            #     config's assets dir. See sbatch/prep_slb_norm_stats.sbatch.
+            # MUST run compute_norm_stats before training -- otherwise the stale 9-D
+            # position-space norm_stats.json under openpi/assets/pi05_axis_slb_*/ would load
+            # silently for this 8-D velocity dataset. The prep sbatch overwrites those.
+            assets=AssetsConfig(),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         # 20k is the field consensus for single-task pi0.5 finetuning, chosen
