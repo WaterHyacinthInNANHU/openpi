@@ -49,6 +49,7 @@ import numpy as np
 from typing_extensions import override
 
 import openpi.transforms as _transforms
+from openpi.training.slb_variant_sampler import RENDER_FRAME_OFFSET
 
 logger = logging.getLogger(__name__)
 
@@ -157,12 +158,20 @@ class SlbCfgConditioning(_transforms.DataTransformFn):
         return {**data, "prompt": apply_tag(str(prompt), label)}
 
 
-def build_cfg_labels(sidecar, join_index, fps: float) -> dict[tuple[int, int], int]:
+def build_cfg_labels(
+    sidecar, join_index, fps: float, *, render_aligned: bool = True
+) -> dict[tuple[int, int], int]:
     """Map (episode_index, frame_index) -> CFG label {0=pos, 1=neg}.
 
-    frame_index uses the SAME round(t_start * fps) the sampler uses for its row offset,
-    so a labelled window is exactly the window the sampler draws. If the two ever
-    diverge, rows would carry a neighbouring window's label.
+    frame_index MUST be computed with the SAME formula slb_variant_sampler.plan_indices
+    uses for its row offset, or a labelled window keys a frame the sampler never draws and
+    the conditioning is silently dropped for EVERY window (cfg then degenerates to a
+    byte-for-byte duplicate of vanilla). The render-aligned map -- the default and the only
+    one used for new work -- is `round((t_start[w] - t0) * fps) + RENDER_FRAME_OFFSET`,
+    where t0 is the attempt's first sim_time; the legacy `round(t_start * fps)` is retained
+    only to reproduce pre-2026-07-22 runs (see slb_variant_sampler.RENDER_FRAME_OFFSET).
+    The two grids are offset by exactly one frame and are otherwise DISJOINT, so getting
+    this wrong is not an off-by-one on a few windows -- it misses all of them.
 
     Read through VariantSidecar's PUBLIC api rather than its `_per_attempt` map: `label()`
     additionally enforces variant == "cfg", so a sidecar of the wrong variant fails here
@@ -181,7 +190,12 @@ def build_cfg_labels(sidecar, join_index, fps: float) -> dict[tuple[int, int], i
         t_start = sidecar.t_start(aid)
         if w >= len(t_start):
             continue
-        frame = int(round(float(t_start[w]) * fps))
+        if render_aligned:
+            t0 = float(t_start[0]) if len(t_start) else 0.0
+            frame = int(round((float(t_start[w]) - t0) * fps)) + RENDER_FRAME_OFFSET
+        else:
+            frame = int(round(float(t_start[w]) * fps))
+        frame = max(frame, 0)
         if ref.frame_count:
             frame = min(frame, int(ref.frame_count) - 1)
         out[(int(ref.episode_index), frame)] = sidecar.label(aid, w)
@@ -196,12 +210,15 @@ def build_conditioning(
     fps: float = 15.0,
     cond_dropout: float = DEFAULT_COND_DROPOUT,
     seed: int = 0,
+    render_aligned: bool = True,
 ) -> SlbCfgConditioning:
     """Load the cfg sidecar + join index and build the conditioning transform.
 
     Raises rather than degrading: a `cfg` run without conditioning is byte-for-byte
     identical to `vanilla`, so a silent fallback would put a duplicate arm in the bake-off
-    and make it look like CFG had no effect.
+    and make it look like CFG had no effect. `render_aligned` must match the sampler's
+    `slb_render_aligned_rows` (default True) or the labels key a disjoint frame grid and
+    every window's conditioning is dropped -- the same silent-vanilla degeneration.
     """
     from benchmarks.dataloader.join_index import JoinIndex
     from benchmarks.dataloader.sidecar_reader import VariantSidecar
@@ -210,7 +227,7 @@ def build_conditioning(
         raise ValueError("slb_manifest_path is required to join attempts to episodes")
     sidecar = VariantSidecar.load(int(task_id), "cfg", sidecar_root=sidecar_root)
     join_index = JoinIndex.from_manifest(manifest_path)
-    labels = build_cfg_labels(sidecar, join_index, fps)
+    labels = build_cfg_labels(sidecar, join_index, fps, render_aligned=render_aligned)
     if not labels:
         raise ValueError("cfg sidecar produced no (episode, frame) labels")
     n_pos = sum(1 for v in labels.values() if int(v) == 0)
