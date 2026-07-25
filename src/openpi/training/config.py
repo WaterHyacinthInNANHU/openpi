@@ -1054,15 +1054,12 @@ _CONFIGS = [
     # same data, same LoRA setup, but the flow-matching gradient is cut at the prefix KV and
     # the VLM is instead trained by a FAST-token cross-entropy. Separate names so the
     # in-flight non-KI sweep is untouched and the pair is a clean A/B.
-    # 150 epochs over each task's 25-demo homogeneous variant selection (50 epochs was
-    # under-fit: dual-sim rollout was 0/20 across every 1644 arm, the policy reaching toward
-    # the objects but not completing the grasp/place). Steps = round(150 * windows / bs32):
-    # task 1644 has 1572 windows -> 7369 steps, task 1645 has 1855 -> 8695. Same step budget
-    # across all five variants of a task (fixed budget for a fair bake-off); differs BETWEEN
-    # tasks only because their demo sets differ.
+    # Fixed 30k-step budget, matching openpi's example fine-tune configs (the TrainConfig
+    # default and pi05_droid_finetune's regime) rather than an epoch-derived budget. Over the
+    # 25-demo homogeneous set this is many passes; the budget-matched cosine (warmup 10%,
+    # decay over the whole 30k) anneals to the floor. Same budget for all 5 variants of a task.
     *[
-        _axis_slb_config(task_id, variant, knowledge_insulation=ki,
-                         num_train_steps={1644: 7369, 1645: 8695}[task_id])
+        _axis_slb_config(task_id, variant, knowledge_insulation=ki, num_train_steps=30_000)
         for task_id in (1644, 1645)
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
