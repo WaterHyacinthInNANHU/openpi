@@ -1,7 +1,10 @@
 """AXIS Franka (DROID 8D) input/output transforms for pi0.5.
 
-State[8] = 7 arm + 1 gripper (DROID format); action[8] = absolute joint ctrl targets.
-Mirrors libero_policy. Images arrive already
+State[8] = 7 arm joint positions (rad) + 1 gripper closedness [0,1] (DROID 8-D layout).
+action[8] = 7 arm joint VELOCITY (rad/s) + 1 gripper closedness [0,1] -- NOT absolute
+position targets (see benchmarks/dataloader/convert_droid_actions.py and the sim-side
+integrator benchmarks/slb_pilot/action_mapping_pi05.py, which integrates v*dt into a
+persistent position command). Mirrors libero_policy. Images arrive already
 repacked to base_0_rgb / left_wrist_0_rgb by the DataConfig repack step.
 
 DO NOT PAD state/actions here. The pipeline order is
