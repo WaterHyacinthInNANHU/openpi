@@ -778,6 +778,11 @@ def _axis_slb_config(
         # be a problem at a much shorter budget -- at 4k the LR is still 97.7% of
         # peak, i.e. no annealing at all.)
         num_train_steps=num_train_steps,
+        # Keep ONLY the final checkpoint (max_to_keep=1 + no keep_period). At 5000 the
+        # default kept 6 checkpoints/arm (~114 GB), and 10 arms exhausted the shared 10 TB
+        # /bigdata group quota mid-run -> orbax EDQUOT -> 6 arms died. The eval only ever
+        # loads the final step, so intermediates are pure quota cost here.
+        keep_period=None,
         lr_schedule=slb_lr,
         # LeRobot v3.0 decodes video per item; the default 2 workers starve both
         # norm-stats and training. 8 matches --cpus-per-task=8 in the sbatch.
