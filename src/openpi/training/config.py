@@ -675,8 +675,37 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _slb_freeze_filter(freeze_vision: bool):
+    """Params to FREEZE for an SLB LoRA arm.
+
+    The base LoRA recipe (get_freeze_filter) freezes LLM non-LoRA weights but leaves the
+    ~400M SigLIP So400m image tower FULLY TRAINABLE (its params live under `.*img.*`, never
+    matched by the `.*llm.*` freeze). On the 25-demo, per-episode appearance-randomized SLB
+    set that overfits/corrupts the pretrained visual grounding -- diagnosed as the cause of
+    uniform ~0-20% success with all-`timeout` failures and no variant separation. With
+    `freeze_vision` we additionally freeze the entire image tower so only the LLM +
+    action-expert LoRA adapt (the standard low-data VLA recipe), preserving visual grounding.
+    """
+    import openpi.shared.nnx_utils as nnx_utils
+
+    base = pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter()
+    if not freeze_vision:
+        return base
+    return nnx.Any(base, nnx_utils.PathRegex(".*img.*"))
+
+
 def _axis_slb_config(
-    task_id: int, variant: str, *, knowledge_insulation: bool = False, num_train_steps: int = 20_000
+    task_id: int,
+    variant: str,
+    *,
+    knowledge_insulation: bool = False,
+    num_train_steps: int = 20_000,
+    freeze_vision: bool = True,
+    name_suffix: str = "",
 ) -> TrainConfig:
     """One arm of the AXIS Franka SLB bake-off (pi0.5 LoRA, HF-rendered Franka dataset).
 
@@ -717,7 +746,7 @@ def _axis_slb_config(
         }
 
     return TrainConfig(
-        name=f"pi05_axis_slb_{task_id}_{variant}" + ("_ki" if knowledge_insulation else ""),
+        name=f"pi05_axis_slb_{task_id}_{variant}{name_suffix}" + ("_ki" if knowledge_insulation else ""),
         # LoRA fine-tune: the model itself must carry the LoRA gemma variants
         # (not just the freeze_filter), or training silently falls back to a
         # full fine-tune. Must match the freeze_filter variants below.
@@ -787,11 +816,7 @@ def _axis_slb_config(
         # LeRobot v3.0 decodes video per item; the default 2 workers starve both
         # norm-stats and training. 8 matches --cpus-per-task=8 in the sbatch.
         num_workers=8,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
+        freeze_filter=_slb_freeze_filter(freeze_vision),
         ema_decay=None,
     )
 
@@ -1069,6 +1094,11 @@ _CONFIGS = [
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
     ],
+    # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
+    # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen
+    # image tower. If this lifts success well above 2/20, vision-tower overfitting on the
+    # 25-demo appearance-randomized set was the primary cause of the uniform low scores.
+    _axis_slb_config(1644, "vanilla", num_train_steps=7369, name_suffix="_vfz7k"),
     #
     # Fine-tuning Aloha configs.
     #
