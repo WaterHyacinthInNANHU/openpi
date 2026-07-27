@@ -704,7 +704,12 @@ def _axis_slb_config(
     *,
     knowledge_insulation: bool = False,
     num_train_steps: int = 20_000,
-    freeze_vision: bool = True,
+    # Vision UNFROZEN by default: empirically, freezing the SigLIP tower made grasp success
+    # WORSE in every condition (0/20-0/50 vs 1-2/20 unfrozen), with the gripper stuck ~90%
+    # closed. Our robosuite renders are far from SigLIP's natural-image pretraining, so the
+    # tower must ADAPT to the sim domain -- the opposite of the GR00T/pi0.5-KI freeze recipe,
+    # which assumes a near-natural fine-tune domain. Keep False for AXIS sim-render data.
+    freeze_vision: bool = False,
     name_suffix: str = "",
 ) -> TrainConfig:
     """One arm of the AXIS Franka SLB bake-off (pi0.5 LoRA, HF-rendered Franka dataset).
