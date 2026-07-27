@@ -1099,6 +1099,12 @@ _CONFIGS = [
     # image tower. If this lifts success well above 2/20, vision-tower overfitting on the
     # 25-demo appearance-randomized set was the primary cause of the uniform low scores.
     _axis_slb_config(1644, "vanilla", num_train_steps=7369, name_suffix="_vfz7k"),
+    # Re-render A/B test: SAME 25 demos, but IMAGES re-rendered to ONE fixed eval-matched
+    # appearance (via DATASET_ROOT_OVERRIDE at launch). Vision UNFROZEN + 7369 steps, so vs
+    # the 2/20 unfrozen baseline the ONLY change is train visual variance (25 different looks
+    # -> 1 consistent look). Tests the hypothesis that appearance variance, not demo count,
+    # starves the policy.
+    _axis_slb_config(1644, "vanilla", num_train_steps=7369, freeze_vision=False, name_suffix="_rr7k"),
     #
     # Fine-tuning Aloha configs.
     #
