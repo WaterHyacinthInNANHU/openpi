@@ -43,7 +43,9 @@ Runs in the openpi venv (numpy only here; no jax needed).
 from __future__ import annotations
 
 import dataclasses
+import glob
 import logging
+import os
 
 import numpy as np
 from typing_extensions import override
@@ -225,8 +227,24 @@ def build_conditioning(
 
     if not manifest_path:
         raise ValueError("slb_manifest_path is required to join attempts to episodes")
-    sidecar = VariantSidecar.load(int(task_id), "cfg", sidecar_root=sidecar_root)
     join_index = JoinIndex.from_manifest(manifest_path)
+
+    # π0.7 metadata mode (env SLB_CFG_METADATA=1): condition on episode quality + mistake
+    # from the episode_meta sidecar instead of the single advantage tag. See §3 of
+    # docs/advantage_redesign.md. The other 4 SLB variants are untouched.
+    if metadata_enabled():
+        meta = build_cfg_metadata(int(task_id), sidecar_root, join_index, fps,
+                                  render_aligned=render_aligned)
+        if not meta:
+            raise ValueError("SLB_CFG_METADATA=1 but no episode_meta sidecars produced labels "
+                             "(build with benchmarks.dataloader.episode_meta)")
+        n_mis = sum(1 for (_, m) in meta.values() if m)
+        qs = [q for (q, _) in meta.values()]
+        logger.info("SLB cfg METADATA: task=%s windows=%d mistake=%d q_ep[min/med/max]=%d/%d/%d dropout=%.2f",
+                    task_id, len(meta), n_mis, min(qs), int(np.median(qs)), max(qs), cond_dropout)
+        return SlbCfgMetadataConditioning(meta=meta, cond_dropout=cond_dropout, seed=seed)
+
+    sidecar = VariantSidecar.load(int(task_id), "cfg", sidecar_root=sidecar_root)
     labels = build_cfg_labels(sidecar, join_index, fps, render_aligned=render_aligned)
     if not labels:
         raise ValueError("cfg sidecar produced no (episode, frame) labels")
@@ -236,3 +254,122 @@ def build_conditioning(
         task_id, len(labels), n_pos, 100.0 * n_pos / max(1, len(labels)), cond_dropout,
     )
     return SlbCfgConditioning(labels=labels, cond_dropout=cond_dropout, seed=seed)
+
+
+# ---------------------------------------------------------------------------------------
+# π0.7-style episode-metadata conditioning (docs/advantage_redesign.md §3). Enabled per-run
+# via env SLB_CFG_METADATA=1. Conditions the `cfg` variant on episode QUALITY (1..5, from the
+# fraction of PHR 'P'-progression) + per-window MISTAKE (window in a PHR 'R'-regression seg),
+# each an INDEPENDENT prompt token with per-component dropout (π0.7 mechanism). NO learned
+# value (a value fit to one-shot trajectories memorizes). Metadata is the offline
+# episode_meta sidecar from benchmarks/dataloader/episode_meta.py. The other 4 SLB variants
+# (vanilla/filt_bin/top70/awr) are untouched fixed baselines.
+# ---------------------------------------------------------------------------------------
+QUALITY_KEY = "Quality"
+MISTAKE_KEY = "Mistake"
+MISTAKE_YES, MISTAKE_NO = "yes", "no"
+INFER_QUALITY = 5          # π0.7 sets quality=max at inference
+INFER_MISTAKE = False
+
+
+def metadata_enabled() -> bool:
+    return os.environ.get("SLB_CFG_METADATA", "0") not in ("0", "", "false", "False")
+
+
+def apply_metadata(prompt, q_ep, mistake, *, drop_quality: bool = False, drop_mistake: bool = False) -> str:
+    """Append the π0.7 metadata tokens; a dropped component is omitted (its unconditional form).
+    A window that omits BOTH is the bare prompt -- the fully-unconditional branch for CFG."""
+    parts = [str(prompt)]
+    if q_ep is not None and not drop_quality:
+        parts.append(f"{QUALITY_KEY}: {int(q_ep)}")
+    if mistake is not None and not drop_mistake:
+        parts.append(f"{MISTAKE_KEY}: {MISTAKE_YES if mistake else MISTAKE_NO}")
+    return "\n".join(parts)
+
+
+def _load_episode_meta(task_id: int, sidecar_root) -> dict:
+    """attempt_id -> (q_ep:int, mistake:bool[n_win], t_start:float[n_win]). numpy-only."""
+    from pathlib import Path
+    root = Path(sidecar_root) / "episode_meta"
+    out: dict = {}
+    for f in glob.glob(str(root / f"task_{int(task_id)}_attempt_*.npz")):
+        aid = int(Path(f).stem.split("attempt_")[1])
+        d = np.load(f)
+        out[aid] = (int(d["q_ep"]), d["mistake"].astype(bool), d["t_start"].astype(np.float64))
+    return out
+
+
+def build_cfg_metadata(task_id: int, sidecar_root, join_index, fps: float, *, render_aligned: bool = True) -> dict:
+    """(episode_index, frame) -> (q_ep, mistake). Uses the SAME render-aligned frame map as
+    the sampler / build_cfg_labels (round((t_start-t0)*fps)+RENDER_FRAME_OFFSET), so tokens land
+    on the rows the sampler actually draws (the disjoint-grid bug that silently reverts cfg to
+    vanilla applies here identically)."""
+    out: dict = {}
+    for aid, (q_ep, mistake, t_start) in _load_episode_meta(task_id, sidecar_root).items():
+        ref = join_index.episode_for(aid)
+        if ref is None or not len(t_start):
+            continue
+        t0 = float(t_start[0])
+        for w in range(len(t_start)):
+            if render_aligned:
+                fr = int(round((float(t_start[w]) - t0) * fps)) + RENDER_FRAME_OFFSET
+            else:
+                fr = int(round(float(t_start[w]) * fps))
+            fr = max(fr, 0)
+            if ref.frame_count:
+                fr = min(fr, int(ref.frame_count) - 1)
+            out[(int(ref.episode_index), fr)] = (int(q_ep), bool(mistake[w]))
+    return out
+
+
+@dataclasses.dataclass(frozen=True)
+class SlbCfgMetadataConditioning(_transforms.DataTransformFn):
+    """Train-time π0.7 metadata conditioning: per-episode quality + per-window mistake, each
+    INDEPENDENTLY dropped out so CFG guidance is defined on any subset. Deterministic per
+    (episode, frame) so reruns reproduce. Runs BEFORE RepackTransform (needs episode_index)."""
+
+    meta: dict  # (episode_index, frame) -> (q_ep, mistake)
+    cond_dropout: float = DEFAULT_COND_DROPOUT
+    seed: int = 0
+
+    @override
+    def __call__(self, data: dict) -> dict:
+        prompt = data.get("prompt")
+        if prompt is None:
+            return data
+        ep, fr = data.get("episode_index"), data.get("frame_index")
+        if ep is None or fr is None:
+            return data
+        key = (int(np.asarray(ep).reshape(-1)[0]), int(np.asarray(fr).reshape(-1)[0]))
+        m = self.meta.get(key)
+        if m is None:
+            return data
+        q_ep, mistake = m
+        drop_q = drop_m = False
+        if self.cond_dropout > 0.0:
+            rng = np.random.default_rng(
+                (int(self.seed) << 32) ^ ((key[0] * 1_000_003 + key[1]) & 0xFFFFFFFF)
+            )
+            drop_q = rng.random() < self.cond_dropout   # per-component (π0.7) dropout
+            drop_m = rng.random() < self.cond_dropout
+        return {**data, "prompt": apply_metadata(prompt, q_ep, mistake, drop_quality=drop_q, drop_mistake=drop_m)}
+
+
+@dataclasses.dataclass(frozen=True)
+class FixedCfgMetadataConditioning(_transforms.DataTransformFn):
+    """Serve-time metadata conditioning. Conditional branch = ask for top quality + no mistake
+    (π0.7 inference); unconditional branch (`drop_all=True`) = bare prompt. Pair the two via
+    Policy(uncond_transforms=...) so the CFG branches differ only in the metadata tokens."""
+
+    q_ep: int = INFER_QUALITY
+    mistake: bool = INFER_MISTAKE
+    drop_all: bool = False
+
+    @override
+    def __call__(self, data: dict) -> dict:
+        prompt = data.get("prompt")
+        if prompt is None:
+            return data
+        if self.drop_all:
+            return data
+        return {**data, "prompt": apply_metadata(prompt, self.q_ep, self.mistake)}

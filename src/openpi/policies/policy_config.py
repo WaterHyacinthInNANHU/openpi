@@ -43,7 +43,15 @@ def _input_chain(
     when `prompt` is absent; both branches then no-op identically, so a missing prompt
     degrades guidance to plain conditional sampling rather than to a wrong tag.
     """
-    cfg_tag = [] if cfg_label is None else [_slb_cfg.FixedCfgConditioning(label=cfg_label)]
+    # π0.7 metadata mode (env SLB_CFG_METADATA=1): serve with quality=max/mistake=no on the
+    # conditional branch and the bare prompt on the unconditional branch (drop_all), matching
+    # SlbCfgMetadataConditioning at train time. Else the legacy single advantage tag.
+    if cfg_label is None:
+        cfg_tag = []
+    elif _slb_cfg.metadata_enabled():
+        cfg_tag = [_slb_cfg.FixedCfgMetadataConditioning(drop_all=(cfg_label == _slb_cfg.NULL_LABEL))]
+    else:
+        cfg_tag = [_slb_cfg.FixedCfgConditioning(label=cfg_label)]
     return [
         *repack_inputs,
         transforms.InjectDefaultPrompt(default_prompt),
