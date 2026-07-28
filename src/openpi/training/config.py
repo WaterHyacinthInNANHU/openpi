@@ -4,6 +4,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import json
 import logging
 import os
 import pathlib
@@ -826,6 +827,42 @@ def _axis_slb_config(
     )
 
 
+def _slb_available_task_ids() -> tuple[int, ...]:
+    """SLB task_ids that have BOTH a manifest entry and converted LeRobot data on disk.
+
+    The full SLB benchmark spans the tasks in slb_variant_homogeneous_800plus.json, but the
+    per-task DROID-8D LeRobot dirs are uploaded/converted incrementally: only a task whose
+    converted `*__droid8d` dir exists under AXIS_DATALOADER_ROOT can actually train. We
+    register the five variants for exactly those tasks, so the config list grows automatically
+    as conversions land -- without ever registering a dataless, un-trainable arm (which would
+    only bloat get_config / difflib suggestions). Falls back to the always-present pilot pair
+    (1644, 1645) if the manifest or data root cannot be read, so the core SLB configs never
+    vanish on a machine that lacks the full offline cache.
+    """
+    fallback = (1644, 1645)
+    # config.py -> openpi/src/openpi/training/; parents[4] is the outer dataset_preview repo.
+    repo_root = pathlib.Path(__file__).resolve().parents[4]
+    manifest = pathlib.Path(
+        os.environ.get(
+            "SLB_TASKS_MANIFEST",
+            repo_root / "datasets" / "manifests" / "slb_variant_homogeneous_800plus.json",
+        )
+    )
+    try:
+        candidates = [int(t["task_id"]) for t in json.loads(manifest.read_text())["tasks"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return fallback
+    dl_root = (
+        pathlib.Path(os.environ.get("AXIS_DATALOADER_ROOT", os.path.expanduser("~/axis_dataloader_cache")))
+        / "hf_local"
+        / "Franka-Datasets-v2"
+    )
+    available = tuple(
+        tid for tid in candidates if any(dl_root.glob(f"Franka-{tid}-*/camera_fixed/*__droid8d"))
+    )
+    return available or fallback
+
+
 def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsdp_devices: int = 4) -> TrainConfig:
     """FULL-WEIGHT pi0.5 fine-tune on real AXIS data -- built to MEASURE step throughput,
     not to produce a checkpoint.
@@ -1078,12 +1115,13 @@ _CONFIGS = [
     #
     # Fine-tuning AXIS Franka SLB configs (pi0.5 LoRA, HF-rendered Franka dataset).
     #
-    # SLB v2 pilot pair. Only 24 of SLB's 86 tasks have rendered HF episodes at all;
-    # 1644/1645 are the two best of those -- 20 scene variants each (4x task 1424's 5),
-    # pools of 578/510 for 100 demos, and two DIFFERENT families (pnp vs directed
-    # rotation) so the bake-off is not measuring a single skill. 1424 dropped: 5
-    # variants and only 103 joinable demos for 100, the thinnest margin of any
-    # candidate. Extend once the full render finishes.
+    # Full SLB benchmark: the five variants of EVERY task in slb_variant_homogeneous_800plus.json
+    # that has converted LeRobot data on disk. The task list is data-driven via
+    # _slb_available_task_ids() -- it reads the manifest and keeps only tasks whose `*__droid8d`
+    # dir exists, so the registry auto-expands as the collaborator finishes uploading/converting
+    # (85 tasks total; 1424/1628/1644/1645 available at time of writing). No dataless arms are
+    # registered. The homogeneous manifest fixes ONE scene_variant_index per task and selects 25
+    # demos; per-(task,variant) sidecars + per-task 8-D norm stats gate each arm.
     #
     # Each arm also gets a `_ki` twin with knowledge insulation enabled (arXiv:2505.23705):
     # same data, same LoRA setup, but the flow-matching gradient is cut at the prefix KV and
@@ -1095,7 +1133,7 @@ _CONFIGS = [
     # decay over the whole 30k) anneals to the floor. Same budget for all 5 variants of a task.
     *[
         _axis_slb_config(task_id, variant, knowledge_insulation=ki, num_train_steps=30_000)
-        for task_id in (1644, 1645)
+        for task_id in _slb_available_task_ids()
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
     ],
