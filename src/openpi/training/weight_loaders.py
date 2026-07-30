@@ -49,13 +49,14 @@ class CheckpointWeightLoader(WeightLoader):
 
     # Reference params allowed to be absent from the checkpoint and kept at their freshly
     # initialised values. Anything else missing is a real mismatch and must stay dropped so
-    # that train.py's `check_pytree_equality` reports it.
-    #   - `.*lora.*`: LoRA adapters, which no base checkpoint carries.
-    #   - `.*discrete_action_head.*`: the knowledge-insulation FAST-token head
-    #     (`Pi0Config.knowledge_insulation`). It postdates every released checkpoint,
-    #     including the `pi05_droid/params` that all KI configs initialise from, and is
-    #     trained from scratch by design.
-    missing_regex: ClassVar[str] = ".*lora.*|.*discrete_action_head.*"
+    # that train.py's `check_pytree_equality` reports it. Only LoRA adapters qualify: no base
+    # checkpoint carries them.
+    #
+    # Knowledge insulation deliberately adds NO parameters -- its discrete cross-entropy goes
+    # through the tied LM head (`gemma.Module.decode`) -- so it needs no entry here. An earlier
+    # design used a separate `discrete_action_head`, which this regex had to special-case; that
+    # head is gone, and with it the special case.
+    missing_regex: ClassVar[str] = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.

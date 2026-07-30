@@ -112,16 +112,13 @@ def _world():
     t = jnp.full((_B,), 0.5)
     pt, pm, pam = model.embed_prefix(obs)
     prefix = (jax.random.normal(jax.random.key(9), pt.shape), pm, pam)
-    # Stand-in for what TokenizeFASTActionTargets puts in the batch. Real FAST ids are not
-    # needed here -- the CE is over arbitrary class indices either way, and the gradient
-    # topology (which is what this file tests) does not depend on their values. Keeping this
-    # synthetic also keeps the test runnable with no network access.
-    obs_ki = dataclasses.replace(
-        obs,
-        fast_action_tokens=jax.random.randint(
-            jax.random.key(17), (_B, cfg.ki_num_action_tokens), 0, cfg.ki_fast_vocab_size, dtype=jnp.int32
-        ),
-    )
+    # Stand-in for what the FAST tokenizer puts in the batch: a loss mask over a trailing slice
+    # of the prompt, which is where the `Action:` + FAST-ids postfix lives. Real FAST ids are
+    # not needed here -- the CE is over token indices either way, and the gradient TOPOLOGY
+    # (which is all this file tests) does not depend on their values. Keeping it synthetic also
+    # keeps the test runnable with no network access.
+    loss_mask = jnp.zeros((_B, cfg.max_token_len), dtype=bool).at[:, -8:].set(True)
+    obs_ki = dataclasses.replace(obs, token_loss_mask=loss_mask)
     return model, cfg, obs, obs_ki, x_t, t, prefix
 
 
@@ -178,12 +175,12 @@ def test_fast_token_loss_does_not_disturb_the_action_expert(_setup):
     assert _setup["stop+ce"].get("expert", 0.0) == pytest.approx(_setup["stop"].get("expert", 0.0), rel=1e-3)
 
 
-def test_missing_fast_action_tokens_is_a_hard_error(_world):
-    """`fast_action_tokens` is optional on Observation so every non-KI config is unaffected --
-    which means a KI run whose data pipeline forgot the transform would otherwise train as a
-    plain frozen backbone while still reporting itself as KI. That must fail loudly."""
+def test_missing_fast_token_targets_is_a_hard_error(_world):
+    """`token_loss_mask` is optional on Observation so every non-KI config is unaffected --
+    which means a KI run whose data pipeline forgot to use the FAST tokenizer would otherwise
+    train as a plain frozen backbone while still reporting itself as KI. Must fail loudly."""
     model, cfg, obs, *_ = _world
-    assert obs.fast_action_tokens is None, "fake_obs must not supply KI targets by default"
-    prefix_out = jnp.zeros((_B, cfg.ki_num_action_tokens, model.discrete_action_head.in_features))
-    with pytest.raises(ValueError, match="fast_action_tokens"):
+    assert obs.token_loss_mask is None, "fake_obs must not supply KI targets by default"
+    prefix_out = jnp.zeros((_B, cfg.max_token_len, model.action_in_proj.out_features))
+    with pytest.raises(ValueError, match="token_loss_mask"):
         model._fast_token_loss(prefix_out, obs)  # noqa: SLF001

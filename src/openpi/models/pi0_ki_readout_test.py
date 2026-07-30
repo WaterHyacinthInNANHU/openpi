@@ -1,78 +1,57 @@
-"""The KI discrete loss must actually read the observation.
+"""Knowledge insulation reads real, teacher-forced FAST tokens -- not prompt padding.
 
-`_fast_token_loss` supervises `prefix_out[:, -ki_num_action_tokens:]`, i.e. the LAST n
-positions of the prefix. The prefix is [image tokens ..., max_token_len prompt tokens], and
-the prompt is right-padded by `PaligemmaTokenizer`. For pi05 (max_token_len=200, n=64) that
-window is prompt positions 136-199, while a real prompt is ~60-90 tokens -- so the readout
-lands entirely in padding.
+The original KI implementation supervised `prefix_out[:, -n:]` while never putting the FAST ids
+into the token stream at all, so the readout window was prompt padding. Padded query rows are
+all-masked, `gemma` fills them with `big_neg`, and softmax over an all-`big_neg` row is UNIFORM
+over every key -- so all n positions collapsed to one mean-pooled vector (measured pairwise
+cosine 1.0000 vs 0.70-0.86 for real positions). The head was a single global classifier applied
+n times, whose optimum is the position-independent marginal.
 
-`make_attn_mask` zeroes a padded query's whole attention row
-(`valid_mask = input_mask[:,None,:] * input_mask[:,:,None]`). `gemma.py` then fills those
-logits with `big_neg` and softmaxes, which for an all-masked row is UNIFORM over every key.
-So each padded readout position returns the same unweighted mean-pool of all value vectors:
-measured pairwise cosine 1.0000 across the window, versus 0.70-0.86 for real positions.
+Option C fixes this the way every surveyed implementation does: the FAST ids are spliced into
+`tokenized_prompt` as real PaliGemma vocab ids (`FASTTokenizer`), appended last with a causal
+`token_ar_mask`, and the loss is a shift-by-one cross-entropy through the EXISTING tied LM head,
+masked by `token_loss_mask`. See reports/pi05_knowledge_insulation_design.md sec. 1a and 4.
 
-The consequence is not that the loss is constant -- the mean-pool still moves with the image
-(`test_ki_loss_depends_on_the_observation` passes). It is that all n positions are IDENTICAL,
-so the discrete head is one global classifier applied n times and its optimum is the
-position-independent marginal FAST-token distribution. That is nothing like the paper's
-autoregressive `sum_j log p(l_{j+1} | x_{1:j})`, and it is close to the failure
-`_fast_token_loss`'s own docstring warns about (KI degrading to backbone freezing).
-
-`pi0_ki_test.py` cannot catch this: it stubs the prefix with a fully-valid mask, so every
-readout position is real there.
-
-See reports/pi05_knowledge_insulation_design.md sec. 4 for the fix options.
+Properties pinned down here:
+  1. the supervised positions are real tokens (was xfail)
+  2. those positions are distinguishable from each other (was xfail)
+  3. the action expert cannot see the FAST tokens -- splicing the ground-truth answer into the
+     prefix otherwise leaks it into the flow-matching loss. The paper: "we set the attention
+     mask A such that no discrete FAST action token can attend to continuous action tokens and
+     vice-versa."
+  4. KI adds no parameters (the whole point of routing the CE through the tied LM head)
 """
 
 from __future__ import annotations
 
-import dataclasses
-
 import flax.nnx as nnx
+import flax.traverse_util as traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import openpi.models.model as _model
-from openpi.models.pi0 import make_attn_mask
 import openpi.models.pi0_config as _pi0_config
+import openpi.models.tokenizer as _tokenizer
 
 _B, _AH, _AD = 1, 4, 8
-# Wide enough that a short prompt leaves a padded tail, like the real pi05 max_token_len=200.
-_MAX_TOKEN_LEN = 48
-_N_FAST = 16
-_PROMPT_LEN = 10  # real tokens; the remaining positions are padding
-
-# Strict xfail: these encode the CORRECT behaviour, which the current readout does not have.
-# Strict so that whoever fixes `_fast_token_loss` is told to drop the marker instead of
-# quietly leaving a passing xfail behind. See reports/pi05_knowledge_insulation_design.md.
-_KNOWN_DEFECT = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KI reads prefix_out[:, -n:], which for a padded prompt is entirely padding. Padded "
-        "query rows are all-masked, so softmax over big_neg logits is UNIFORM over every key: "
-        "all n readout vectors collapse to the same mean-pooled vector (measured pairwise "
-        "cosine 1.0000 vs 0.70-0.86 for real positions). The discrete head can therefore only "
-        "predict a position-independent marginal, not the ordered FAST sequence."
-    ),
-)
+_MAX_TOKEN_LEN = 250
 
 
-def _randomized_model() -> object:
-    cfg = _pi0_config.Pi0Config(
+def _config(*, ki: bool = True) -> _pi0_config.Pi0Config:
+    return _pi0_config.Pi0Config(
         paligemma_variant="dummy",
         action_expert_variant="dummy",
         action_horizon=_AH,
         action_dim=_AD,
         max_token_len=_MAX_TOKEN_LEN,
         pi05=True,
-        knowledge_insulation=True,
-        ki_num_action_tokens=_N_FAST,
-        ki_fast_vocab_size=64,
+        knowledge_insulation=ki,
     )
-    model = cfg.create(jax.random.key(0))
+
+
+def _randomized_model():
+    model = _config(ki=True).create(jax.random.key(0))
     # A freshly created Pi0 is a near-identity map (see pi0_ki_test.py); randomize so the
     # prefix can actually influence the readout.
     state = nnx.state(model, nnx.Param)
@@ -93,86 +72,122 @@ def _randomized_model() -> object:
     return model
 
 
-def _observation(image_seed: int) -> _model.Observation:
+def _smooth_actions(seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, 1, _AH)[:, None]
+    return np.sin(
+        2 * np.pi * t * rng.uniform(0.2, 0.8, (1, _AD)) + rng.uniform(0, 2 * np.pi, (1, _AD))
+    ).astype(np.float32)
+
+
+def _observation(action_seed: int = 0, image_seed: int = 0) -> _model.Observation:
+    """An observation carrying a real FAST-tokenized prompt, as the KI transform group builds it."""
+    tok = _tokenizer.FASTTokenizer(max_len=_MAX_TOKEN_LEN)
+    tokens, token_mask, ar_mask, loss_mask = tok.tokenize(
+        "pick up the red block", np.zeros(_AD, dtype=np.float32), _smooth_actions(action_seed)
+    )
     rng = np.random.default_rng(image_seed)
     img = jnp.asarray(rng.uniform(-1, 1, (_B, *_model.IMAGE_RESOLUTION, 3)), dtype=jnp.float32)
-    mask = jnp.ones((_B, _MAX_TOKEN_LEN), dtype=bool).at[:, _PROMPT_LEN:].set(False)
     return _model.Observation(
         images={"base_0_rgb": img},
         image_masks={"base_0_rgb": jnp.ones((_B,), dtype=bool)},
         state=jnp.zeros((_B, _AD), dtype=jnp.float32),
-        tokenized_prompt=jnp.ones((_B, _MAX_TOKEN_LEN), dtype=jnp.int32),
-        tokenized_prompt_mask=mask,
-        fast_action_tokens=jnp.asarray(
-            np.random.default_rng(7).integers(0, 64, (_B, _N_FAST)), dtype=jnp.int32
-        ),
+        tokenized_prompt=jnp.asarray(tokens, dtype=jnp.int32)[None],
+        tokenized_prompt_mask=jnp.asarray(token_mask, dtype=bool)[None],
+        token_ar_mask=jnp.asarray(ar_mask, dtype=jnp.int32)[None],
+        token_loss_mask=jnp.asarray(loss_mask, dtype=bool)[None],
     )
 
 
-def _fast_loss(model, obs):
+def _prefix_out(model, obs):
+    from openpi.models.pi0 import make_attn_mask
+
     prefix_tokens, prefix_mask, prefix_ar_mask = model.embed_prefix(obs)
     attn = make_attn_mask(prefix_mask, prefix_ar_mask)
     positions = jnp.cumsum(prefix_mask, axis=1) - 1
-    (prefix_out, _), _ = model.PaliGemma.llm([prefix_tokens, None], mask=attn, positions=positions)
-    return model._fast_token_loss(prefix_out, obs), prefix_out
+    (out, _), _ = model.PaliGemma.llm([prefix_tokens, None], mask=attn, positions=positions)
+    return out
 
 
-@_KNOWN_DEFECT
-def test_ki_readout_positions_are_not_all_padding():
-    """The supervised window must overlap real (unmasked) prompt positions."""
-    model = _randomized_model()
-    obs = _observation(0)
-    _, prefix_out = _fast_loss(model, obs)
-    n_prefix = prefix_out.shape[1]
-    n_image = n_prefix - _MAX_TOKEN_LEN
-
-    readout_start = n_prefix - _N_FAST
-    last_real = n_image + _PROMPT_LEN  # exclusive
-    assert readout_start < last_real, (
-        f"KI reads prefix positions [{readout_start}, {n_prefix}) but the last real token is at "
-        f"{last_real - 1} (image tokens: {n_image}, prompt tokens: {_PROMPT_LEN} of {_MAX_TOKEN_LEN}). "
-        "The whole readout window is padding."
+def _suffix_out(model, obs):
+    """Run the insulated forward and return the action expert's output."""
+    x_t = jnp.asarray(_smooth_actions(99))[None]
+    time = jnp.full((_B,), 0.5, dtype=jnp.float32)
+    prefix_tokens, prefix_mask, prefix_ar_mask = model.embed_prefix(obs)
+    suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = model.embed_suffix(obs, x_t, time)
+    _, suffix_out = model._forward_insulated(
+        prefix_tokens, prefix_mask, prefix_ar_mask,
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond,
+        model.fast_span_mask(obs, prefix_mask.shape[1]),
     )
+    return suffix_out
 
 
-def test_ki_loss_depends_on_the_observation():
-    """A different image must change the discrete loss.
+def test_supervised_positions_are_real_tokens():
+    """The loss-masked positions must all be valid (unmasked) prompt tokens, and non-empty.
 
-    This one PASSES even with the defect: an all-masked query attends uniformly over every
-    key, so the collapsed readout is a mean-pool of the real activations and does still move
-    with the image. Kept as the floor -- if it ever fails, KI is training on nothing at all.
+    This is the property the padding defect violated: the supervised window previously sat
+    entirely outside `tokenized_prompt_mask`.
+    """
+    obs = _observation()
+    loss_mask = np.asarray(obs.token_loss_mask[0])
+    valid = np.asarray(obs.tokenized_prompt_mask[0])
+
+    assert loss_mask.sum() > 0, "no supervised positions at all"
+    assert np.all(valid[loss_mask]), "some supervised positions are padding"
+
+
+def test_supervised_positions_are_distinguishable():
+    """THE decisive property. The supervised positions must carry different information.
+
+    If they are identical the head is one global classifier applied n times and can only learn
+    the marginal FAST-token distribution. Measured 1.0000 pairwise cosine before the fix.
     """
     model = _randomized_model()
-    obs_a = _observation(0)
-    obs_b = dataclasses.replace(_observation(1), fast_action_tokens=obs_a.fast_action_tokens)
+    obs = _observation()
+    out = _prefix_out(model, obs)
 
-    loss_a, _ = _fast_loss(model, obs_a)
-    loss_b, _ = _fast_loss(model, obs_b)
+    n_image = int(out.shape[1] - _MAX_TOKEN_LEN)
+    loss_mask = np.asarray(obs.token_loss_mask[0])
+    window = np.asarray(out[0, n_image:][loss_mask].astype(jnp.float32))
 
-    assert not jnp.allclose(loss_a, loss_b, atol=1e-6), (
-        f"KI cross-entropy is identical ({float(loss_a[0])}) for two different images: the "
-        "readout carries no information about the observation."
-    )
-
-
-@_KNOWN_DEFECT
-def test_ki_readout_positions_are_distinguishable():
-    """The n supervised positions must differ from each other.
-
-    THE decisive property. The head has to emit an ORDERED sequence of n FAST ids, so the n
-    positions it reads must carry different information. If they are identical the head is a
-    single global classifier applied n times, and the best it can do is the marginal token
-    distribution -- no ordering, no chunk structure, essentially no signal for the VLM.
-    """
-    model = _randomized_model()
-    _, prefix_out = _fast_loss(model, _observation(0))
-
-    window = np.asarray(prefix_out[0, -_N_FAST:].astype(jnp.float32))
     unit = window / np.linalg.norm(window, axis=-1, keepdims=True)
     cos = unit @ unit.T
     off_diagonal = cos[~np.eye(len(cos), dtype=bool)]
 
     assert off_diagonal.mean() < 0.99, (
-        f"the {_N_FAST} KI readout positions are near-identical (mean pairwise cosine "
-        f"{off_diagonal.mean():.4f}); the discrete head cannot represent an ordered sequence."
+        f"the {len(window)} supervised positions are near-identical (mean pairwise cosine "
+        f"{off_diagonal.mean():.4f}); the head cannot represent an ordered sequence."
     )
+
+
+def test_action_expert_cannot_see_the_fast_tokens():
+    """No label leakage: the ground-truth FAST ids are in the prefix, so the flow-matching
+    expert must be masked off them. Changing ONLY the spliced action tokens must leave the
+    expert's output unchanged.
+
+    Without the mask the expert reads the answer at training time and sees nothing at
+    inference -- the flow loss would collapse to copying the tokens.
+    """
+    model = _randomized_model()
+    obs_a = _observation(action_seed=0)
+    obs_b = _observation(action_seed=1)
+
+    # Sanity: the two observations really do differ in the spliced action tokens.
+    assert not np.array_equal(np.asarray(obs_a.tokenized_prompt), np.asarray(obs_b.tokenized_prompt))
+
+    assert jnp.allclose(_suffix_out(model, obs_a), _suffix_out(model, obs_b), atol=1e-5), (
+        "the action expert's output changed when only the ground-truth FAST tokens changed: "
+        "the label is leaking into the flow-matching branch."
+    )
+
+
+def test_knowledge_insulation_adds_no_parameters():
+    """Option C's whole point: the CE goes through the tied LM head, so a KI model and a stock
+    pi0.5 have identical parameter trees and checkpoints stay interchangeable."""
+
+    def keys(*, ki: bool) -> set[str]:
+        params = nnx.state(_config(ki=ki).create(jax.random.key(0)), nnx.Param).to_pure_dict()
+        return set(traverse_util.flatten_dict(params, sep="/"))
+
+    assert keys(ki=True) == keys(ki=False)

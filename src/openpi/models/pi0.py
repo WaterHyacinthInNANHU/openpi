@@ -98,21 +98,12 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
-        # KI half 2: predicts discrete (FAST) action tokens from the VLM stream, so the VLM
-        # keeps a learning signal once the action-expert gradient path is cut. Shared across
-        # the supervised token positions, so this costs width*vocab params, not
-        # width*num_tokens*vocab.
-        # Scalars are assigned unconditionally -- only the HEAD is conditional, because it is
-        # the only one that allocates parameters (and so changes the checkpoint). Gating the
-        # scalars too made `model.ki_num_action_tokens` an AttributeError on every non-KI
-        # model, which anything introspecting a stock Pi0 would hit.
+        # KI half 2: a discrete (FAST) action-token cross-entropy keeps training the VLM once
+        # the action-expert gradient path is cut. It runs through the TIED LM head
+        # (`gemma.Module.decode`), so knowledge insulation allocates NO parameters and KI
+        # checkpoints stay interchangeable with stock pi0.5.
         self.knowledge_insulation = config.knowledge_insulation
         self.ki_fast_loss_weight = config.ki_fast_loss_weight
-        self.ki_num_action_tokens = config.ki_num_action_tokens
-        if config.knowledge_insulation:
-            self.discrete_action_head = nnx.Linear(
-                paligemma_config.width, config.ki_fast_vocab_size, rngs=rngs
-            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -120,7 +111,7 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, "*b s"]]:
         input_mask = []
         ar_mask = []
         tokens = []
@@ -144,11 +135,22 @@ class Pi0(_model.BaseModel):
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            if self.knowledge_insulation and obs.token_ar_mask is not None:
+                # Under KI the prompt carries a teacher-forced FAST action postfix, which must
+                # be CAUSAL so the discrete loss is genuine next-token prediction rather than
+                # each position seeing its own answer. `token_ar_mask` (from `FASTTokenizer`)
+                # is 0 on the image/text prefix and 1 on that postfix. It is per-example, so
+                # the whole ar_mask becomes [b, s] here rather than the usual [s]; every
+                # consumer of it broadcasts, so this is safe.
+                image_part = jnp.zeros((obs.token_ar_mask.shape[0], len(ar_mask)), dtype=bool)
+                ar_mask = jnp.concatenate([image_part, obs.token_ar_mask.astype(bool)], axis=1)
+            else:
+                # full attention between image and language inputs
+                ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
+        if isinstance(ar_mask, list):
+            ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
     @at.typecheck
@@ -221,6 +223,7 @@ class Pi0(_model.BaseModel):
             prefix_out, suffix_out = self._forward_insulated(
                 prefix_tokens, prefix_mask, prefix_ar_mask,
                 suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond,
+                self.fast_span_mask(observation, prefix_mask.shape[1]),
             )
         else:
             # one big forward pass of prefix + suffix at once
@@ -240,9 +243,23 @@ class Pi0(_model.BaseModel):
             loss = loss + self.ki_fast_loss_weight * self._fast_token_loss(prefix_out, observation)[:, None]
         return loss
 
+    def fast_span_mask(self, obs: _model.Observation, prefix_len: int) -> at.Bool[at.Array, "b p"]:
+        """True at prefix positions holding the teacher-forced FAST action postfix.
+
+        The action expert must be blind to these (see `_forward_insulated`). `token_loss_mask`
+        marks exactly the `Action:` + FAST-ids + `|` postfix, and is in PROMPT coordinates, so
+        it is left-padded here by the number of image tokens to reach prefix coordinates.
+        """
+        if obs.token_loss_mask is None:
+            return jnp.zeros((obs.state.shape[0], prefix_len), dtype=bool)
+        n_image = prefix_len - obs.token_loss_mask.shape[1]
+        image_part = jnp.zeros((obs.token_loss_mask.shape[0], n_image), dtype=bool)
+        return jnp.concatenate([image_part, obs.token_loss_mask.astype(bool)], axis=1)
+
     def _forward_insulated(
         self, prefix_tokens, prefix_mask, prefix_ar_mask,
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond,
+        fast_span_mask,
     ):
         """Prefix and suffix in two passes, with the VLM's KV detached between them.
 
@@ -252,10 +269,22 @@ class Pi0(_model.BaseModel):
         representations. Splitting the forward gives us a seam to cut.
 
         The cut is on the KV CACHE, not on `prefix_tokens`. Detaching the input embeddings
-        (as Shiduo-zh/openpi does) only protects the vision tower and embedder -- the LLM
-        layers processing the prefix would still receive action gradients through attention.
-        Detaching the cache severs every path, matching liushb9/TACO (JAX) and
-        TensorAuto/OpenTau (`past_key_values[...].detach()`).
+        only protects the vision tower and embedder -- the LLM layers processing the prefix
+        would still receive action gradients through attention. Detaching the cache severs
+        every path, matching TensorAuto/OpenTau (`past_key_values[...]["key_states"].detach()`)
+        and, more literally still, cijerezg/lerobot, which splits K/V by query owner so VLM
+        queries keep the gradient while action queries get a detached copy.
+
+        `fast_span_mask` marks the teacher-forced FAST action tokens now living in the prefix.
+        The expert is masked OFF them, because they are the ground-truth answer: letting the
+        flow-matching branch attend to them would leak the label (and they are absent at
+        inference, so the branch would also see a different world at test time). The paper:
+        "we set the attention mask A such that no discrete FAST action token can attend to
+        continuous action tokens and vice-versa." OpenTau does the same by subtracting the
+        discrete-action span from `num_cross_att_tokens`.
+
+        The expert's POSITION ids are offset by the count of tokens it can actually see, not by
+        the full prefix length, for the same train/inference-consistency reason.
         """
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -264,10 +293,13 @@ class Pi0(_model.BaseModel):
         )
         kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)
 
+        # What the expert is allowed to attend to: valid prefix tokens MINUS the FAST span.
+        visible_prefix_mask = jnp.logical_and(prefix_mask, jnp.logical_not(fast_span_mask))
+
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-        prefix_part = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        prefix_part = einops.repeat(visible_prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
         full_attn_mask = jnp.concatenate([prefix_part, suffix_attn_mask], axis=-1)
-        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+        positions = jnp.sum(visible_prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
         (_, suffix_out), _ = self.PaliGemma.llm(
             [None, suffix_tokens], mask=full_attn_mask, positions=positions,
             kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
@@ -275,25 +307,36 @@ class Pi0(_model.BaseModel):
         return prefix_out, suffix_out
 
     def _fast_token_loss(self, prefix_out, observation) -> at.Float[at.Array, " b"]:
-        """Cross-entropy on discrete FAST action tokens predicted from the VLM stream.
+        """Shift-by-one cross-entropy on the teacher-forced FAST action tokens.
 
-        This is the ONLY signal training the VLM once the action gradient is cut, so a
-        missing target is a hard error: silently dropping it would turn `knowledge_insulation`
-        into plain backbone freezing while still reporting itself as KI.
+        This is the ONLY signal training the VLM once the action gradient is cut, so a missing
+        target is a hard error: silently dropping it would turn `knowledge_insulation` into
+        plain backbone freezing while still reporting itself as KI.
+
+        Mirrors `pi0_fast.compute_loss`: each position predicts the NEXT token, so logits are
+        shifted left against targets shifted right, and the loss is averaged over the masked
+        positions only. Logits come from the TIED embedding table (`gemma.Module.decode`), so
+        no parameters are added -- the same choice cijerezg/lerobot and open-gigaai/giga-brain-0
+        make.
         """
-        targets = getattr(observation, "fast_action_tokens", None)
-        if targets is None:
+        if observation.token_loss_mask is None or observation.tokenized_prompt is None:
             raise ValueError(
-                "knowledge_insulation=True requires Observation.fast_action_tokens "
-                f"(int32 [b, {self.ki_num_action_tokens}]) from the data pipeline: with the "
+                "knowledge_insulation=True requires a FAST-tokenized prompt (tokenized_prompt "
+                "+ token_ar_mask + token_loss_mask) from the data pipeline: with the "
                 "action-expert gradient path cut, the VLM would otherwise receive no gradient "
                 "at all, which is backbone freezing rather than knowledge insulation."
             )
-        n = self.ki_num_action_tokens
-        logits = self.discrete_action_head(prefix_out[:, -n:])
-        logp = jax.nn.log_softmax(logits, axis=-1)
+        # The prefix is [image tokens, prompt tokens]; only the prompt part has token targets.
+        n_prompt = observation.tokenized_prompt.shape[1]
+        prompt_out = prefix_out[:, -n_prompt:]
+
+        logits = self.PaliGemma.llm(prompt_out[:, :-1], method="decode")
+        logp = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+        targets = observation.tokenized_prompt[:, 1:]
         picked = jnp.take_along_axis(logp, targets[..., None].astype(jnp.int32), axis=-1)[..., 0]
-        return -jnp.mean(picked, axis=-1)
+
+        loss_mask = observation.token_loss_mask[:, 1:].astype(jnp.float32)
+        return -jnp.sum(picked * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, axis=-1), 1)
 
     @override
     def sample_actions(

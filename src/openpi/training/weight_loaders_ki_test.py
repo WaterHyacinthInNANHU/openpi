@@ -1,15 +1,15 @@
-"""The knowledge-insulation head must survive loading a pre-KI checkpoint.
+"""A KI model must load a pre-KI checkpoint with no special-casing at all.
 
-`discrete_action_head` is introduced by `knowledge_insulation=True` and exists in NO
-released checkpoint -- every KI config initialises from `pi05_droid/params`, which predates
-it. `CheckpointWeightLoader` keeps only the intersection of checkpoint and reference params,
-plus reference params matching `missing_regex` (was `.*lora.*` only). The head matched
-neither, so it was dropped from the merged tree, and `scripts/train.py`
-`_load_weights_and_validate` then compares the merged tree against the full params shape
-with `check_pytree_equality` -- a hard ValueError before step 0.
+History: the first KI design added a `discrete_action_head`, which no released checkpoint
+carries. `CheckpointWeightLoader` keeps only the intersection of checkpoint and reference params
+plus reference params matching `missing_regex` (`.*lora.*`), so the head was dropped and
+`scripts/train.py` `_load_weights_and_validate` raised on the structural mismatch before step 0
+-- every `_ki` config was unlaunchable. That was first fixed by widening the regex.
 
-The control test is what keeps the fix honest: widening the regex to `.*` would make the
-first test pass while silently accepting genuinely misnamed params.
+Option C then removed the head entirely: the discrete cross-entropy goes through the TIED LM
+head (`gemma.Module.decode`), so KI allocates no parameters and the regex went back to
+`.*lora.*`. These tests keep that true -- if anyone reintroduces a KI-only parameter, the first
+test fails and tells them they have also reintroduced the loading bug.
 """
 
 from __future__ import annotations
@@ -24,48 +24,43 @@ import openpi.models.pi0_config as _pi0_config
 import openpi.training.weight_loaders as _weight_loaders
 
 
-def _ki_params_shape() -> dict:
-    """Reference params of a tiny KI-enabled pi0.5, as train.py passes to the loader."""
+def _params(*, ki: bool) -> dict:
     cfg = _pi0_config.Pi0Config(
         paligemma_variant="dummy",
         action_expert_variant="dummy",
         action_horizon=4,
         action_dim=8,
-        max_token_len=16,
         pi05=True,
-        knowledge_insulation=True,
+        knowledge_insulation=ki,
     )
     return nnx.state(cfg.create(jax.random.key(0)), nnx.Param).to_pure_dict()
 
 
 @pytest.fixture(scope="module")
 def ki_params() -> dict:
-    return _ki_params_shape()
+    return _params(ki=True)
 
 
-def _pre_ki_checkpoint(params: dict) -> dict:
-    """The same params as a released (pre-KI) checkpoint: everything except the KI head."""
-    flat = traverse_util.flatten_dict(params, sep="/")
-    return traverse_util.unflatten_dict(
-        {k: np.asarray(v) for k, v in flat.items() if "discrete_action_head" not in k}, sep="/"
+@pytest.fixture(scope="module")
+def stock_params() -> dict:
+    return _params(ki=False)
+
+
+def test_ki_needs_no_params_the_checkpoint_lacks(ki_params, stock_params):
+    """The root property: a KI model asks for exactly the params a stock pi0.5 checkpoint has."""
+    assert set(traverse_util.flatten_dict(ki_params, sep="/")) == set(
+        traverse_util.flatten_dict(stock_params, sep="/")
     )
 
 
-def test_ki_head_survives_a_pre_ki_checkpoint(ki_params):
-    merged = _weight_loaders._merge_params(
-        _pre_ki_checkpoint(ki_params),
-        ki_params,
-        missing_regex=_weight_loaders.CheckpointWeightLoader.missing_regex,
-    )
-    flat = traverse_util.flatten_dict(merged, sep="/")
-    assert "discrete_action_head/kernel" in flat
-    assert "discrete_action_head/bias" in flat
+def test_stock_checkpoint_loads_into_a_ki_model(ki_params, stock_params):
+    """End to end: merging a pre-KI checkpoint into a KI model leaves nothing missing.
 
-
-def test_merged_tree_matches_the_reference_structure(ki_params):
-    """What train.py actually asserts: the merged tree must be structurally complete."""
+    This is exactly the structural equality `scripts/train.py` asserts before step 0.
+    """
+    checkpoint = {k: np.asarray(v) for k, v in traverse_util.flatten_dict(stock_params, sep="/").items()}
     merged = _weight_loaders._merge_params(
-        _pre_ki_checkpoint(ki_params),
+        traverse_util.unflatten_dict(checkpoint, sep="/"),
         ki_params,
         missing_regex=_weight_loaders.CheckpointWeightLoader.missing_regex,
     )
@@ -74,15 +69,15 @@ def test_merged_tree_matches_the_reference_structure(ki_params):
     )
 
 
-def test_unknown_reference_params_are_still_dropped(ki_params):
-    """Control: the regex must not have been widened to `.*`.
+def test_unknown_reference_params_are_still_dropped(ki_params, stock_params):
+    """Control: the regex must not be so wide that a real mismatch slips through.
 
-    A param the checkpoint does not carry and KI did not introduce is a real mismatch
-    (typo, arch drift). It must still be dropped so train.py's equality check reports it.
+    A param the checkpoint lacks and LoRA did not introduce is a typo or arch drift, and must
+    stay dropped so train.py's equality check reports it.
     """
     reference = {**ki_params, "typo_head": {"kernel": np.zeros((2, 2), dtype=np.float32)}}
     merged = _weight_loaders._merge_params(
-        _pre_ki_checkpoint(ki_params),
+        stock_params,
         reference,
         missing_regex=_weight_loaders.CheckpointWeightLoader.missing_regex,
     )

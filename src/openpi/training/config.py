@@ -166,31 +166,37 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                inputs: list[_transforms.DataTransformFn] = [
-                    _transforms.InjectDefaultPrompt(self.default_prompt),
-                    _transforms.ResizeImages(224, 224),
-                    _transforms.TokenizePrompt(
-                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        discrete_state_input=model_config.discrete_state_input,
-                    ),
-                    _transforms.PadStatesAndActions(model_config.action_dim),
-                ]
                 if model_config.knowledge_insulation:
-                    # AFTER PadStatesAndActions on purpose: the discrete head must predict the
-                    # same padded chunk the flow-matching head regresses, otherwise the two
-                    # halves of KI supervise different action spaces.
-                    # PAD id = vocab_size - 1, so `ki_fast_vocab_size` must be strictly larger
-                    # than the FAST vocabulary (2048) -- see FASTActionTokenizer.
-                    inputs.append(
-                        _transforms.TokenizeFASTActionTargets(
-                            _tokenizer.FASTActionTokenizer(
-                                num_tokens=model_config.ki_num_action_tokens,
-                                pad_token_id=model_config.ki_fast_vocab_size - 1,
+                    # KI needs the FAST action ids teacher-forced INTO the token stream, which
+                    # is exactly what the pi0-FAST tokenizer already produces: the pi0.5 prompt
+                    # (`Task: ..., State: ...;\n`) followed by an `Action:` + FAST-ids + `|`
+                    # postfix, plus the causal `token_ar_mask` and the `token_loss_mask` the
+                    # discrete cross-entropy is averaged over.
+                    #
+                    # PadStatesAndActions runs FIRST so the FAST ids describe the same padded
+                    # chunk the flow-matching head regresses; otherwise the two halves of KI
+                    # would supervise different action spaces.
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                            _transforms.TokenizeFASTInputs(
+                                _tokenizer.FASTTokenizer(model_config.max_token_len),
                             ),
-                            vocab_size=model_config.ki_fast_vocab_size,
-                        )
+                        ],
                     )
-                return _transforms.Group(inputs=inputs)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -738,17 +744,10 @@ class TrainConfig:
 
 
 # Knowledge insulation (arXiv:2505.23705), shared by every KI arm so the DROID, AXIS-pretrain
-# and SLB twins supervise the discrete head identically and stay comparable.
-# All of them use action_horizon=16 / action_dim=32, so one setting is correct for all.
-_KI_MODEL_KWARGS = {
-    "knowledge_insulation": True,
-    # 64, not the 32 default: a normalized 16x32 chunk FAST-compresses to ~40-50 ids, so 32
-    # would truncate away the end of nearly every chunk.
-    "ki_num_action_tokens": 64,
-    # FAST's own vocabulary is 2048; the extra slot is the pad/end-of-chunk class, so padding
-    # never collides with a real action token.
-    "ki_fast_vocab_size": 2049,
-}
+# and SLB twins are comparable. The FAST token budget is no longer a model field: the ids are
+# spliced into the prompt, so `max_token_len` (250 for KI, see Pi0Config.__post_init__) is what
+# bounds them.
+_KI_MODEL_KWARGS = {"knowledge_insulation": True}
 
 
 def _with_ki_twin(config: TrainConfig) -> list[TrainConfig]:
@@ -762,10 +761,13 @@ def _with_ki_twin(config: TrainConfig) -> list[TrainConfig]:
     `compute_loss`, so an inference-only config (e.g. `pi05_droid`) would gain an untrained
     `discrete_action_head` and behave identically at sampling time.
     """
+    # max_token_len is reset to None so Pi0Config.__post_init__ re-derives it: KI needs the
+    # larger budget (250) to fit the spliced FAST postfix, and the base config has already
+    # resolved its own default (200) by the time we get here.
     ki = dataclasses.replace(
         config,
         name=f"{config.name}_ki",
-        model=dataclasses.replace(config.model, **_KI_MODEL_KWARGS),
+        model=dataclasses.replace(config.model, max_token_len=None, **_KI_MODEL_KWARGS),
     )
     return [config, ki]
 

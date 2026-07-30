@@ -40,17 +40,27 @@ class Pi0Config(_model.BaseModelConfig):
     # Half 1 alone is NOT knowledge insulation -- with no other signal reaching it the VLM
     # simply stops learning, which is plain backbone freezing. Upstream openpi implements
     # neither (README: "we currently only support the flow matching head").
+    # The discrete half runs through the TIED LM head over the PaliGemma vocabulary, with the
+    # FAST ids spliced into the prompt by `FASTTokenizer` -- so KI adds NO parameters and KI
+    # checkpoints stay interchangeable with stock pi0.5.
     knowledge_insulation: bool = False
-    # Weight on the discrete-action CE relative to the flow-matching MSE.
+    # Weight on the discrete-action CE relative to the flow-matching MSE. 1.0 matches
+    # cijerezg/lerobot's w_action_ce; the paper's own alpha could not be read off the PDF.
     ki_fast_loss_weight: float = 1.0
-    # Number of FAST action tokens supervised per example, and their vocabulary size.
-    # Must match whatever the data pipeline puts in Observation.fast_action_tokens.
-    ki_num_action_tokens: int = 32
-    ki_fast_vocab_size: int = 2048
 
     def __post_init__(self):
         if self.max_token_len is None:
-            object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+            # KI splices an `Action:` + FAST-ids + `|` postfix into the prompt, which costs
+            # 37-53 tokens on a 16x32 chunk with 8 active dims. Measured against REAL AXIS
+            # instructions (median 6 words, longest 12) the total tops out at ~191, so the
+            # stock 200 does fit -- but with only ~9 tokens to spare, and FAST length varies
+            # with chunk compressibility. Truncation is from the right, so crossing that line
+            # silently deletes the tail of the action chunk, which never shows up in the loss.
+            # 250 buys margin, and is required for `pi05_droid_finetune_ki` whose user datasets
+            # have unbounded prompt lengths. Costs ~11% more prefix tokens and zero parameters
+            # (gemma uses RoPE, so no shape depends on this).
+            default_len = 250 if self.knowledge_insulation else 200
+            object.__setattr__(self, "max_token_len", default_len if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
         if self.pytorch_compile_mode is not None:
