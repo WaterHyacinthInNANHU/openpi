@@ -13,7 +13,7 @@ WHY THIS FILE EXISTS
 
 The ranges dict is openpi's own sample-ranges artifact, keyed ``task_<task_id>--<episode_index>``
 with half-open ``[start, end)`` frame ranges -- byte-identical to what
-``benchmarks.dataloader.pretrain_ranges`` emits. Ranges are clamped to each episode's length.
+``axis_data.pretrain_ranges`` emits. Ranges are clamped to each episode's length.
 """
 
 from __future__ import annotations

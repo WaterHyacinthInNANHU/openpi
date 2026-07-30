@@ -68,7 +68,7 @@ def plan_rows_from_roots(roots_index: str | pathlib.Path, ranges_path: str | pat
     if roots_index is None or ranges_path is None:
         raise ValueError(
             "pretraining needs both AXIS_PRETRAIN_ROOTS_INDEX and AXIS_PRETRAIN_RANGES set "
-            "(build them with benchmarks.dataloader.build_pretrain_datasets / pretrain_ranges); "
+            "(build them with axis_data.build_pretrain_datasets / pretrain_ranges); "
             f"got roots_index={roots_index!r}, ranges_path={ranges_path!r}"
         )
     entries: list[tuple[int, dict[int, tuple[int, int]], int]] = []

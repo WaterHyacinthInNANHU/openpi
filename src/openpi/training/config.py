@@ -902,7 +902,7 @@ def _axis_pretrain_config(*, num_train_steps: int = 100_000, batch_size: int = 3
 
     Multi-task: the loader concatenates the per-task __droid8d sub-datasets named in
     AXIS_PRETRAIN_ROOTS_INDEX and restricts rows to the non-idle ranges at
-    AXIS_PRETRAIN_RANGES (both produced offline by benchmarks.dataloader.build_pretrain_datasets
+    AXIS_PRETRAIN_RANGES (both produced offline by axis_data.build_pretrain_datasets
     / pretrain_ranges). Paths come from env so the committed config carries no machine paths.
 
     Norm stats are OWN (run scripts/compute_norm_stats.py --config-name pi05_axis_pretrain

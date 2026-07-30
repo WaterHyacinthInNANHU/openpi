@@ -16,7 +16,7 @@ dims 8-31, so each padded zero became
     (0 - 0) / (0 - 0 + 1e-6) * 2 - 1 = -1.0
 turning 24 of 32 action dims into a constant -1.0 the pretrained decoder never emits,
 where pi05_droid saw 0.0. Benign under z-score, pathological under quantile.
-Regression-tested in benchmarks/dataloader/tests/test_axis_franka_policy.py.
+Regression-tested in axis_data/tests/test_axis_franka_policy.py.
 """
 from __future__ import annotations
 

@@ -203,8 +203,8 @@ def build_conditioning(
     identical to `vanilla`, so a silent fallback would put a duplicate arm in the bake-off
     and make it look like CFG had no effect.
     """
-    from benchmarks.dataloader.join_index import JoinIndex
-    from benchmarks.dataloader.sidecar_reader import VariantSidecar
+    from axis_data.join_index import JoinIndex
+    from axis_data.sidecar_reader import VariantSidecar
 
     if not manifest_path:
         raise ValueError("slb_manifest_path is required to join attempts to episodes")

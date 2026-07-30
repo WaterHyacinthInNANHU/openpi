@@ -48,7 +48,7 @@ def test_global_base_offsets_second_subdataset():
 
 
 def test_episode_key_format_matches_pretrain_ranges():
-    # The ranges file is emitted by benchmarks.dataloader.pretrain_ranges with exactly this
+    # The ranges file is emitted by axis_data.pretrain_ranges with exactly this
     # key format; drift here silently drops every row. Pin it.
     assert ps.episode_key(1644, 7) == "task_1644--7"
 
