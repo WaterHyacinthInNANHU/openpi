@@ -1,7 +1,7 @@
 import dataclasses
 import logging
 import re
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import flax.traverse_util
 import numpy as np
@@ -47,11 +47,21 @@ class CheckpointWeightLoader(WeightLoader):
 
     params_path: str
 
+    # Reference params allowed to be absent from the checkpoint and kept at their freshly
+    # initialised values. Anything else missing is a real mismatch and must stay dropped so
+    # that train.py's `check_pytree_equality` reports it.
+    #   - `.*lora.*`: LoRA adapters, which no base checkpoint carries.
+    #   - `.*discrete_action_head.*`: the knowledge-insulation FAST-token head
+    #     (`Pi0Config.knowledge_insulation`). It postdates every released checkpoint,
+    #     including the `pi05_droid/params` that all KI configs initialise from, and is
+    #     trained from scratch by design.
+    missing_regex: ClassVar[str] = ".*lora.*|.*discrete_action_head.*"
+
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing LoRA / knowledge-insulation weights.
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)
