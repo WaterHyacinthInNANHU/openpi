@@ -737,6 +737,39 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# Knowledge insulation (arXiv:2505.23705), shared by every KI arm so the DROID, AXIS-pretrain
+# and SLB twins supervise the discrete head identically and stay comparable.
+# All of them use action_horizon=16 / action_dim=32, so one setting is correct for all.
+_KI_MODEL_KWARGS = {
+    "knowledge_insulation": True,
+    # 64, not the 32 default: a normalized 16x32 chunk FAST-compresses to ~40-50 ids, so 32
+    # would truncate away the end of nearly every chunk.
+    "ki_num_action_tokens": 64,
+    # FAST's own vocabulary is 2048; the extra slot is the pad/end-of-chunk class, so padding
+    # never collides with a real action token.
+    "ki_fast_vocab_size": 2049,
+}
+
+
+def _with_ki_twin(config: TrainConfig) -> list[TrainConfig]:
+    """Returns `[config, config_with_knowledge_insulation]` for splicing into `_CONFIGS`.
+
+    Built with `dataclasses.replace` so the twin provably differs from the base in the KI
+    model fields and the name and NOTHING else -- the A/B stays clean even if the base config
+    is later edited, and the base itself is returned untouched for in-flight runs.
+
+    Only meaningful for TRAINABLE configs: `knowledge_insulation` is read exclusively by
+    `compute_loss`, so an inference-only config (e.g. `pi05_droid`) would gain an untrained
+    `discrete_action_head` and behave identically at sampling time.
+    """
+    ki = dataclasses.replace(
+        config,
+        name=f"{config.name}_ki",
+        model=dataclasses.replace(config.model, **_KI_MODEL_KWARGS),
+    )
+    return [config, ki]
+
+
 def _axis_slb_config(
     task_id: int, variant: str, *, knowledge_insulation: bool = False, num_train_steps: int = 20_000
 ) -> TrainConfig:
@@ -766,17 +799,7 @@ def _axis_slb_config(
         decay_steps=num_train_steps,
         decay_lr=2.5e-6,
     )
-    ki_kwargs = {}
-    if knowledge_insulation:
-        ki_kwargs = {
-            "knowledge_insulation": True,
-            # 64, not the 32 default: a normalized 16x32 chunk FAST-compresses to ~40-50 ids,
-            # so 32 would truncate away the end of nearly every chunk.
-            "ki_num_action_tokens": 64,
-            # FAST's own vocabulary is 2048; the extra slot is the pad/end-of-chunk class, so
-            # padding never collides with a real action token.
-            "ki_fast_vocab_size": 2049,
-        }
+    ki_kwargs = _KI_MODEL_KWARGS if knowledge_insulation else {}
 
     return TrainConfig(
         name=f"pi05_axis_slb_{task_id}_{variant}" + ("_ki" if knowledge_insulation else ""),
@@ -897,7 +920,9 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
     )
 
 
-def _axis_pretrain_config(*, num_train_steps: int = 100_000, batch_size: int = 32) -> TrainConfig:
+def _axis_pretrain_config(
+    *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False
+) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
     Multi-task: the loader concatenates the per-task __droid8d sub-datasets named in
@@ -913,11 +938,20 @@ def _axis_pretrain_config(*, num_train_steps: int = 100_000, batch_size: int = 3
     num_train_steps is a placeholder: recompute it as ceil(total_selected_windows / batch_size)
     * epochs against the FINAL downloaded corpus (see reports/fullweight_training_speed_estimate.md
     and reports/pretrain_dataloader_design.md) before the real run.
+
+    `knowledge_insulation` emits a separately-named `_ki` twin rather than changing this config,
+    so a run already launched against `pi05_axis_pretrain` keeps exactly the config it started
+    with. Pretraining is where KI should matter most: this is a FULL-WEIGHT run over a large
+    corpus, i.e. precisely the regime where the flow-matching gradient has enough steps to
+    erode the VLM's pretrained semantics (arXiv:2505.23705).
     """
     return TrainConfig(
-        name="pi05_axis_pretrain",
+        name="pi05_axis_pretrain" + ("_ki" if knowledge_insulation else ""),
         # Full weight: default (non-lora) gemma variants, no freeze_filter.
-        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=16,
+            **(_KI_MODEL_KWARGS if knowledge_insulation else {}),
+        ),
         data=AxisFrankaPretrainDataConfig(
             repo_id="Devon018/Franka-Datasets-v2",
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
@@ -947,6 +981,9 @@ def _axis_pretrain_config(*, num_train_steps: int = 100_000, batch_size: int = 3
 _CONFIGS = [
     _axis_fullweight_speedtest(),
     _axis_pretrain_config(),
+    # Knowledge-insulation twin: identical data/optimizer/budget, but the flow-matching
+    # gradient is cut at the prefix KV and the VLM is trained by a FAST-token CE instead.
+    _axis_pretrain_config(knowledge_insulation=True),
     #
     # Inference Aloha configs.
     #
@@ -1308,29 +1345,36 @@ _CONFIGS = [
         keep_period=10_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
-    TrainConfig(
-        # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
-        # Here, we use LeRobot data format (like for all other fine-tuning examples)
-        # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
-        name="pi05_droid_finetune",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,  # pi05 is trained with 32-dim actions
-            action_horizon=16,
-        ),
-        data=LeRobotDROIDDataConfig(
-            # Replace with your custom DROID LeRobot dataset repo id.
-            repo_id="your_hf_username/my_droid_dataset",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                # Important: reuse the original DROID norm stats during fine-tuning!
-                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
-                asset_id="droid",
+    # `pi05_droid_finetune` plus its `_ki` twin (knowledge insulation, arXiv:2505.23705).
+    # pi05-DROID was itself trained with KI, so a KI fine-tune keeps the recipe the base
+    # checkpoint was produced under instead of reverting to a plain joint flow-matching
+    # fine-tune. The head is new (absent from the released params) and starts from scratch --
+    # see CheckpointWeightLoader.missing_regex.
+    *_with_ki_twin(
+        TrainConfig(
+            # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
+            # Here, we use LeRobot data format (like for all other fine-tuning examples)
+            # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
+            name="pi05_droid_finetune",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,  # pi05 is trained with 32-dim actions
+                action_horizon=16,
             ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
-        num_train_steps=20_000,
-        batch_size=32,
+            data=LeRobotDROIDDataConfig(
+                # Replace with your custom DROID LeRobot dataset repo id.
+                repo_id="your_hf_username/my_droid_dataset",
+                base_config=DataConfig(prompt_from_task=True),
+                assets=AssetsConfig(
+                    # Important: reuse the original DROID norm stats during fine-tuning!
+                    assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                    asset_id="droid",
+                ),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+            num_train_steps=20_000,
+            batch_size=32,
+        )
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
