@@ -1295,13 +1295,14 @@ _CONFIGS = [
     # -> 1 consistent look). Tests the hypothesis that appearance variance, not demo count,
     # starves the policy.
     _axis_slb_config(1644, "vanilla", num_train_steps=7369, freeze_vision=False, name_suffix="_rr7k"),
-    # Re-rendered 4-METHOD bake-off @ 75k steps, vision unfrozen, on the fixed-appearance data
+    # Re-rendered 5-METHOD bake-off @ 75k steps, vision unfrozen, on the fixed-appearance data
     # (launch with CFG_SUFFIX=_rr75k + DATASET_ROOT_OVERRIDE + MANIFEST_OVERRIDE). Same 25 demos,
     # same per-(task,variant) sidecars (keyed by attempt_id), only IMAGES re-rendered. First
-    # method comparison on consistent-appearance data.
+    # method comparison on consistent-appearance data. vanilla is the REQUIRED baseline: without
+    # it at the same 75k step budget, "filt_bin/top70/awr beat plain BC" is unprovable.
     *[
         _axis_slb_config(1644, v, num_train_steps=75_000, name_suffix="_rr75k")
-        for v in ("filt_bin", "top70", "awr", "cfg")
+        for v in ("vanilla", "filt_bin", "top70", "awr", "cfg")
     ],
     #
     # Fine-tuning Aloha configs.
