@@ -386,6 +386,18 @@ class Module(nn.Module):
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
     @at.typecheck
+    def decode(self, x: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        """Logits over the PaliGemma vocabulary, via the TIED embedding table.
+
+        `Embedder.decode` is `x @ input_embedding_table.T`, so this head costs no parameters --
+        which is what lets knowledge insulation add a discrete action-token cross-entropy
+        without changing the checkpoint (see `Pi0Config.knowledge_insulation`). `gemma_fast`
+        exposes the same thing through `return_prelogits`/`pre_logits`; this is the equivalent
+        entry point for the two-expert `gemma` module that pi0/pi0.5 use.
+        """
+        return self.embedder.decode(x)
+
+    @at.typecheck
     def __call__(
         self,
         # list of token arrays, one for each expert, or None if that expert should not be run

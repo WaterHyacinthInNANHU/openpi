@@ -139,62 +139,6 @@ class FASTTokenizer:
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
 
 
-class FASTActionTokenizer:
-    """FAST action tokenization on its own vocabulary, without the PaliGemma text wrapper.
-
-    `FASTTokenizer` maps the FAST ids into the *tail of the PaliGemma vocabulary* and splices
-    them into a prompt, because that is what the pi0-FAST model consumes as language. The
-    knowledge-insulation head is a separate `nnx.Linear(width, ki_fast_vocab_size)` predicting
-    raw FAST ids, so it needs the untranslated ids -- and none of the SentencePiece machinery,
-    which is why this class does not download the PaliGemma tokenizer at all.
-
-    FAST is a DCT + BPE compressor, so the id sequence length varies per chunk (empirically
-    ~40-50 ids for a 16x32 normalized chunk, but hundreds for near-noise). The model needs a
-    fixed `[b, num_tokens]` target, so sequences are right-padded with `pad_token_id` and
-    truncated from the right. Padding is supervised rather than masked out: predicting "the
-    chunk ended here" is the same objective an autoregressive FAST decoder is trained on, and
-    it keeps the loss a plain mean over `num_tokens` positions. This makes `pad_token_id` a
-    real class, so it MUST be disjoint from the FAST id range -- see `ki_fast_vocab_size`.
-    """
-
-    def __init__(
-        self,
-        num_tokens: int,
-        pad_token_id: int,
-        fast_tokenizer_path: str = "physical-intelligence/fast",
-    ):
-        self._num_tokens = num_tokens
-        self._pad_token_id = pad_token_id
-        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
-        self._warned_truncation = False
-
-    @property
-    def num_tokens(self) -> int:
-        return self._num_tokens
-
-    @property
-    def pad_token_id(self) -> int:
-        return self._pad_token_id
-
-    def tokenize_actions(self, actions: np.ndarray) -> np.ndarray:
-        """Returns int32 FAST ids of shape [num_tokens] for a single [action_horizon, action_dim] chunk."""
-        tokens = list(self._fast_tokenizer(np.asarray(actions, dtype=np.float32)[None])[0])
-
-        if (n := len(tokens)) > self._num_tokens:
-            if not self._warned_truncation:
-                self._warned_truncation = True
-                logging.warning(
-                    f"FAST action chunk produced {n} tokens, truncating to {self._num_tokens}. The tail of the "
-                    "chunk is then unsupervised; raise `ki_num_action_tokens` if this is not rare. "
-                    "(Logged once per tokenizer instance.)"
-                )
-            tokens = tokens[: self._num_tokens]
-        else:
-            tokens = tokens + [self._pad_token_id] * (self._num_tokens - n)
-
-        return np.asarray(tokens, dtype=np.int32)
-
-
 ###########################################################################
 ## The tokenizers below are used for RoboArena baseline implementations. ##
 ## They are *not* used for pi0-style models.                             ##

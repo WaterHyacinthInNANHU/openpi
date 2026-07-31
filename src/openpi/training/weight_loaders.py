@@ -1,7 +1,7 @@
 import dataclasses
 import logging
 import re
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import flax.traverse_util
 import numpy as np
@@ -47,11 +47,22 @@ class CheckpointWeightLoader(WeightLoader):
 
     params_path: str
 
+    # Reference params allowed to be absent from the checkpoint and kept at their freshly
+    # initialised values. Anything else missing is a real mismatch and must stay dropped so
+    # that train.py's `check_pytree_equality` reports it. Only LoRA adapters qualify: no base
+    # checkpoint carries them.
+    #
+    # Knowledge insulation deliberately adds NO parameters -- its discrete cross-entropy goes
+    # through the tied LM head (`gemma.Module.decode`) -- so it needs no entry here. An earlier
+    # design used a separate `discrete_action_head`, which this regex had to special-case; that
+    # head is gone, and with it the special case.
+    missing_regex: ClassVar[str] = ".*lora.*"
+
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing LoRA / knowledge-insulation weights.
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -130,6 +130,15 @@ class DataConfig:
     # documents the qpos-based measurement. False only reproduces pre-2026-07-22 runs.
     slb_render_aligned_rows: bool = True
 
+    # --- PSB/pretraining multi-task loader (see openpi.training.pretrain_sampler) ---
+    # Distinct from the single-task SLB path above. When pretrain_roots_index is set, the
+    # loader concatenates the per-task __droid8d LeRobot sub-datasets it names and restricts
+    # rows to the non-idle sample-ranges at pretrain_ranges_path (openpi's own ranges format,
+    # keyed "task_<id>--<episode_index>"). Left None for every non-pretraining config, which
+    # keeps the single-dataset behaviour. These never coexist with the slb_* fields.
+    pretrain_roots_index: str | None = None
+    pretrain_ranges_path: str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -158,31 +167,37 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                inputs: list[_transforms.DataTransformFn] = [
-                    _transforms.InjectDefaultPrompt(self.default_prompt),
-                    _transforms.ResizeImages(224, 224),
-                    _transforms.TokenizePrompt(
-                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        discrete_state_input=model_config.discrete_state_input,
-                    ),
-                    _transforms.PadStatesAndActions(model_config.action_dim),
-                ]
                 if model_config.knowledge_insulation:
-                    # AFTER PadStatesAndActions on purpose: the discrete head must predict the
-                    # same padded chunk the flow-matching head regresses, otherwise the two
-                    # halves of KI supervise different action spaces.
-                    # PAD id = vocab_size - 1, so `ki_fast_vocab_size` must be strictly larger
-                    # than the FAST vocabulary (2048) -- see FASTActionTokenizer.
-                    inputs.append(
-                        _transforms.TokenizeFASTActionTargets(
-                            _tokenizer.FASTActionTokenizer(
-                                num_tokens=model_config.ki_num_action_tokens,
-                                pad_token_id=model_config.ki_fast_vocab_size - 1,
+                    # KI needs the FAST action ids teacher-forced INTO the token stream, which
+                    # is exactly what the pi0-FAST tokenizer already produces: the pi0.5 prompt
+                    # (`Task: ..., State: ...;\n`) followed by an `Action:` + FAST-ids + `|`
+                    # postfix, plus the causal `token_ar_mask` and the `token_loss_mask` the
+                    # discrete cross-entropy is averaged over.
+                    #
+                    # PadStatesAndActions runs FIRST so the FAST ids describe the same padded
+                    # chunk the flow-matching head regresses; otherwise the two halves of KI
+                    # would supervise different action spaces.
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                            _transforms.TokenizeFASTInputs(
+                                _tokenizer.FASTTokenizer(model_config.max_token_len),
                             ),
-                            vocab_size=model_config.ki_fast_vocab_size,
-                        )
+                        ],
                     )
-                return _transforms.Group(inputs=inputs)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -476,6 +491,59 @@ class AxisFrankaSlbDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class AxisFrankaPretrainDataConfig(DataConfigFactory):
+    """pi0.5 pretraining over the FULL AXIS Franka corpus (~182 tasks, one demo/scene variant).
+
+    Unlike the single-task SLB factory this trains over many tasks at once. The per-task
+    __droid8d LeRobot sub-datasets are concatenated by the loader (roots named in
+    ``roots_index``) and rows are restricted to the non-idle sample-ranges in ``ranges_path``.
+    No SLB variant sidecars, no AWR/CFG conditioning.
+
+    Norm stats are the config's OWN (computed by scripts/compute_norm_stats.py), NOT DROID's:
+    a prior experiment showed DROID's stats do not fit this action/state distribution, and a
+    full-weight run over a large corpus can learn its own scale. So this factory deliberately
+    omits the ``assets=AssetsConfig(.../pi05_droid/assets, asset_id="droid")`` override the SLB
+    arms carry -- assets default to the config's own dir.
+    """
+
+    roots_index: str | None = None
+    ranges_path: str | None = None
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        from openpi.policies import axis_franka_policy
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "base_0_rgb": "observation.images.third_person",
+                        "left_wrist_0_rgb": "observation.images.wrist",
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[axis_franka_policy.AxisFrankaInputs()],
+            outputs=[axis_franka_policy.AxisFrankaOutputs()],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+            pretrain_roots_index=self.roots_index,
+            pretrain_ranges_path=self.ranges_path,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -698,6 +766,34 @@ def _slb_freeze_filter(freeze_vision: bool):
         return base
     return nnx.Any(base, nnx_utils.PathRegex(".*img.*"))
 
+# Knowledge insulation (arXiv:2505.23705), shared by every KI arm so the DROID, AXIS-pretrain
+# and SLB twins are comparable. The FAST token budget is no longer a model field: the ids are
+# spliced into the prompt, so `max_token_len` (250 for KI, see Pi0Config.__post_init__) is what
+# bounds them.
+_KI_MODEL_KWARGS = {"knowledge_insulation": True}
+
+
+def _with_ki_twin(config: TrainConfig) -> list[TrainConfig]:
+    """Returns `[config, config_with_knowledge_insulation]` for splicing into `_CONFIGS`.
+
+    Built with `dataclasses.replace` so the twin provably differs from the base in the KI
+    model fields and the name and NOTHING else -- the A/B stays clean even if the base config
+    is later edited, and the base itself is returned untouched for in-flight runs.
+
+    Only meaningful for TRAINABLE configs: `knowledge_insulation` is read exclusively by
+    `compute_loss`, so an inference-only config (e.g. `pi05_droid`) would gain an untrained
+    `discrete_action_head` and behave identically at sampling time.
+    """
+    # max_token_len is reset to None so Pi0Config.__post_init__ re-derives it: KI needs the
+    # larger budget (250) to fit the spliced FAST postfix, and the base config has already
+    # resolved its own default (200) by the time we get here.
+    ki = dataclasses.replace(
+        config,
+        name=f"{config.name}_ki",
+        model=dataclasses.replace(config.model, max_token_len=None, **_KI_MODEL_KWARGS),
+    )
+    return [config, ki]
+
 
 def _axis_slb_config(
     task_id: int,
@@ -739,17 +835,7 @@ def _axis_slb_config(
         decay_steps=num_train_steps,
         decay_lr=2.5e-6,
     )
-    ki_kwargs = {}
-    if knowledge_insulation:
-        ki_kwargs = {
-            "knowledge_insulation": True,
-            # 64, not the 32 default: a normalized 16x32 chunk FAST-compresses to ~40-50 ids,
-            # so 32 would truncate away the end of nearly every chunk.
-            "ki_num_action_tokens": 64,
-            # FAST's own vocabulary is 2048; the extra slot is the pad/end-of-chunk class, so
-            # padding never collides with a real action token.
-            "ki_fast_vocab_size": 2049,
-        }
+    ki_kwargs = _KI_MODEL_KWARGS if knowledge_insulation else {}
 
     return TrainConfig(
         name=f"pi05_axis_slb_{task_id}_{variant}{name_suffix}" + ("_ki" if knowledge_insulation else ""),
@@ -906,9 +992,70 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
     )
 
 
+def _axis_pretrain_config(
+    *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False
+) -> TrainConfig:
+    """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
+
+    Multi-task: the loader concatenates the per-task __droid8d sub-datasets named in
+    AXIS_PRETRAIN_ROOTS_INDEX and restricts rows to the non-idle ranges at
+    AXIS_PRETRAIN_RANGES (both produced offline by axis_data.build_pretrain_datasets
+    / pretrain_ranges). Paths come from env so the committed config carries no machine paths.
+
+    Norm stats are OWN (run scripts/compute_norm_stats.py --config-name pi05_axis_pretrain
+    before launch) -- NOT DROID's; see AxisFrankaPretrainDataConfig. Weight INIT is still the
+    pi05_droid checkpoint. Full-weight (no _lora, no freeze_filter): all 3.35B params train,
+    sharded over fsdp_devices=8; batch_size is GLOBAL (per-GPU = batch_size / 8).
+
+    num_train_steps is a placeholder: recompute it as ceil(total_selected_windows / batch_size)
+    * epochs against the FINAL downloaded corpus (see reports/fullweight_training_speed_estimate.md
+    and reports/pretrain_dataloader_design.md) before the real run.
+
+    `knowledge_insulation` emits a separately-named `_ki` twin rather than changing this config,
+    so a run already launched against `pi05_axis_pretrain` keeps exactly the config it started
+    with. Pretraining is where KI should matter most: this is a FULL-WEIGHT run over a large
+    corpus, i.e. precisely the regime where the flow-matching gradient has enough steps to
+    erode the VLM's pretrained semantics (arXiv:2505.23705).
+    """
+    return TrainConfig(
+        name="pi05_axis_pretrain" + ("_ki" if knowledge_insulation else ""),
+        # Full weight: default (non-lora) gemma variants, no freeze_filter.
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=16,
+            **(_KI_MODEL_KWARGS if knowledge_insulation else {}),
+        ),
+        data=AxisFrankaPretrainDataConfig(
+            repo_id="Devon018/Franka-Datasets-v2",
+            roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
+            ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
+            base_config=DataConfig(prompt_from_task=True),
+            # NB: deliberately NO assets override -> own norm stats (compute_norm_stats),
+            # NOT pi05_droid's. See the class docstring / reports/pretrain_dataloader_design.md.
+        ),
+        # Init from the DROID checkpoint (reuse of weights is fine; only the STATS are ours).
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=num_train_steps,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=max(1000, num_train_steps // 20),
+            peak_lr=2.5e-5,
+            decay_steps=num_train_steps,
+            decay_lr=2.5e-6,
+        ),
+        batch_size=batch_size,   # GLOBAL; per-GPU = batch_size / fsdp_devices
+        fsdp_devices=8,          # 8x A100-80GB single node
+        num_workers=8,
+        ema_decay=None,
+        # NO freeze_filter -> all params trainable (full weight).
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     _axis_fullweight_speedtest(),
+    _axis_pretrain_config(),
+    # Knowledge-insulation twin: identical data/optimizer/budget, but the flow-matching
+    # gradient is cut at the prefix KV and the VLM is trained by a FAST-token CE instead.
+    _axis_pretrain_config(knowledge_insulation=True),
     #
     # Inference Aloha configs.
     #
@@ -1287,29 +1434,36 @@ _CONFIGS = [
         keep_period=10_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
-    TrainConfig(
-        # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
-        # Here, we use LeRobot data format (like for all other fine-tuning examples)
-        # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
-        name="pi05_droid_finetune",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,  # pi05 is trained with 32-dim actions
-            action_horizon=16,
-        ),
-        data=LeRobotDROIDDataConfig(
-            # Replace with your custom DROID LeRobot dataset repo id.
-            repo_id="your_hf_username/my_droid_dataset",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                # Important: reuse the original DROID norm stats during fine-tuning!
-                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
-                asset_id="droid",
+    # `pi05_droid_finetune` plus its `_ki` twin (knowledge insulation, arXiv:2505.23705).
+    # pi05-DROID was itself trained with KI, so a KI fine-tune keeps the recipe the base
+    # checkpoint was produced under instead of reverting to a plain joint flow-matching
+    # fine-tune. The head is new (absent from the released params) and starts from scratch --
+    # see CheckpointWeightLoader.missing_regex.
+    *_with_ki_twin(
+        TrainConfig(
+            # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
+            # Here, we use LeRobot data format (like for all other fine-tuning examples)
+            # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
+            name="pi05_droid_finetune",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,  # pi05 is trained with 32-dim actions
+                action_horizon=16,
             ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
-        num_train_steps=20_000,
-        batch_size=32,
+            data=LeRobotDROIDDataConfig(
+                # Replace with your custom DROID LeRobot dataset repo id.
+                repo_id="your_hf_username/my_droid_dataset",
+                base_config=DataConfig(prompt_from_task=True),
+                assets=AssetsConfig(
+                    # Important: reuse the original DROID norm stats during fine-tuning!
+                    assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                    asset_id="droid",
+                ),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+            num_train_steps=20_000,
+            batch_size=32,
+        )
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
