@@ -42,6 +42,16 @@ def _to_hwc_uint8(img) -> np.ndarray:
     return arr
 
 
+# Relative-EEF action math lives in the dependency-free `eef_math` module (so the offline
+# corpus column-add can import it without flax). Re-exported here for the transforms + tests.
+# Convention CONFIRMED against LIBERO robosuite OSC_POSE (world-frame delta, 3-D axis-angle,
+# absolute gripper, 7-D). NB: eef_pose is baked as MuJoCo **wxyz** -- reorder to xyzw first.
+from openpi.policies.eef_math import (  # noqa: E402
+    eef_pose_to_delta_actions,
+    quat_xyzw_to_axisangle,
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class AxisFrankaInputs(_transforms.DataTransformFn):
     """Repack AXIS-Franka rows into the pi0.5 input layout.
@@ -86,3 +96,108 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
 class AxisFrankaOutputs(_transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         return {"actions": np.asarray(data["actions"])[:, :8]}
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisFrankaEEFOutputs(_transforms.DataTransformFn):
+    """Relative-EEF action variant: slice the model's padded 32-D output back to the 7-D
+    LIBERO/robosuite OSC_POSE action [Δpos(3), Δaxis-angle(3), gripper]. Inputs are shared
+    with the joint variant (AxisFrankaInputs passes state/actions through unpadded); only the
+    output width differs (7 vs 8), and the DataConfig feeds state_eef/action_eef columns."""
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"])[:, :7]}
+
+
+# ---------------------------------------------------------------------------------------
+# LIBERO-Plus serve-time adapter (inference only) for the relative-EEF pretrain checkpoint.
+#
+# The LIBERO client (benchmarks_eval/run_libero_plus_eval.py) sends the pi05_libero contract:
+#   observation/image, observation/wrist_image  (HWC uint8, already 180°-rotated + pad-224)
+#   observation/state  = [eef_pos(3), quat->axisangle(3), robot0_gripper_qpos(2)]  (8-D)
+#   prompt
+# Our pretrain_eef model was trained on `state_eef` = [pos(3), CANONICAL axis-angle(3, w>=0),
+# closedness, closedness] and emits `action_eef` = [Δpos(3), Δaxis-angle(3), closedness[0,1]].
+# Two channels of the LIBERO state and the action gripper therefore need a convention remap;
+# pos + Δpose already share robosuite OSC_POSE world-frame conventions (see eef_math).
+#
+# Serve chain (SimpleDataConfig.data_transforms.inputs, since serve_policy.py passes NO
+# repack_transforms -> the DataConfig repack runs only in training):
+#   RepackTransform(observation/*->base_0_rgb/left_wrist_0_rgb/state) -> LiberoStateToAxisEEF
+#   -> AxisFrankaInputs ; outputs: AxisFrankaEEFLiberoOutputs.
+# ---------------------------------------------------------------------------------------
+
+# LIBERO Panda finger half-open width used to map robot0_gripper_qpos -> closedness. Only the
+# monotonic open->0 / closed->1 mapping matters: our own quantile norm-stats (bimodal at 0/1)
+# absorb the exact scale, so a coarse linear map on the mean finger width is sufficient.
+_LIBERO_GRIPPER_OPEN_W = 0.04   # |finger| ~0.04 when fully open
+_LIBERO_GRIPPER_CLOSED_W = 0.0  # ~0 when fully closed
+
+
+def _libero_gripper_qpos_to_closedness(qpos2) -> float:
+    """robot0_gripper_qpos (2 finger positions, meters) -> closedness in [0,1] (0 open / 1 close).
+
+    Mirrors convert_droid_actions.gripper_closedness (mean finger width, linear, clipped). Uses
+    |q0|+|q1| so it is robust to whether the two Panda finger joints are stored [+,-] or [+,+]."""
+    q = np.asarray(qpos2, dtype=np.float64)
+    width = 0.5 * (abs(float(q[0])) + abs(float(q[1])))
+    denom = _LIBERO_GRIPPER_OPEN_W - _LIBERO_GRIPPER_CLOSED_W
+    return float(np.clip((_LIBERO_GRIPPER_OPEN_W - width) / denom, 0.0, 1.0))
+
+
+def _canonicalize_axisangle(aa) -> np.ndarray:
+    """Map an axis-angle rotation vector to the shortest-arc equivalent (norm <= pi).
+
+    robosuite mat2quat canonicalises w>=0, so LIBERO states never occupy norm>pi -- but the
+    eval client's _quat2axisangle takes robot0_eef_quat as-is (no sign flip), so a w<0 pose
+    lands at norm>pi, a region our (canonicalised) training states never saw. v and
+    v*(1 - 2π/|v|) are the same rotation; the latter has norm 2π-|v| < π."""
+    v = np.asarray(aa, dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    if n > np.pi and n > 1e-9:
+        v = v * (1.0 - 2.0 * np.pi / n)
+    return v.astype(np.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class LiberoStateToAxisEEF(_transforms.DataTransformFn):
+    """Remap the LIBERO 8-D proprio state into our `state_eef` convention (inference only).
+
+    [pos(3), axisangle(3), gripper_qpos(2)] -> [pos(3), canonical-axisangle(3), closedness, closedness].
+    pos passes through (shared world frame); the axis-angle is canonicalised to norm<=pi to match
+    our training states; the two raw finger positions collapse to the duplicated closedness scalar
+    the model was trained on. No-op if `state` is absent."""
+
+    def __call__(self, data: dict) -> dict:
+        if "state" not in data:
+            return data
+        s = np.asarray(data["state"], dtype=np.float32)
+        if s.shape[-1] != 8:
+            return data
+        closed = _libero_gripper_qpos_to_closedness(s[6:8])
+        state = np.concatenate([s[:3], _canonicalize_axisangle(s[3:6]),
+                                np.array([closed, closed], dtype=np.float32)]).astype(np.float32)
+        return {**data, "state": state}
+
+
+# robosuite OSC_POSE (LIBERO default controller, osc_pose.json) maps action [-1,1] ->
+# output_max = [0.05 m]*3 + [0.5 rad]*3 with control_delta=true. Our Unnormalized action_eef
+# is a RAW physical per-step delta (~±0.01 m / ±0.03 rad per our norm stats), so it must be
+# divided by these scales to land in the controller's [-1,1] input space -- otherwise a 0.01 m
+# delta reads as 0.01*0.05 = 0.5 mm and the arm is effectively frozen.
+_OSC_POSE_OUTPUT_MAX = np.array([0.05, 0.05, 0.05, 0.5, 0.5, 0.5], dtype=np.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisFrankaEEFLiberoOutputs(_transforms.DataTransformFn):
+    """Serve-time EEF output for the LIBERO env. Slice to 7-D, then match robosuite OSC_POSE:
+      pose (0:6): raw Δpos(m)/Δaxis-angle(rad) -> normalized [-1,1] via /output_max (osc_pose.json);
+      gripper (6): our closedness [0,1] (0 open / 1 close) -> LIBERO [-1,1] (-1 open / +1 close),
+                   i.e. 2c-1 (LIBERO_DUMMY_ACTION=[...,-1] confirms -1=open).
+    Distinct from AxisFrankaEEFOutputs (AXIS-sim serving), which keeps raw deltas + closedness."""
+
+    def __call__(self, data: dict) -> dict:
+        actions = np.asarray(data["actions"], dtype=np.float32)[:, :7].copy()
+        actions[:, :6] = np.clip(actions[:, :6] / _OSC_POSE_OUTPUT_MAX, -1.0, 1.0)
+        actions[:, 6] = 2.0 * actions[:, 6] - 1.0
+        return {"actions": actions}

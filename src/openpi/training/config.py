@@ -20,6 +20,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.axis_franka_policy as axis_franka_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -509,19 +510,25 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     roots_index: str | None = None
     ranges_path: str | None = None
     default_prompt: str | None = None
+    # Relative-EEF action space (LIBERO-Plus proxy benchmark): feed the baked `state_eef`(8) /
+    # `action_eef`(7, robosuite OSC_POSE delta) columns and slice the output to 7. Default False
+    # keeps the DROID-8D joint-velocity layout (for a future real-world checkpoint).
+    eef_action: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         from openpi.policies import axis_franka_policy
 
+        state_col = "state_eef" if self.eef_action else "observation.state"
+        action_col = "action_eef" if self.eef_action else "action"
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
                         "base_0_rgb": "observation.images.third_person",
                         "left_wrist_0_rgb": "observation.images.wrist",
-                        "state": "observation.state",
-                        "actions": "action",
+                        "state": state_col,
+                        "actions": action_col,
                         "prompt": "prompt",
                     }
                 )
@@ -529,7 +536,11 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
         )
         data_transforms = _transforms.Group(
             inputs=[axis_franka_policy.AxisFrankaInputs()],
-            outputs=[axis_franka_policy.AxisFrankaOutputs()],
+            outputs=[
+                axis_franka_policy.AxisFrankaEEFOutputs()
+                if self.eef_action
+                else axis_franka_policy.AxisFrankaOutputs()
+            ],
         )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
         return dataclasses.replace(
@@ -537,7 +548,7 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            action_sequence_keys=("action",),
+            action_sequence_keys=(action_col,),
             pretrain_roots_index=self.roots_index,
             pretrain_ranges_path=self.ranges_path,
         )
@@ -993,7 +1004,8 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
 
 
 def _axis_pretrain_config(
-    *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False
+    *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
+    eef: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1018,7 +1030,7 @@ def _axis_pretrain_config(
     erode the VLM's pretrained semantics (arXiv:2505.23705).
     """
     return TrainConfig(
-        name="pi05_axis_pretrain" + ("_ki" if knowledge_insulation else ""),
+        name="pi05_axis_pretrain" + ("_eef" if eef else "") + ("_ki" if knowledge_insulation else ""),
         # Full weight: default (non-lora) gemma variants, no freeze_filter.
         model=pi0_config.Pi0Config(
             pi05=True, action_dim=32, action_horizon=16,
@@ -1029,11 +1041,16 @@ def _axis_pretrain_config(
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             base_config=DataConfig(prompt_from_task=True),
+            # relative-EEF (LIBERO-Plus proxy) feeds state_eef/action_eef; else DROID-8D joint-vel.
+            eef_action=eef,
             # NB: deliberately NO assets override -> own norm stats (compute_norm_stats),
             # NOT pi05_droid's. See the class docstring / reports/pretrain_dataloader_design.md.
         ),
-        # Init from the DROID checkpoint (reuse of weights is fine; only the STATS are ours).
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        # EEF variant inits from pi05_base (its EEF control-mode head); the joint variant from
+        # pi05_droid (DROID-8D joint-velocity). Only weights are reused; norm stats are ours.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            f"gs://openpi-assets/checkpoints/{'pi05_base' if eef else 'pi05_droid'}/params"
+        ),
         num_train_steps=num_train_steps,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=max(1000, num_train_steps // 20),
@@ -1049,6 +1066,49 @@ def _axis_pretrain_config(
     )
 
 
+def _axis_eef_libero_serve_config() -> TrainConfig:
+    """INFERENCE-ONLY config to serve the `pi05_axis_pretrain_eef` checkpoint against the
+    LIBERO-Plus client (benchmarks_eval/run_libero_plus_eval.py), which speaks the pi05_libero
+    contract (observation/image, observation/wrist_image, observation/state 8-D, prompt).
+
+    Differs from the train config `pi05_axis_pretrain_eef` (which reads parquet columns
+    state_eef/action_eef): the LIBERO client's obs keys are repacked *inside* data_transforms
+    (serve_policy.py passes no repack_transforms, so a DataConfig.repack_transforms would never
+    run at inference), the LIBERO 8-D state is remapped into our `state_eef` convention
+    (LiberoStateToAxisEEF: canonical axis-angle + gripper_qpos->closedness), and the 7-D output
+    remaps the gripper from closedness [0,1] to LIBERO [-1,1] (AxisFrankaEEFLiberoOutputs).
+
+    Model + asset_id match the train config exactly (Pi0Config action_dim=32/horizon=16;
+    repo_id "Devon018/Franka-Datasets-v2"), so create_trained_policy loads OUR checkpoint's
+    OWN norm stats from <ckpt>/assets/Devon018/Franka-Datasets-v2/norm_stats.json.
+    Serve: scripts/serve_policy.py --env LIBERO --policy.config pi05_axis_eef_libero_serve
+           --policy.dir <ckpt>."""
+    serve_inputs = lambda model: _transforms.Group(  # noqa: E731 (GroupFactory is a callable)
+        inputs=[
+            _transforms.RepackTransform(
+                {
+                    "base_0_rgb": "observation/image",
+                    "left_wrist_0_rgb": "observation/wrist_image",
+                    "state": "observation/state",
+                    "prompt": "prompt",
+                }
+            ),
+            axis_franka_policy.LiberoStateToAxisEEF(),
+            axis_franka_policy.AxisFrankaInputs(),
+        ],
+        outputs=[axis_franka_policy.AxisFrankaEEFLiberoOutputs()],
+    )
+    return TrainConfig(
+        name="pi05_axis_eef_libero_serve",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=SimpleDataConfig(
+            repo_id="Devon018/Franka-Datasets-v2",  # -> asset_id, loads our ckpt norm stats
+            data_transforms=serve_inputs,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     _axis_fullweight_speedtest(),
@@ -1056,6 +1116,11 @@ _CONFIGS = [
     # Knowledge-insulation twin: identical data/optimizer/budget, but the flow-matching
     # gradient is cut at the prefix KV and the VLM is trained by a FAST-token CE instead.
     _axis_pretrain_config(knowledge_insulation=True),
+    # Relative-EEF variant (LIBERO-Plus proxy benchmark): state_eef/action_eef columns +
+    # robosuite OSC_POSE 7-D delta action, init from pi05_base. Own norm stats.
+    _axis_pretrain_config(eef=True),
+    # INFERENCE-ONLY: serve the pi05_axis_pretrain_eef checkpoint to the LIBERO-Plus client.
+    _axis_eef_libero_serve_config(),
     #
     # Inference Aloha configs.
     #
@@ -1258,6 +1323,35 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    # LIBERO fine-tune INITIALISED FROM our AXIS-pretrained EEF pilot (50k) instead of pi05_base.
+    # Headline of the transfer experiment: does AXIS-Franka sim-pretraining improve LIBERO-Plus
+    # robustness vs vanilla pi05_base init? Identical to pi05_libero except (a) weight init = our
+    # 50k params (copied to UCR at /bigdata/jlilab/myan035/eef_ckpt_50000) and (b) box-safe
+    # batch_size=64 (pi05_libero's 256 OOMs a single 8xA100-80GB node for full-weight pi0.5).
+    # H=10 (LIBERO) despite our pilot's 16: the flow head params are per-action-dim, H is a
+    # sequence length, so a 16->10 init transfers. LIBERO norm stats used (LeRobotLiberoDataConfig).
+    TrainConfig(
+        name="pi05_libero_axisinit",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=30_000, decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # Env-driven so it works on the box (init = the pilot's own 50k output) or on UCR (a
+        # copied checkpoint). On the box: AXIS_EEF_INIT_CKPT=/data/checkpoints/pi05_axis_pretrain_eef/axis_pretrain_eef/50000/params
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get("AXIS_EEF_INIT_CKPT", "/bigdata/jlilab/myan035/eef_ckpt_50000/params")
+        ),
+        num_train_steps=30_000,
+        fsdp_devices=8,
     ),
     #
     # Fine-tuning AXIS Franka SLB configs (pi0.5 LoRA, HF-rendered Franka dataset).
