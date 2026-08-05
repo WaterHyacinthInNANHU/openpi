@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.rlinf_franka_droid as rlinf_franka_droid
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -439,6 +440,34 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             ]
         )
         # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            outputs=[droid_policy.DroidOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRLinfDROIDDataConfig(DataConfigFactory):
+    """DROID data config for LeRobot datasets collected by the RLinf FR3 bench.
+
+    Same pipeline as LeRobotDROIDDataConfig, but the repack step is a custom
+    transform (RLinfFrankaDroidRepack) because the RLinf writer stores the
+    8-D state as one column ([grip, q0..q6]) that must be split, and uses
+    image/extra_view_image as camera keys. No second exterior view.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(inputs=[rlinf_franka_droid.RLinfFrankaDroidRepack()])
+        # Joint *velocity* actions (DROID-native): no delta transform.
         data_transforms = _transforms.Group(
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
@@ -906,6 +935,58 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    TrainConfig(
+        # LoRA fine-tune of pi05-DROID on RLinf FR3 bench data (LeRobot v2.1,
+        # collected by RLinf/tasl). Mirrors pi05_droid_finetune but with the
+        # LoRA recipe (same as the pi05_libero LoRA configs) and the RLinf
+        # column layout handled by LeRobotRLinfDROIDDataConfig.
+        name="pi05_droid_franka_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 is trained with 32-dim actions
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="franka/test_finetune",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                # Reuse the original DROID norm stats during fine-tuning
+                # (per the pi05_droid_finetune recipe). If the preflight check
+                # shows our normalized-action units land far outside the DROID
+                # quantile range, switch to locally computed stats instead
+                # (runme_cal_stats_franka.sh) and drop this assets override.
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        # Match the model config above when extracting the freeze filter.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA fine-tuning.
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,  # effectively constant LR after warmup
+        ),
+        # The repo lives on /data1; keep checkpoints there too (not /data3).
+        checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
+        save_interval=2_000,
+        keep_period=5_000,
+        log_interval=100,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
