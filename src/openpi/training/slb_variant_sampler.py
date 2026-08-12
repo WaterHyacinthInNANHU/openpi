@@ -299,8 +299,8 @@ def build_sampler(dataset, data_config, *, seed: int = 0) -> tuple[RowSampler, d
     except ``awr``; when it is not None the caller must wrap the dataset in
     ``WeightedRowDataset`` so Eq E.5 can be applied in the loss.
     """
-    from axis_data.join_index import JoinIndex
-    from axis_data.sidecar_reader import VariantSidecar
+    from axis.episode.join_index import JoinIndex
+    from axis.dataset.sidecar_reader import VariantSidecar
 
     variant = data_config.slb_variant
     sidecar = VariantSidecar.load(

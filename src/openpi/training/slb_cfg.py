@@ -222,8 +222,8 @@ def build_conditioning(
     `slb_render_aligned_rows` (default True) or the labels key a disjoint frame grid and
     every window's conditioning is dropped -- the same silent-vanilla degeneration.
     """
-    from axis_data.join_index import JoinIndex
-    from axis_data.sidecar_reader import VariantSidecar
+    from axis.episode.join_index import JoinIndex
+    from axis.dataset.sidecar_reader import VariantSidecar
 
     if not manifest_path:
         raise ValueError("slb_manifest_path is required to join attempts to episodes")

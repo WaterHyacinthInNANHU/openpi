@@ -55,11 +55,11 @@ def test_build_conditioning_constructs_the_transform(monkeypatch):
     sidecar = _FakeSidecar({7: [0, 1]}, {7: [0.0, 1.0]})
     monkeypatch.setattr(slb_cfg, "build_cfg_labels", lambda *a, **k: {(0, 0): 0, (0, 15): 1})
     monkeypatch.setattr(
-        "axis_data.sidecar_reader.VariantSidecar.load",
+        "axis.dataset.sidecar_reader.VariantSidecar.load",
         classmethod(lambda cls, *a, **k: sidecar),
     )
     monkeypatch.setattr(
-        "axis_data.join_index.JoinIndex.from_manifest",
+        "axis.episode.join_index.JoinIndex.from_manifest",
         classmethod(lambda cls, *a, **k: _FakeJoin({7: _FakeRef(0, 100)})),
     )
     t = slb_cfg.build_conditioning(task_id=1, sidecar_root="x", manifest_path="y")
@@ -72,11 +72,11 @@ def test_build_conditioning_raises_when_no_labels(monkeypatch):
     must fail loudly rather than put a duplicate arm in the bake-off."""
     monkeypatch.setattr(slb_cfg, "build_cfg_labels", lambda *a, **k: {})
     monkeypatch.setattr(
-        "axis_data.sidecar_reader.VariantSidecar.load",
+        "axis.dataset.sidecar_reader.VariantSidecar.load",
         classmethod(lambda cls, *a, **k: _FakeSidecar({}, {})),
     )
     monkeypatch.setattr(
-        "axis_data.join_index.JoinIndex.from_manifest",
+        "axis.episode.join_index.JoinIndex.from_manifest",
         classmethod(lambda cls, *a, **k: _FakeJoin({})),
     )
     with pytest.raises(ValueError, match="no .*labels"):
