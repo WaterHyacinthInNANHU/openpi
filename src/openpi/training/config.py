@@ -1005,7 +1005,7 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
 
 def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
-    eef: bool = False,
+    eef: bool = False, paper: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1028,12 +1028,52 @@ def _axis_pretrain_config(
     with. Pretraining is where KI should matter most: this is a FULL-WEIGHT run over a large
     corpus, i.e. precisely the regime where the flow-matching gradient has enough steps to
     erode the VLM's pretrained semantics (arXiv:2505.23705).
+
+    `paper` emits a `_paper` twin, for the same reason and by the same mechanism as `_ki`:
+    the in-flight `pi05_axis_pretrain_eef` runs must keep the hyper-parameters they were
+    launched with. The twin is stage 1 of the Axis-V1 recipe exactly as Appendix F Table 10
+    states it -- action_horizon 10 (not 16), 10k warmup, 5e-5 CONSTANT after warmup, EMA
+    0.999, 100k steps, GLOBAL batch 8 (1/GPU at fsdp_devices=8).
+
+    DO NOT "FIX" THE WARMUP. 10,000 is a fixed absolute number in both tables, not a fraction
+    of the budget -- CONFIRMED WITH THE AXIS-V1 AUTHOR (2026-08-11) for stage 1 (10k of 100k)
+    and stage 2 (10k of 30k, which looks like a table typo and is not). The superficially
+    sensible "scale the warmup to num_train_steps" edit takes this off-recipe. Note this is
+    why `warmup_steps` is a literal here while the non-paper arm derives it from the budget.
+
+    Everything Table 10 shares with the base arm is already true here and is NOT re-stated:
+    init from pi05_base (the `eef` arm), full-model (no LoRA, no freeze_filter),
+    OWN norm stats (no assets override),
+    action_dim padded to 32, and AdamW(b1=0.9, b2=0.95, eps=1e-8, wd=1e-10, clip=1.0), which
+    is openpi's `_optimizer.AdamW` default field-for-field -- so the paper's optimizer block
+    is reached by NOT passing an optimizer, and any future edit to those defaults is a
+    deviation from the paper.
+
+    The "constant LR" is expressed as CosineDecaySchedule(peak_lr == decay_lr, decay_steps
+    well past the budget), which is how upstream openpi already spells a constant LR --
+    `pi05_full_droid_finetune` (warmup 1k, 5e-5, decay_steps 1e6, decay_lr 5e-5, 100k steps)
+    and `pi05_libero` both do exactly this. optax's `warmup_cosine_decay_schedule` computes
+    `end + (peak - end) * cosine(...)`, so peak == end makes every post-warmup step exactly
+    that value (measured: one unique post-warmup value, float32(5e-5)). No new schedule class
+    is needed and the warmup ramp stays the one every other openpi config uses.
+
+    The paper's action space is NOT changed here: Appendix F's "7D joint-position action" is
+    a typo for the LIBERO/robosuite OSC_POSE 7-D delta `[dpos(3), daxis-angle(3), gripper]`,
+    which is what `eef=True` already feeds (axis_franka_policy / eef_math). Quantile
+    normalisation is likewise already the pi0.5 default (`use_quantile_norm = model_type !=
+    PI0`) and matches Appendix F's formula, so the only normalisation requirement -- own
+    q01/q99 -- is met by this factory's deliberate lack of an `assets=` override.
     """
     return TrainConfig(
-        name="pi05_axis_pretrain" + ("_eef" if eef else "") + ("_ki" if knowledge_insulation else ""),
+        name=(
+            "pi05_axis_pretrain"
+            + ("_eef" if eef else "")
+            + ("_ki" if knowledge_insulation else "")
+            + ("_paper" if paper else "")
+        ),
         # Full weight: default (non-lora) gemma variants, no freeze_filter.
         model=pi0_config.Pi0Config(
-            pi05=True, action_dim=32, action_horizon=16,
+            pi05=True, action_dim=32, action_horizon=10 if paper else 16,
             **(_KI_MODEL_KWARGS if knowledge_insulation else {}),
         ),
         data=AxisFrankaPretrainDataConfig(
@@ -1052,16 +1092,29 @@ def _axis_pretrain_config(
             f"gs://openpi-assets/checkpoints/{'pi05_base' if eef else 'pi05_droid'}/params"
         ),
         num_train_steps=num_train_steps,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=max(1000, num_train_steps // 20),
-            peak_lr=2.5e-5,
-            decay_steps=num_train_steps,
-            decay_lr=2.5e-6,
+        lr_schedule=(
+            # Appendix F Table 10: 10k warmup, then 5e-5 held CONSTANT. Spelled the way
+            # upstream openpi spells a constant LR -- peak_lr == decay_lr with decay_steps
+            # far beyond the budget (`pi05_full_droid_finetune`: warmup 1k, 5e-5, 1e6,
+            # 5e-5 over 100k steps; `pi05_libero` likewise). See the docstring.
+            _optimizer.CosineDecaySchedule(
+                warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+            )
+            if paper
+            else _optimizer.CosineDecaySchedule(
+                warmup_steps=max(1000, num_train_steps // 20),
+                peak_lr=2.5e-5,
+                decay_steps=num_train_steps,
+                decay_lr=2.5e-6,
+            )
         ),
         batch_size=batch_size,   # GLOBAL; per-GPU = batch_size / fsdp_devices
         fsdp_devices=8,          # 8x A100-80GB single node
         num_workers=8,
-        ema_decay=None,
+        # Appendix G initialises stage 2 from the EMA-SMOOTHED params, and openpi's
+        # `checkpoints._split_params` writes ema_params (when set) as the `params` item -- so
+        # EMA here is what makes <ckpt>/<step>/params the artifact stage 2 must consume.
+        ema_decay=0.999 if paper else None,
         # NO freeze_filter -> all params trainable (full weight).
     )
 
@@ -1119,6 +1172,38 @@ _CONFIGS = [
     # Relative-EEF variant (LIBERO-Plus proxy benchmark): state_eef/action_eef columns +
     # robosuite OSC_POSE 7-D delta action, init from pi05_base. Own norm stats.
     _axis_pretrain_config(eef=True),
+    # Axis-V1 paper recipe, stage 1 (arXiv 2607.21588v1 Appendix F Table 10). Same data and
+    # action space as the arm above; differs ONLY in the six optimisation fields the table
+    # pins. batch_size is stated here, not defaulted: Table 10's batch is 8 GLOBAL, which at
+    # fsdp_devices=8 is one sample per A100.
+    #
+    # SUPERVISION ARMS ARE OFF, AND THIS IS THE BC BASELINE. The experiment varies ONLY
+    # supervision -- vanilla / +CFG / +AWR -- so the first run of both `_paper` configs must be
+    # plain BC. Both are vanilla today because `slb_sidecar_root` is None, and that single field
+    # gates the whole chain: it gates `slb_variant_sampler.build_sampler`, the only producer of
+    # `weights_by_row`; which is the only thing that wraps the dataset in `WeightedRowDataset`;
+    # which is the only writer of `slb_awr_loss.LOSS_WEIGHT_KEY`. With that key absent from the
+    # batch, `DataLoaderImpl.__iter__` yields the original 2-tuple, `train_step` sees
+    # `loss_weights=None`, and `slb_awr_loss.combine` returns literally `jnp.mean(chunked_loss)`
+    # -- bit-for-bit the pre-SLB objective. Enforced by config_paper_test.py.
+    #
+    # WHERE EACH ARM WOULD ENTER, when the owner enables it (do NOT enable it here):
+    #   +CFG  -- a prompt-tag transform PREPENDED to `repack_transforms.inputs`, ahead of the
+    #            RepackTransform, in the relevant factory's `create()`
+    #            (AxisFrankaPretrainDataConfig for stage 1, LeRobotLiberoDataConfig for stage 2).
+    #            Order is load-bearing: RepackTransform drops `episode_index`/`frame_index`,
+    #            which is what `slb_cfg.build_conditioning` keys the advantage label on. See
+    #            AxisFrankaSlbDataConfig.create for the working precedent. Zero model change:
+    #            the tag rides the prompt, so checkpoints stay interchangeable across arms.
+    #   +AWR  -- a per-row weight reaching the batch under `slb_awr_loss.LOSS_WEIGHT_KEY`, i.e.
+    #            a `WeightedRowDataset`-equivalent wrapper applied where the pretrain branch of
+    #            `data_loader.create_torch_data_loader` builds its `RowSampler`. The loss half
+    #            already exists and needs no edit: `combine()` applies WVM Eq E.5 the moment a
+    #            weight is present. `DataConfig.awr_tau` (10.0) / `awr_delta` (2.0) carry the
+    #            Eq E.7 constants.
+    # Neither path exists for these two configs yet -- both factories build their repack from a
+    # bare RepackTransform, and the pretrain loader branch draws rows uniformly with no weights.
+    _axis_pretrain_config(eef=True, paper=True, batch_size=8, num_train_steps=100_000),
     # INFERENCE-ONLY: serve the pi05_axis_pretrain_eef checkpoint to the LIBERO-Plus client.
     _axis_eef_libero_serve_config(),
     #
@@ -1349,6 +1434,70 @@ _CONFIGS = [
         # copied checkpoint). On the box: AXIS_EEF_INIT_CKPT=/data/checkpoints/pi05_axis_pretrain_eef/axis_pretrain_eef/50000/params
         weight_loader=weight_loaders.CheckpointWeightLoader(
             os.environ.get("AXIS_EEF_INIT_CKPT", "/bigdata/jlilab/myan035/eef_ckpt_50000/params")
+        ),
+        num_train_steps=30_000,
+        fsdp_devices=8,
+    ),
+    # Axis-V1 paper recipe, stage 2 (arXiv 2607.21588v1 Appendix G Table 11). A separately
+    # named `_paper` twin of pi05_libero_axisinit, for the same reason as the `_ki` twins:
+    # a run already launched against pi05_libero_axisinit keeps the schedule it started with.
+    #
+    # Differs from pi05_libero_axisinit in exactly two fields -- warmup 1,000 -> 10,000 and
+    # decay_lr 5e-6 -> 5e-5, i.e. 5e-5 held CONSTANT after warmup (peak == decay collapses
+    # optax's cosine leg to a constant).
+    #
+    # DO NOT "FIX" THE WARMUP. 10,000 of 30,000 steps is a third of training spent ramping,
+    # which reads like a table typo -- it is not. CONFIRMED WITH THE AXIS-V1 AUTHOR
+    # (2026-08-11): warmup is 10,000 for BOTH stages, deliberately. Scaling it to the step
+    # budget (the "obvious" correction) would silently make this not the paper's recipe.
+    #
+    # The durable justification is upstream, not just the paper: openpi's OWN shipped
+    # `pi05_libero` (registered just above in this list) is warmup 10_000 / peak 5e-5 / decay_steps
+    # 1_000_000 / decay_lr 5e-5 / num_train_steps 30_000 / ema_decay 0.999 -- i.e. Table 11
+    # IS openpi's LIBERO recipe on every axis except batch size. So this twin is the upstream
+    # schedule verbatim; only batch differs (paper 64 vs upstream 256, chosen so 8xA100 holds
+    # ~8 samples/GPU). If the warmup still looks wrong, compare against `pi05_libero` first.
+    #
+    # What pi05_libero_axisinit got wrong: decay_steps=30_000 with decay_lr=5e-6 is a REAL
+    # cosine decay to a tenth of peak, disagreeing with BOTH the paper and upstream.
+    #
+    # Everything else Table 11 pins already matched and is unchanged: 30,000 steps, GLOBAL
+    # batch 64, EMA 0.999, action_horizon 10, extra_delta_transform=False, LIBERO-specific
+    # norm stats (LeRobotLiberoDataConfig -> physical-intelligence/libero assets), and
+    # AdamW's openpi defaults (b1 0.9 / b2 0.95 / eps 1e-8 / wd 1e-10 / clip 1.0).
+    #
+    # WEIGHT INIT: Appendix G transfers MODEL PARAMS ONLY. `CheckpointWeightLoader` is exactly
+    # that -- it reads `<stage1_ckpt>/<step>/params` and nothing else, so the optimizer state,
+    # step counter and EMA buffer all start fresh (a `--resume` would not; do not use one).
+    # And because stage 1 trains with ema_decay=0.999, `checkpoints._split_params` writes the
+    # EMA params into that `params` item, so this loader consumes the EMA-smoothed weights
+    # Appendix G asks for without any extra step.
+    #
+    # A DISTINCT env var from pi05_libero_axisinit's AXIS_EEF_INIT_CKPT, with NO usable
+    # default: the 50k pilot checkpoint that variable points at does NOT qualify for this
+    # recipe (action_horizon 16, trained without EMA), and silently initialising from it
+    # would produce a plausible-looking run that is not the paper's. Unset, the path below
+    # does not exist and the weight loader fails loudly at startup.
+    TrainConfig(
+        name="pi05_libero_axisinit_paper",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=64,
+        # Byte-identical to upstream `pi05_libero`'s schedule; see the note above.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "AXIS_EEF_PAPER_INIT_CKPT",
+                "/unset/set-AXIS_EEF_PAPER_INIT_CKPT-to-a-pi05_axis_pretrain_eef_paper-step/params",
+            )
         ),
         num_train_steps=30_000,
         fsdp_devices=8,
