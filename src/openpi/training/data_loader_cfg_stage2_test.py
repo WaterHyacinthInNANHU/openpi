@@ -97,9 +97,11 @@ def _decode(observation, i, tok) -> str:
     return tok._tokenizer.decode([int(t) for t in ids[mask]])  # noqa: SLF001
 
 
-def _drive(config_name: str, *, num_batches: int = 8):
+def _drive(config_name: str, *, num_batches: int = 8, framework: str = "jax"):
     """The REGISTERED config, through the real loader. `shuffle=False` and `num_workers=0` make
-    the fetch order the row order, so a decoded prompt can be tied back to its own row."""
+    the fetch order the row order WITHIN each presentation -- `PresentationSampler` yields
+    `presentation * N_ROWS + row` in row order when it is not shuffling -- so a decoded prompt can
+    be tied back to both its row and which pass over the corpus it belongs to."""
     cfg = _config.get_config(config_name)
     data_config = cfg.data.create(cfg.assets_dirs, cfg.model)
     return list(
@@ -113,14 +115,16 @@ def _drive(config_name: str, *, num_batches: int = 8):
             seed=0,
             shuffle=False,
             skip_norm_stats=True,
+            framework=framework,
         )
     )
 
 
-def _expected_tagged(row: int) -> bool:
-    """What the keyed dropout says about this row, computed independently of the loader."""
+def _expected_tagged(row: int, presentation: int = 0) -> bool:
+    """What the keyed dropout says about this presentation of this row, computed independently of
+    the loader."""
     return not LiberoQualityConditioning(q_ep=5).dropped(
-        row // FRAMES_PER_EPISODE, row % FRAMES_PER_EPISODE
+        row // FRAMES_PER_EPISODE, row % FRAMES_PER_EPISODE, presentation
     )
 
 
@@ -196,6 +200,56 @@ def test_two_runs_of_the_arm_tag_identically(toy, tok):
     ]
     assert first == second
     assert any("Quality: 5" in t for t in first)
+
+
+def test_the_second_pass_over_the_corpus_tags_the_same_rows_differently(toy, tok):
+    """THE FIXED-PARTITION TEST, through the real loader.
+
+    Stage 2 is ~5.7 epochs. Keyed on the row alone, the dropout is not a dropout at all but a
+    frozen partition: the unconditional branch is fit on one fixed 19.25% of the rows seen 5.7
+    times each, and the conditional branch never sees those rows once. π0.7 re-draws per example.
+    Nothing observable distinguishes the two -- the realized tagged fraction is 0.8075 either way,
+    the loss curve is normal, the prompts are all in range -- except driving the loader for more
+    than one pass and comparing a row against ITSELF.
+
+    Two full passes, per row, both directions asserted: the tag must follow
+    `dropped(ep, fr, presentation)` on each pass, and a substantial share of rows must change.
+    """
+    passes = 2
+    batches = _drive(TWIN, num_batches=passes * (N_ROWS // BATCH))
+    fate: dict[int, list[bool]] = {}
+    for b, (observation, _actions) in enumerate(batches):
+        rows = toy[b * BATCH : (b + 1) * BATCH]
+        assert len(rows) == BATCH
+        for i, row in enumerate(rows):
+            presentation = (b * BATCH + i) // N_ROWS
+            tagged = "Quality: 5" in _decode(observation, i, tok)
+            assert tagged is _expected_tagged(row, presentation), (row, presentation)
+            fate.setdefault(row, []).append(tagged)
+
+    assert len(fate) == N_ROWS and all(len(v) == passes for v in fate.values())
+    changed = sum(len(set(v)) == 2 for v in fate.values())
+    # Independent Bernoulli(0.8075) over two passes disagree 2*p*(1-p) = 31% of the time; a
+    # row-keyed draw gives EXACTLY 0.
+    assert 0.20 < changed / N_ROWS < 0.45, f"{changed}/{N_ROWS} rows changed fate between passes"
+
+
+def test_the_pytorch_path_refuses_the_stage2_arm(toy):
+    """The refusal must be REACHED. That branch builds its own sampler, so the presentation
+    counter never leaves the main process and every epoch would decode as presentation 0 -- the
+    fixed partition restored, with a realized rate that still reads 0.8075."""
+    with pytest.raises(ValueError, match="presentation"):
+        _drive(TWIN, framework="pytorch")
+
+
+def test_the_parent_is_untouched_by_the_presentation_wiring(toy):
+    """The five other stage-2 arms must be byte-identical to what they were: no wrapper, no
+    sampler, and therefore the plain shuffle path. Catches a wrap keyed on something broader than
+    the twin's own conditioning transform."""
+    toy.clear()
+    _drive(PARENT, num_batches=N_ROWS // BATCH)
+    # Without the extended index space the parent still fetches each row exactly once per pass.
+    assert sorted(toy) == list(range(N_ROWS))
 
 
 def test_the_realized_tagged_fraction_is_stage_ones(toy, tok):

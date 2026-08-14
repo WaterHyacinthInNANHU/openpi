@@ -27,6 +27,7 @@ from openpi.training import slb_cfg
 from openpi.training.quality_conditioning import DROP_COMPONENT_STAGE2
 from openpi.training.quality_conditioning import DROP_WHOLE_STAGE2
 from openpi.training.quality_conditioning import N_BINS
+from openpi.training.quality_conditioning import PRESENTATION_KEY
 from openpi.training.quality_conditioning import LiberoQualityConditioning
 
 PARENT = "pi05_libero_axisinit_paper"
@@ -37,8 +38,15 @@ TWIN = "pi05_libero_axisinit_paper_cfg"
 TAGGED_FRACTION = (1.0 - DROP_WHOLE_STAGE2) * (1.0 - DROP_COMPONENT_STAGE2)
 
 
-def _row(ep: int, fr: int, prompt: str = "pick up the black bowl") -> dict:
-    return {"prompt": prompt, "episode_index": ep, "frame_index": fr}
+def _row(ep: int, fr: int, prompt: str = "pick up the black bowl", presentation: int = 0) -> dict:
+    """A sample as the transform sees it -- including the presentation counter
+    `PresentationKeyedDataset` injects, which the dropout is keyed on alongside the row."""
+    return {
+        "prompt": prompt,
+        "episode_index": ep,
+        "frame_index": fr,
+        PRESENTATION_KEY: presentation,
+    }
 
 
 # --- the twin is registered and is its parent in every field but the treatment -------------------
@@ -204,6 +212,102 @@ def test_the_transform_raises_without_the_row_keys():
         t({"prompt": "p", "episode_index": 3})
 
 
+def test_the_transform_raises_without_the_presentation_counter():
+    """Without the counter the draw is a pure function of the row, which over stage 2's ~5.7
+    epochs is a FIXED 19.25% partition: the unconditional branch fit on one frozen ~65k rows seen
+    5.7 times each, the conditional branch never seeing them. The realized tagged fraction still
+    reads 0.8075 under that bug, so a raise is the only signal there is."""
+    with pytest.raises(KeyError, match="quality_presentation"):
+        LiberoQualityConditioning()({"prompt": "p", "episode_index": 1, "frame_index": 2})
+
+
+# --- the presentation counter: the same row, dropped differently on different passes -------------
+
+
+STAGE2_PRESENTATIONS = 6  # ceil(30_000 * 64 / 338_575) -- the real stage-2 budget's epoch count
+
+
+def test_a_row_is_dropped_on_some_presentations_and_kept_on_others():
+    """THE FIXED-PARTITION TEST. Keyed on the row alone, every row's fate is decided once and
+    repeated for all ~5.7 epochs -- two disjoint datasets rather than a dropout. Over the real
+    presentation count a nontrivial share of rows must flip, and both directions must occur.
+    """
+    t = LiberoQualityConditioning(seed=0)
+    flipped = 0
+    rows = [(e, f) for e in range(60) for f in range(20)]
+    for ep, fr in rows:
+        fates = {t.dropped(ep, fr, p) for p in range(STAGE2_PRESENTATIONS)}
+        flipped += len(fates) == 2
+    # Independent Bernoulli(0.1925) over 6 presentations: P(not all equal) = 1 - .1925^6 - .8075^6
+    # = ~0.723. A row-keyed draw gives exactly 0.
+    assert 0.60 < flipped / len(rows) < 0.85, f"{flipped}/{len(rows)} rows ever change fate"
+
+
+def test_the_presentation_actually_moves_the_draw():
+    """Catches a counter that is threaded through every signature and never mixed into the key --
+    under which the argument exists, the tests read plausibly, and the bug is untouched."""
+    t = LiberoQualityConditioning(seed=0)
+    a = [t.dropped(e, f, 0) for e in range(40) for f in range(10)]
+    b = [t.dropped(e, f, 1) for e in range(40) for f in range(10)]
+    assert a != b
+    assert sum(x != y for x, y in zip(a, b, strict=True)) > 10
+
+
+def test_every_presentation_realizes_the_same_marginal():
+    """The counter must not skew the rate it varies: each pass over the corpus still trains the
+    unconditional branch at 1 - 0.85*0.95."""
+    t = LiberoQualityConditioning(seed=0)
+    for p in range(STAGE2_PRESENTATIONS):
+        tagged = sum(not t.dropped(e, f, p) for e in range(120) for f in range(100))
+        assert abs(tagged / 12_000 - TAGGED_FRACTION) < 0.02, f"presentation {p}"
+
+
+def test_the_draw_is_still_recomputable_from_the_seed_alone():
+    """The D5 property the counter must not cost: a fresh instance of the same config, given the
+    row and the presentation, answers identically. Nothing is carried on the object."""
+    t = LiberoQualityConditioning(seed=0)
+    for p in range(STAGE2_PRESENTATIONS):
+        assert [t.dropped(e, 7, p) for e in range(100)] == [
+            LiberoQualityConditioning(seed=0).dropped(e, 7, p) for e in range(100)
+        ]
+
+
+def test_adjacent_presentations_of_one_row_are_not_correlated_through_the_key():
+    """The counter goes through the SAME SHA-256 mix as the row keys, for the same reason:
+    consecutive presentations are adjacent keys, and a weak mix there would make a row's fate
+    change in runs rather than independently."""
+    t = LiberoQualityConditioning(seed=0)
+    flips = sum(
+        t.dropped(e, f, 0) != t.dropped(e, f, 1) for e in range(100) for f in range(10)
+    )
+    # Independent Bernoulli(0.1925) draws differ ~2*p*(1-p) = 31% of the time.
+    assert 200 < flips < 420, f"{flips} flips in 1000 pairs looks structured"
+
+
+def test_the_presentation_counter_does_not_disturb_the_seed():
+    """Two seeds must still disagree at every presentation -- catches a key that collapses the
+    seed into the counter (e.g. concatenated without a separator)."""
+    for p in (0, 3):
+        a = [LiberoQualityConditioning(seed=0).dropped(e, f, p) for e in range(40) for f in range(10)]
+        b = [LiberoQualityConditioning(seed=1).dropped(e, f, p) for e in range(40) for f in range(10)]
+        assert sum(x != y for x, y in zip(a, b, strict=True)) > 10, p
+
+
+def test_the_transform_reads_the_presentation_the_dataset_injected():
+    """End to end through `__call__`: the tag on a row must follow the counter in its sample, not
+    a constant. Uses whichever presentations disagree for a chosen row."""
+    t = LiberoQualityConditioning(seed=0)
+    ep, fr = next(
+        (e, f)
+        for e in range(60)
+        for f in range(20)
+        if len({t.dropped(e, f, p) for p in range(STAGE2_PRESENTATIONS)}) == 2
+    )
+    for p in range(STAGE2_PRESENTATIONS):
+        tagged = "Quality: 5" in t(_row(ep, fr, presentation=p))["prompt"]
+        assert tagged is (not t.dropped(ep, fr, p)), (ep, fr, p)
+
+
 def test_the_transform_raises_without_a_prompt():
     """`prompt_from_task=False`, or a repack that does not surface `prompt`. Appending to a
     synthesised empty prompt would condition the arm on a bare `Quality: 5`."""
@@ -230,7 +334,7 @@ def _a_tagged_row() -> tuple[int, int]:
     t = LiberoQualityConditioning()
     for ep in range(50):
         for fr in range(50):
-            if not t.dropped(ep, fr):
+            if not t.dropped(ep, fr, 0):
                 return ep, fr
     raise AssertionError("no undropped row in 2500 tries; the dropout is not ~19%")
 
@@ -247,10 +351,10 @@ def test_the_dropout_is_a_pure_function_of_the_row_and_the_seed():
     t = LiberoQualityConditioning(seed=0)
     for ep, fr in ((3, 17), (0, 0), (11, 240)):
         assert t(_row(ep, fr)) == t(_row(ep, fr))
-        assert t.dropped(ep, fr) == t.dropped(ep, fr)
+        assert t.dropped(ep, fr, 0) == t.dropped(ep, fr, 0)
     # ...and a fresh instance of the same config agrees, i.e. nothing is carried on the object.
-    assert [t.dropped(e, 0) for e in range(200)] == [
-        LiberoQualityConditioning(seed=0).dropped(e, 0) for e in range(200)
+    assert [t.dropped(e, 0, 0) for e in range(200)] == [
+        LiberoQualityConditioning(seed=0).dropped(e, 0, 0) for e in range(200)
     ]
 
 
@@ -258,8 +362,8 @@ def test_the_seed_actually_moves_the_draw():
     """Catches a seed that is stored, documented and never mixed in -- under which every run of
     every arm would share one dropout pattern while the config claimed otherwise. Asserted as a
     disagreement over many rows, not one, because any single row may agree by chance."""
-    a = [LiberoQualityConditioning(seed=0).dropped(e, f) for e in range(40) for f in range(10)]
-    b = [LiberoQualityConditioning(seed=1).dropped(e, f) for e in range(40) for f in range(10)]
+    a = [LiberoQualityConditioning(seed=0).dropped(e, f, 0) for e in range(40) for f in range(10)]
+    b = [LiberoQualityConditioning(seed=1).dropped(e, f, 0) for e in range(40) for f in range(10)]
     assert a != b
     assert sum(x != y for x, y in zip(a, b, strict=True)) > 10
 
@@ -268,14 +372,14 @@ def test_the_frame_index_actually_moves_the_draw():
     """Catches a draw keyed on the episode alone, which would drop whole episodes at a time --
     a ~19% marginal that is nothing like π0.7's per-sample dropout, and invisible in any rate."""
     t = LiberoQualityConditioning()
-    assert len({t.dropped(7, fr) for fr in range(200)}) == 2
+    assert len({t.dropped(7, fr, 0) for fr in range(200)}) == 2
 
 
 def test_adjacent_rows_are_not_correlated_through_the_key():
     """The reason the key goes through SHA-256 rather than an integer product: consecutive frames
     of one episode are exactly the adjacent keys, and a weak mix there would drop them in runs."""
     flips = sum(
-        LiberoQualityConditioning().dropped(4, fr) != LiberoQualityConditioning().dropped(4, fr + 1)
+        LiberoQualityConditioning().dropped(4, fr, 0) != LiberoQualityConditioning().dropped(4, fr + 1, 0)
         for fr in range(999)
     )
     # Independent Bernoulli(0.1925) neighbours flip ~2*p*(1-p) = 31% of the time; a key that
@@ -297,7 +401,7 @@ def test_the_realized_marginal_matches_stage_ones():
 def test_a_dropped_row_gets_the_bare_prompt_not_quality_zero():
     """The bare prompt IS the unconditional branch. `Quality: 0` would be a sixth condition."""
     t = LiberoQualityConditioning()
-    dropped = next((e, f) for e in range(50) for f in range(50) if t.dropped(e, f))
+    dropped = next((e, f) for e in range(50) for f in range(50) if t.dropped(e, f, 0))
     out = t(_row(*dropped))
     assert out["prompt"] == "pick up the black bowl"
     assert "Quality" not in out["prompt"]
@@ -321,5 +425,6 @@ def test_the_row_keys_are_read_the_way_lerobot_supplies_them():
     ep, fr = _a_tagged_row()
     boxed = {"prompt": "pick up the black bowl",
              "episode_index": np.asarray([ep], dtype=np.int64),
-             "frame_index": np.asarray(fr, dtype=np.int64)}
+             "frame_index": np.asarray(fr, dtype=np.int64),
+             PRESENTATION_KEY: np.asarray(0, dtype=np.int64)}
     assert t(boxed)["prompt"] == t(_row(ep, fr))["prompt"]

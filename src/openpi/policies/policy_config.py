@@ -222,6 +222,15 @@ def create_trained_policy(
             **(metadata or {}),
             "cfg_conditioning": True,
             "guidance_scale": float(guidance_scale),
+            # WHICH checkpoint and WHICH config answered. Ten sweep cells share the default port
+            # 8000 and this project has already lost time to stale servers and port collisions;
+            # with only β in the metadata, a mispaired server still yields ten internally
+            # consistent numbers attributed to the wrong cell. The client writes both into its
+            # results file (benchmarks_eval/run_libero_plus_eval.py `_dump`), so the run record
+            # -- not stdout -- says what was served. Published only on this branch so every
+            # non-CFG policy's metadata stays byte-identical.
+            "checkpoint_dir": str(checkpoint_dir),
+            "config_name": str(train_config.name),
         }
         if quality_tag is not None:
             metadata["quality_tag"] = int(quality_tag)

@@ -8,12 +8,25 @@ a number read off disk rather than a reconstruction from eight workers' RNG stat
 
 STAGE 2 (the LIBERO finetune, `LiberoQualityConditioning` at the bottom of this file) has no
 artifact and cannot have one without a second offline pipeline over a third-party dataset, which
-is out of scope. It therefore draws its dropout from a KEYED HASH of `(seed, episode_index,
-frame_index)` -- a pure function of the row, not a stream. That is a stated deviation from design
-decision D5, and it preserves the property D5 exists to protect: the realized dropout is
-reproducible from the run record (the seed, which is in the config) without knowing any worker's
-RNG state. It is also the mechanism `slb_cfg.SlbCfgMetadataConditioning` already uses. The
-deviation belongs in the paper's method note, beside the stage-2 parity cost.
+is out of scope. It therefore draws its dropout from a KEYED HASH of `(seed, presentation,
+episode_index, frame_index)` -- a pure function of the row AND of which time through the corpus
+this is. That is a stated deviation from design decision D5, and it preserves the property D5
+exists to protect: the realized dropout is reproducible from the run record (the seed, which is in
+the config) without knowing any worker's RNG state. It is also the mechanism
+`slb_cfg.SlbCfgMetadataConditioning` already uses. The deviation belongs in the paper's method
+note, beside the stage-2 parity cost.
+
+WHY THE PRESENTATION COUNTER IS IN THE KEY, and it is not a detail. Keyed on the row alone, the
+draw is a fixed PARTITION of the corpus rather than a dropout: stage 1 runs exactly 1.0 epoch
+(20,605 x 64 = 1,318,720 draws over 1,318,749 rows), where per-row and per-example dropout
+coincide, but stage 2 runs 30,000 x 64 = 1,920,000 samples over 338,575 LIBERO frames, i.e. ~5.7
+epochs. A row-keyed draw would therefore fit the UNCONDITIONAL branch on a fixed 19.25% of rows
+(~65k) seen 5.7 times each, and the conditional branch would never see those rows at all -- two
+disjoint datasets, which is not what pi0.7 does (it re-draws per example, so both branches see all
+data) and not what any realized-rate number would reveal. So the key carries a presentation
+counter: `PresentationSampler` encodes it in the index it draws (`presentation * n_rows + row`)
+and `PresentationKeyedDataset` decodes it back out into the sample, which keeps the draw a pure
+function of reproducible inputs -- no worker RNG, no dependence on batch order or worker count.
 
 TWO OBJECTS, and the split is load-bearing. `QualityTaggedDataset` runs BEFORE any transform and
 injects the tag using `__getitem__`'s own index argument -- the only unambiguously concat-global
@@ -33,9 +46,11 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import pathlib
 
 import numpy as np
+import torch
 from typing_extensions import override
 
 from openpi.training.slb_cfg import INFER_QUALITY
@@ -93,6 +108,11 @@ DROP_COMPONENT_STAGE2 = 0.05
 # why `LiberoQualityConditioning` must HEAD the repack group -- see its docstring.
 EPISODE_INDEX_KEY = "episode_index"
 FRAME_INDEX_KEY = "frame_index"
+
+# The third key of the stage-2 draw: WHICH time through the corpus this sample is. Injected by
+# `PresentationKeyedDataset`, consumed by `LiberoQualityConditioning`, and dropped by
+# `RepackTransform` immediately afterwards like the two above. Not in the repack map.
+PRESENTATION_KEY = "quality_presentation"
 
 
 class QualityTags:
@@ -523,18 +543,27 @@ class LiberoQualityConditioning(_transforms.DataTransformFn):
     WHY A KEYED HASH RATHER THAN AN ARTIFACT, unlike stage 1. Building one would mean a second
     offline pipeline over a third-party dataset (LIBERO), which is out of scope. What D5 exists to
     protect is that the realized dropout be reconstructable WITHOUT knowing any worker's RNG
-    state -- so the draw is a pure function of `(seed, episode_index, frame_index)`, which
-    `dropped()` exposes so a row's fate can be recomputed offline from the run record alone. Two
-    passes over one row agree; eight workers agree; a rerun agrees; and unlike a per-batch RNG the
-    answer does not depend on batch order, worker count, or how many rows were drawn first. This
-    deviation from D5 is disclosed in the plan and belongs in the paper's method note.
+    state -- so the draw is a pure function of `(seed, presentation, episode_index, frame_index)`,
+    which `dropped()` exposes so a row's fate can be recomputed offline from the run record alone.
+    Two passes over one row at one presentation agree; eight workers agree; a rerun agrees; and
+    unlike a per-batch RNG the answer does not depend on batch order, worker count, or how many
+    rows were drawn first. This deviation from D5 is disclosed in the plan and belongs in the
+    paper's method note.
+
+    WHY THE PRESENTATION IS IN THE KEY. Keyed on the row alone this is not a dropout at all but a
+    fixed PARTITION: stage 2 is ~5.7 epochs (30,000 x 64 samples over 338,575 frames), so the
+    unconditional branch would be fit on one frozen 19.25% of the rows seen 5.7 times each while
+    the conditional branch never saw those rows once. pi0.7 re-draws per example and both of its
+    branches see all the data. `PresentationKeyedDataset` supplies the counter; see the module
+    docstring. Stage 1 is exactly 1.0 epoch, where per-row and per-example dropout coincide, so
+    its artifact is unaffected and is NOT rebuilt.
 
     WHERE IT RUNS. At the HEAD of `LeRobotLiberoDataConfig`'s repack group, i.e. before
-    `RepackTransform`, which rebuilds the dict from its structure map and drops `episode_index`
-    and `frame_index` along with everything else not in it. Placed after it, every lookup would
-    miss -- so both keys RAISE rather than defaulting. `slb_cfg.SlbCfgMetadataConditioning`, the
-    sibling that uses this same keying, returns `data` unchanged on a miss; that is the silent
-    version of this failure and is not repeated here.
+    `RepackTransform`, which rebuilds the dict from its structure map and drops `episode_index`,
+    `frame_index` and the presentation counter along with everything else not in it. Placed after
+    it, every lookup would miss -- so all three keys RAISE rather than defaulting.
+    `slb_cfg.SlbCfgMetadataConditioning`, the sibling that uses this same keying, returns `data`
+    unchanged on a miss; that is the silent version of this failure and is not repeated here.
 
     Note there is no `QualityTaggedDataset` twin: stage 1 needs a wrapper because its tag comes
     from a per-row artifact indexed by the concat-global row number, which no transform can see.
@@ -577,21 +606,28 @@ class LiberoQualityConditioning(_transforms.DataTransformFn):
                 "conditional BC while still being called CFG."
             )
 
-    def dropped(self, episode_index: int, frame_index: int) -> bool:
-        """Whether this row's tag is dropped. PURE in `(seed, episode_index, frame_index)`.
+    def dropped(self, episode_index: int, frame_index: int, presentation: int) -> bool:
+        """Whether this PRESENTATION of this row is dropped.
 
-        Public because that purity is the whole of the D5 deviation's defence: the realized
-        dropout of any row of any run is recomputable from the run record (the config's `seed`)
-        plus the row's own identity, with no worker RNG state involved.
+        PURE in `(seed, presentation, episode_index, frame_index)`. Public because that purity is
+        the whole of the D5 deviation's defence: the realized dropout of any sample of any run is
+        recomputable from the run record (the config's `seed`) plus the row's own identity and
+        which time through the corpus it was, with no worker RNG state involved.
+
+        `presentation` is REQUIRED, with no default. A default of 0 would silently answer the
+        wrong question for every epoch after the first -- which is exactly the bug this argument
+        was added to fix -- and this module's own precedent is that a missing row key raises
+        rather than defaults.
 
         Mixed through SHA-256 rather than an ad-hoc integer product because adjacent `(ep, fr)`
-        -- which is what consecutive rows of one episode are -- must not yield correlated draws.
-        Both levels are drawn UNCONDITIONALLY (`random(2)`, not a short-circuited second call) so
-        a future second metadata component slots in without moving the first component's stream,
-        exactly as `axis.dataset.quality_labels.two_level_dropout` does offline.
+        -- which is what consecutive rows of one episode are -- must not yield correlated draws,
+        and neither must consecutive presentations of one row. Both levels are drawn
+        UNCONDITIONALLY (`random(2)`, not a short-circuited second call) so a future second
+        metadata component slots in without moving the first component's stream, exactly as
+        `axis.dataset.quality_labels.two_level_dropout` does offline.
         """
         digest = hashlib.sha256(
-            f"{int(self.seed)}:{int(episode_index)}:{int(frame_index)}".encode()
+            f"{int(self.seed)}:{int(presentation)}:{int(episode_index)}:{int(frame_index)}".encode()
         ).digest()
         u = np.random.default_rng(int.from_bytes(digest[:8], "little")).random(2)
         return bool(u[0] < float(self.drop_whole) or u[1] < float(self.drop_component))
@@ -614,6 +650,16 @@ class LiberoQualityConditioning(_transforms.DataTransformFn):
                     f"treated identically and the arm would silently train with no dropout at "
                     f"all (or none at all tagged), with nothing in the loss curve to show it."
                 )
+        if PRESENTATION_KEY not in data:
+            raise KeyError(
+                f"{PRESENTATION_KEY!r} is not in the sample: the dataset was not wrapped with "
+                f"PresentationKeyedDataset, or this transform runs after the repack that drops "
+                f"it. Without the counter the draw is a pure function of the row, which over "
+                f"stage 2's ~5.7 epochs is a FIXED 19.25% partition -- the unconditional branch "
+                f"fit on ~65k rows seen 5.7 times each, and the conditional branch never seeing "
+                f"those rows at all. The realized rate would still read 0.8075 and nothing else "
+                f"would show it. Build the pair with quality_conditioning.wrap_presentations."
+            )
         if is_tagged(data["prompt"]):
             # DOUBLE TAG, the same failure `AxisQualityConditioning` refuses: two conditioning
             # entries in one chain yield `"...\nQuality: 5\nQuality: 5"` -- in range, tokenizable,
@@ -627,11 +673,171 @@ class LiberoQualityConditioning(_transforms.DataTransformFn):
             )
         ep = int(np.asarray(data[EPISODE_INDEX_KEY]).reshape(-1)[0])
         fr = int(np.asarray(data[FRAME_INDEX_KEY]).reshape(-1)[0])
-        if self.dropped(ep, fr):
+        pres = int(np.asarray(data[PRESENTATION_KEY]).reshape(-1)[0])
+        if self.dropped(ep, fr, pres):
             # The BARE prompt is the unconditional branch, which is why a dropped row must not
             # emit `Quality: 0`.
             return data
         return {**data, "prompt": apply_metadata(data["prompt"], int(self.q_ep), None)}
+
+
+class PresentationSampler(torch.utils.data.Sampler[int]):
+    """Draw `presentation * n_rows + row`, so which time through the corpus a sample is survives.
+
+    THE PROBLEM IT SOLVES. A transform sees one sample dict and nothing else; nothing in it says
+    whether this is the row's first pass or its sixth. A counter held on the dataset object cannot
+    supply that either -- with `persistent_workers=True` each worker holds its own pickled copy,
+    so a per-worker count depends on the worker count and on how the batches were divided, which
+    is precisely the "reproducible only by argument about RNG state" that D5 forbids. The index is
+    the one channel that reaches the worker from the main process untouched, so the counter rides
+    in the index.
+
+    Epoch semantics are exact: presentation `e` yields every row exactly once, so over the run
+    each row is presented `ceil(steps*batch / n_rows)` times at most and a row's dropout varies
+    across those presentations while staying a pure function of `(seed, presentation, ep, fr)`.
+
+    `shuffle=False` yields the rows in order within each presentation, which keeps a fetch-order
+    test meaningful; `shuffle=True` permutes with `seed + presentation`, the same construction
+    `slb_variant_sampler.RowSampler` uses. The permutation ORDER therefore differs from the plain
+    `shuffle=True` path the other stage-2 arms take (torch's own `RandomSampler` draws from the
+    DataLoader's generator). That is a difference in order only: coverage per presentation is
+    identical -- every row exactly once -- so it costs the twin nothing the parity claim covers.
+
+    ON RESUME. Like `RowSampler`, this restarts at presentation 0, and openpi checkpoints no
+    loader position. A resumed stage-2 run therefore repeats presentation 0's dropout pattern
+    rather than continuing the sequence. Stage 2's claim is not coverage neutrality, so this is
+    not the `_check_quality_resume` hazard, but it is the same mechanism: restart clean.
+    """
+
+    def __init__(self, n_rows: int, *, seed: int = 0, shuffle: bool = True):
+        n = int(n_rows)
+        if n <= 0:
+            raise ValueError(f"PresentationSampler got n_rows={n}; there is nothing to present")
+        self._n = n
+        self._seed = int(seed)
+        self._shuffle = bool(shuffle)
+        self._presentation = 0
+
+    def __len__(self) -> int:
+        return self._n
+
+    @property
+    def presentation(self) -> int:
+        """How many full passes have been STARTED. Read by the loader's log, not by the draw."""
+        return self._presentation
+
+    def __iter__(self):
+        e = self._presentation
+        self._presentation += 1
+        if self._shuffle:
+            gen = torch.Generator()
+            gen.manual_seed(self._seed + e)
+            order = torch.randperm(self._n, generator=gen)
+        else:
+            order = torch.arange(self._n)
+        yield from (order + e * self._n).tolist()
+
+
+class PresentationKeyedDataset:
+    """Decode `presentation * n_rows + row` back into a real row plus `data["quality_presentation"]`.
+
+    Wraps the raw dataset BEFORE `transform_dataset`, so the counter is present when the repack
+    group's head transform runs -- the same position, and for the same reason, as
+    `QualityTaggedDataset` in stage 1.
+
+    `__len__` is the TRUE row count, not the extended space: it is what `TorchDataLoader`'s batch
+    check and `len(sampler)` are about, and inflating it would misreport the corpus everywhere.
+    The extended indices come from `PresentationSampler` alone, which is why the two are built
+    together by `wrap_presentations` and never separately -- indexed 0..n-1 by any other sampler
+    this wrapper reports presentation 0 for every sample, silently restoring the fixed-partition
+    bug. `data_loader` refuses the framework paths that would do that.
+    """
+
+    # One line per worker per run, at a point where the count is large enough to be a rate. Stage
+    # 2 otherwise logged NOTHING, so its realized tagged fraction -- the number that says the
+    # unconditional branch was trained at all -- was never computed anywhere.
+    _LOG_EVERY = 20_000
+
+    def __init__(self, dataset, conditioning: LiberoQualityConditioning):
+        self._dataset = dataset
+        self._n = len(dataset)
+        if self._n <= 0:
+            raise ValueError("PresentationKeyedDataset got an empty dataset")
+        self._conditioning = conditioning
+        self._seen = 0
+        self._tagged = 0
+        self._max_presentation = 0
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, index):
+        i = int(index)
+        if i < 0:
+            # A negative index would wrap to a plausible wrong row AND a negative presentation.
+            raise IndexError(f"PresentationKeyedDataset got a negative index {i}")
+        presentation, row = divmod(i, self._n)
+        item = dict(self._dataset[row])
+        item[PRESENTATION_KEY] = presentation
+        self._count(item, presentation)
+        return item
+
+    def _count(self, item, presentation: int) -> None:
+        """Realized tagged fraction, per worker. A log line, never a guard -- the transform that
+        runs next raises on anything actually wrong with these keys."""
+        if EPISODE_INDEX_KEY not in item or FRAME_INDEX_KEY not in item:
+            return
+        ep = int(np.asarray(item[EPISODE_INDEX_KEY]).reshape(-1)[0])
+        fr = int(np.asarray(item[FRAME_INDEX_KEY]).reshape(-1)[0])
+        self._seen += 1
+        self._tagged += int(not self._conditioning.dropped(ep, fr, presentation))
+        self._max_presentation = max(self._max_presentation, presentation)
+        if self._seen % self._LOG_EVERY == 0:
+            logging.info(
+                "stage-2 quality conditioning realized: tagged=%d/%d (%.4f) target=%.4f "
+                "q_ep=%d drop_whole=%.4f drop_component=%.4f seed=%d n_rows=%d "
+                "presentations_seen=%d",
+                self._tagged, self._seen, self._tagged / self._seen,
+                (1.0 - float(self._conditioning.drop_whole))
+                * (1.0 - float(self._conditioning.drop_component)),
+                int(self._conditioning.q_ep), float(self._conditioning.drop_whole),
+                float(self._conditioning.drop_component), int(self._conditioning.seed),
+                self._n, self._max_presentation + 1,
+            )
+
+
+def wrap_presentations(dataset, conditioning: LiberoQualityConditioning, *, seed: int, shuffle: bool):
+    """Build stage 2's dataset wrapper and its sampler TOGETHER. The only supported constructor.
+
+    Same lesson as `wrap_and_transform`, one stage later: of the two ways to wire half of this,
+    only one announces itself. Sampler without wrapper indexes the raw dataset out of range and
+    dies loudly. Wrapper without sampler is drawn 0..n-1, reports presentation 0 for every sample,
+    trains the fixed-partition bug this pair exists to remove, and reports a perfectly normal
+    0.8075 realized rate while doing it.
+    """
+    return PresentationKeyedDataset(dataset, conditioning), PresentationSampler(
+        len(dataset), seed=seed, shuffle=shuffle
+    )
+
+
+def stage2_conditioning(data_config) -> LiberoQualityConditioning | None:
+    """The stage-2 transform in this config's repack group, or None. Refuses two.
+
+    Read off the transform list rather than a second `DataConfig` flag on purpose: the object that
+    does the conditioning and the object that decides to wrap the dataset are then the SAME one,
+    so they cannot drift into a config that tags without a presentation counter (which raises) or,
+    worse, wraps without tagging.
+    """
+    group = getattr(data_config, "repack_transforms", None)
+    found = [t for t in (getattr(group, "inputs", None) or ()) if isinstance(t, LiberoQualityConditioning)]
+    if len(found) > 1:
+        raise ValueError(
+            f"{len(found)} LiberoQualityConditioning transforms in the repack group, so the tag "
+            f"would be applied twice ('...\\nQuality: 5\\nQuality: 5') -- in range, tokenizable, "
+            f"and matched by no eval-time prompt. It belongs there exactly once; see "
+            f"LeRobotLiberoDataConfig.quality_tag."
+        )
+    return found[0] if found else None
 
 
 # =================================================================================================

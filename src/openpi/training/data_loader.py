@@ -353,6 +353,102 @@ def _check_quality_unsupported_on_pytorch(data_config: _config.DataConfig) -> No
         )
 
 
+def _check_stage2_quality_unsupported_on_pytorch(framework: str) -> None:
+    """Stage 2's presentation counter reaches the worker through the SAMPLER's index, and the
+    pytorch branch builds its own.
+
+    `DistributedSampler` (or the plain shuffle that branch falls back to) draws 0..n-1, so
+    `PresentationKeyedDataset` would decode presentation 0 for every sample of every epoch --
+    which is exactly the fixed-partition bug the counter exists to remove, restored silently:
+    the unconditional branch fit on one frozen 19.25% of rows, the conditional branch never
+    seeing them, and a realized tagged fraction that still reads 0.8075.
+    """
+    if framework == "pytorch":
+        raise ValueError(
+            "this config carries the stage-2 quality conditioning (LeRobotLiberoDataConfig."
+            "quality_tag), but the PyTorch training path (scripts/train_pytorch.py, "
+            "framework='pytorch') builds its own sampler and cannot carry the presentation "
+            "counter the dropout is keyed on. Every epoch would reuse presentation 0, i.e. a "
+            "FIXED 19.25% row partition rather than a per-example dropout, with the realized "
+            "rate still reading 0.8075. Use scripts/train.py (framework='jax')."
+        )
+
+
+def _check_schedule_unsupported_on_rlds(data_config: _config.DataConfig) -> None:
+    """`create_rlds_data_loader` builds no sampler at all, so a schedule config would run uniform."""
+    schedule_path = getattr(data_config, "pretrain_schedule_path", None)
+    if schedule_path:
+        raise ValueError(
+            f"pretrain_schedule_path={schedule_path!r} is set, but this config also sets "
+            f"rlds_data_dir, which routes create_data_loader to the RLDS branch -- and that "
+            f"branch builds no sampler, so the precomputed (steps, batch) row block would be "
+            f"ignored and the run would train the plain BC control under the arm's name. Use a "
+            f"LeRobot/torch config (the jax branch of create_torch_data_loader) for schedule arms."
+        )
+
+
+def _check_quality_unsupported_on_rlds(data_config: _config.DataConfig) -> None:
+    """Same refusal for the CFG arm: the RLDS branch never wraps the dataset with the tag."""
+    quality_path = getattr(data_config, "pretrain_quality_path", None)
+    if quality_path:
+        raise ValueError(
+            f"pretrain_quality_path={quality_path!r} is set, but this config also sets "
+            f"rlds_data_dir, which routes create_data_loader to the RLDS branch -- and that "
+            f"branch never calls quality_conditioning.wrap_and_transform, so every prompt would "
+            f"stay bare and the arm would train as the plain BC control under its own name. Use a "
+            f"LeRobot/torch config (the jax branch of create_torch_data_loader) for the CFG arm."
+        )
+
+
+def _bin_row_share(meta: dict) -> dict:
+    """Per-bin share of the TRAINABLE rows, as the loader log's own reading of the artifact.
+
+    `bin_row_counts` is absolute and only the tagged rows are counted in it, so a skewed corpus
+    and a skewed dropout look the same in the raw counts. The share against `n_trainable` is the
+    number the write-up quotes, and computing it here means the run record carries it rather than
+    requiring the artifact to be reopened months later.
+    """
+    counts = meta.get("bin_row_counts") or {}
+    total = int(meta.get("n_trainable") or 0)
+    if not counts or total <= 0:
+        return {}
+    return {str(b): round(int(c) / total, 4) for b, c in sorted(counts.items(), key=lambda kv: int(kv[0]))}
+
+
+def _check_quality_resume(quality_path: str, resuming: bool) -> None:
+    """A resume restarts the row permutation at epoch 0 while the optimiser continues from step k.
+
+    The CFG arm's ONLY claim is coverage neutrality: it draws exactly the rows the round-1 control
+    draws, in the control's order, and differs from it in the prompt alone. That claim is a
+    statement about `RowSampler(plan_rows_from_roots(...), seed)` -- and `RowSampler.__iter__`
+    restarts its epoch counter at 0 every time the loader is built, while openpi checkpoints no
+    loader position at all (`checkpoints.restore_state` drops its `data_loader` argument).
+
+    So a resume at step k over an N-step budget trains `perm[0 : k*B]` and then `perm[0 : (N-k)*B]`
+    -- a UNION of `max(k, N-k)*B` unique rows, not `N*B`. A resume at the midpoint of this 16-hour
+    job halves coverage to 50% of the corpus while the run record, the TOML and the paper line all
+    still say "100%, byte-identical to the control". Nothing else would show it: the loss curve,
+    the step count, the checkpoint and every other guard are unchanged, and the sibling arms were
+    blocked on exactly this quantity (37%).
+
+    Note this is a DIFFERENT mechanism from `_check_schedule_resume`'s -- the schedule arms replay
+    an artifact, this arm draws a permutation -- but the same consequence and the same cause: no
+    loader position is checkpointed. Both refuse rather than warn.
+    """
+    if resuming:
+        raise ValueError(
+            f"config.resume is set together with pretrain_quality_path={quality_path!r}, but "
+            f"openpi checkpoints do not save data-loader position (checkpoints.restore_state "
+            f"drops its data_loader argument): RowSampler restarts its epoch counter at 0, so a "
+            f"resume at step k over an N-step budget would draw perm[0:k*B] and then "
+            f"perm[0:(N-k)*B] -- a union of max(k, N-k)*B unique rows instead of N*B. A resume at "
+            f"the midpoint halves this arm's corpus coverage to ~50% while its whole claim is "
+            f"that coverage is IDENTICAL to the round-1 control's. Restart the run clean instead "
+            f"of resuming -- the same standing instruction the schedule arms carry in "
+            f"conf/experiments/onelayer_v3_round2_cfg_arms.toml."
+        )
+
+
 def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
     """A resume replays the schedule from row 0 while the optimiser continues from step k.
 
@@ -474,13 +570,48 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
-        num_train_steps: The training budget, when known. Only consulted by the index-schedule
-            path, which must refuse a budget longer than its artifact (see ScheduleSampler).
-        resuming: Whether this run is actually resuming from a checkpoint. Only consulted by the
-            index-schedule path, which must refuse to resume (see `_check_schedule_resume`).
+        num_train_steps: The training budget, when known. Consulted by the index-schedule path,
+            which must refuse a budget longer than its artifact (see ScheduleSampler), and logged
+            by the stage-2 quality path as the number of presentations the run will need.
+        resuming: Whether this run is actually resuming from a checkpoint. Consulted by the
+            index-schedule path and by the stage-1 quality path, both of which must refuse to
+            resume: openpi checkpoints no loader position, so the row sequence would restart at 0
+            while the optimiser continued from step k. See `_check_schedule_resume` and
+            `_check_quality_resume`.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     quality_path = getattr(data_config, "pretrain_quality_path", None)
+    # The STAGE-2 twin, read off the repack group rather than a second config flag -- see
+    # `quality_conditioning.stage2_conditioning`. `None` for every other config, including stage 1.
+    from openpi.training import quality_conditioning as _quality_conditioning
+
+    stage2_conditioning = _quality_conditioning.stage2_conditioning(data_config)
+    stage2_sampler = None
+    if stage2_conditioning is not None:
+        if quality_path:
+            raise ValueError(
+                f"this config sets both pretrain_quality_path={quality_path!r} (stage 1's per-row "
+                f"artifact) and a stage-2 LiberoQualityConditioning in its repack group. The two "
+                f"tag the same prompt from different sources; one run cannot be both stages."
+            )
+        _check_stage2_quality_unsupported_on_pytorch(framework)
+        # ONE call builds the wrapper and the sampler: drawn 0..n-1 by any other sampler, the
+        # wrapper reports presentation 0 for every sample and stage 2 silently trains the fixed
+        # 19.25% partition instead of a dropout. See `wrap_presentations`.
+        dataset, stage2_sampler = _quality_conditioning.wrap_presentations(
+            dataset, stage2_conditioning, seed=seed, shuffle=shuffle
+        )
+        logging.info(
+            "stage-2 quality conditioning: q_ep=%d drop_whole=%.4f drop_component=%.4f "
+            "target_tagged=%.4f seed=%d n_rows=%d shuffle=%s presentations_needed=%s",
+            int(stage2_conditioning.q_ep), float(stage2_conditioning.drop_whole),
+            float(stage2_conditioning.drop_component),
+            (1.0 - float(stage2_conditioning.drop_whole))
+            * (1.0 - float(stage2_conditioning.drop_component)),
+            int(stage2_conditioning.seed), len(dataset), shuffle,
+            "unknown" if num_train_steps is None
+            else -(-num_train_steps * batch_size // len(dataset)),
+        )
     if quality_path:
         # π0.7 quality conditioning. This REPLACES the `transform_dataset` call below rather than
         # wrapping around it, and that is the whole of the wiring's difficulty.
@@ -500,6 +631,10 @@ def create_torch_data_loader(
         # `repack_transforms.inputs`, so an entry there too would tag twice.
         from openpi.training import quality_conditioning
 
+        # RAISES. The row permutation this arm shares with the control restarts at epoch 0 on a
+        # resume while the optimiser continues from step k, so a mid-run resume silently halves
+        # the coverage the arm's entire claim rests on. Checked first, before anything expensive.
+        _check_quality_resume(quality_path, resuming)
         tags = quality_conditioning.QualityTags(quality_path)
         # The filename is the only thing separating cfg_v2 from cfg_phase: one config name, one
         # artifact structure, two rewards. Checked before anything expensive happens.
@@ -517,12 +652,19 @@ def create_torch_data_loader(
             dataset, tags, training_transforms(data_config, skip_norm_stats=skip_norm_stats)
         )
         logging.info(
-            "quality conditioning %s: reward=%s n_rows=%s tagged=%s drop_whole=%s "
-            "drop_component=%s entropy_ratio=%s token_margin=%d config_hash=%s seed=%s",
+            "quality conditioning %s: reward=%s n_rows=%s n_trainable=%s tagged=%s drop_whole=%s "
+            "drop_component=%s bin_row_share=%s entropy_ratio=%s token_margin=%d config_hash=%s "
+            "generator_sha256=%s seed=%s",
             quality_path, tags.reward_id, tags.meta.get("n_rows"),
+            tags.meta.get("n_trainable"),
             tags.meta.get("realized_tagged_fraction"), tags.meta.get("realized_drop_whole"),
-            tags.meta.get("realized_drop_component"), tags.meta.get("q_given_task_entropy_ratio"),
-            margin, tags.meta.get("config_hash"), tags.meta.get("seed"),
+            tags.meta.get("realized_drop_component"), _bin_row_share(tags.meta),
+            tags.meta.get("q_given_task_entropy_ratio"),
+            margin, tags.meta.get("config_hash"),
+            # WHICH builder source drew these tags. The schedule arms already log it; without it
+            # here the run record cannot tell a re-derived artifact from the audited one, and
+            # `config_hash` alone does not cover the generator.
+            tags.meta.get("generator_sha256"), tags.meta.get("seed"),
         )
     else:
         dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
@@ -552,6 +694,10 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+        # Stage 2's presentation counter. Installed here and not above because this is where the
+        # sampler lives; the wrapper it is paired with was built with it in one call.
+        if stage2_sampler is not None:
+            sampler = stage2_sampler
         # SLB variant bake-off: restrict/weight rows to the kept (attempt, window)
         # set of the configured WVM variant. Only engages when a sidecar root is
         # set, so all other JAX configs keep full-shuffle behaviour.
@@ -698,6 +844,14 @@ def create_rlds_data_loader(
     """
     if framework == "pytorch":
         raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
+    # The RLDS branch wires NONE of the round-2 mechanisms: no row plan, no schedule sampler, no
+    # quality wrapper. `create_data_loader` picks it purely on `rlds_data_dir`, so a config that
+    # set both that and an arm's artifact would train as the plain control under the arm's name --
+    # the one remaining branch where that is still possible, now that the pytorch branch refuses.
+    # Unreachable today (no round-2 config sets rlds_data_dir), which is exactly when a refusal is
+    # cheap; it is the config that changes, not this file.
+    _check_schedule_unsupported_on_rlds(data_config)
+    _check_quality_unsupported_on_rlds(data_config)
     dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 

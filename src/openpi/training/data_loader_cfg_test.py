@@ -173,7 +173,7 @@ def _data_config(quality_path=None) -> _config.DataConfig:
     return factory.create(base.assets_dirs, _model())
 
 
-def _drive(data_config, *, seed=0, num_batches=8, batch_size=BATCH, framework="jax"):
+def _drive(data_config, *, seed=0, num_batches=8, batch_size=BATCH, framework="jax", resuming=False):
     return list(
         _data_loader.create_torch_data_loader(
             data_config,
@@ -185,6 +185,7 @@ def _drive(data_config, *, seed=0, num_batches=8, batch_size=BATCH, framework="j
             seed=seed,
             skip_norm_stats=True,
             framework=framework,
+            resuming=resuming,
         )
     )
 
@@ -364,6 +365,43 @@ def test_the_pytorch_path_refuses_the_arm_through_the_real_loader(toy):
     """
     with pytest.raises(ValueError, match="pytorch"):
         _drive(_data_config(toy["path"]), framework="pytorch")
+
+
+def test_a_resume_is_refused_through_the_real_loader(toy):
+    """COVERAGE NEUTRALITY UNDER RESUME -- the one way the arm's claim can be false while every
+    other guard here stays green.
+
+    `RowSampler.__iter__` restarts its epoch counter at 0 and openpi checkpoints no loader
+    position, so a resume at step k of an N-step budget trains `perm[0:k*B]` and then
+    `perm[0:(N-k)*B]`: a union of `max(k, N-k)*B` unique rows, i.e. 50% of the corpus for a resume
+    at the midpoint -- while the TOML, the run record and the paper line all still say 100%,
+    byte-identical to the control. There is no loss-curve signature, and `_check_schedule_resume`
+    covers only the sibling arms.
+
+    Driven through the real loader, not by calling the checker: a unit test of
+    `_check_quality_resume` stays green if its call site is deleted, which is the failure.
+    """
+    with pytest.raises(ValueError, match="resume"):
+        _drive(_data_config(toy["path"]), resuming=True)
+
+
+def test_the_control_still_resumes(toy):
+    """The refusal must be the ARM's, not a blanket ban: round 1's control is allowed to resume,
+    and a guard that fired for every config would be found only by a failed relaunch."""
+    toy["seen"].clear()
+    assert _drive(_data_config(None), resuming=True)
+
+
+def test_the_rlds_path_refuses_the_arm(toy):
+    """The last branch where a CFG config could still train as the plain control.
+
+    `create_data_loader` routes on `rlds_data_dir` alone, and `create_rlds_data_loader` never
+    calls `wrap_and_transform` -- so every prompt would stay bare. Unreachable today (no round-2
+    config sets `rlds_data_dir`), which is why the refusal is cheap now and expensive later.
+    """
+    data_config = dataclasses.replace(_data_config(toy["path"]), rlds_data_dir="/nonexistent")
+    with pytest.raises(ValueError, match="rlds_data_dir"):
+        _data_loader.create_rlds_data_loader(data_config, action_horizon=10, batch_size=BATCH)
 
 
 def test_an_artifact_without_an_unconditional_branch_raises_at_loader_construction(toy, tmp_path):
