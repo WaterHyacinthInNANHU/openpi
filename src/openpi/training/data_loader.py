@@ -358,13 +358,38 @@ def create_torch_data_loader(
                 dataset = slb_variant_sampler.WeightedRowDataset(dataset, weights_by_row)
         elif getattr(data_config, "pretrain_roots_index", None):
             # Pretraining: restrict the concatenated multi-task dataset to the non-idle
-            # sample-ranges. Uniform draw over the kept flat rows (no weighting).
+            # sample-ranges, drawn UNIFORMLY -- and, when an AWR weights artifact is configured,
+            # carry a per-row Eq E.7 weight into the batch so the loss can reweight.
+            #
+            # Rows are drawn uniformly in BOTH cases. WVM Eq E.5 puts the weights in the
+            # OBJECTIVE, not in the sampling distribution: weighted resampling has a different
+            # estimator variance and, drawing with replacement, changes the epoch composition
+            # independently of the weights. See slb_awr_loss's module docstring.
             from openpi.training import pretrain_dataset
             from openpi.training import slb_variant_sampler
 
-            rows = pretrain_dataset.plan_rows_from_roots(
-                data_config.pretrain_roots_index, data_config.pretrain_ranges_path
-            )
+            weights_path = getattr(data_config, "pretrain_awr_weights", None)
+            if weights_path:
+                rows, weights = pretrain_dataset.plan_rows_and_weights_from_roots(
+                    data_config.pretrain_roots_index,
+                    data_config.pretrain_ranges_path,
+                    weights_path,
+                )
+                # Dense over the WHOLE flat space; NaN everywhere the sampler will never go, so
+                # a row reached by some other path raises rather than training unweighted.
+                dense = np.full(len(dataset), np.nan, dtype=np.float32)
+                dense[rows] = weights
+                logging.info(
+                    "pretrain AWR weights from %s: n_rows=%d mean=%.4f at_cap=%.1f%% at_one=%.1f%%",
+                    weights_path, len(weights), float(weights.mean()),
+                    100.0 * float(np.mean(weights >= weights.max() - 1e-9)),
+                    100.0 * float(np.mean(weights == 1.0)),
+                )
+                dataset = slb_variant_sampler.StrictWeightedRowDataset(dataset, dense)
+            else:
+                rows = pretrain_dataset.plan_rows_from_roots(
+                    data_config.pretrain_roots_index, data_config.pretrain_ranges_path
+                )
             sampler = slb_variant_sampler.RowSampler(rows, seed=seed)
 
     logging.info(f"local_batch_size: {local_batch_size}")

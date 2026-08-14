@@ -49,14 +49,126 @@ def read_episode_offsets(root: str | pathlib.Path) -> tuple[dict[int, tuple[int,
     return episodes, total
 
 
+CORPUS_ROOT_ENV = "AXIS_PRETRAIN_CORPUS_ROOT"
+
+
 def _ordered_roots(roots_index: str | pathlib.Path) -> list[tuple[int, str]]:
     """``(task_id, root_path)`` pairs from the roots-index JSON, sorted by task id.
 
     Sorting (not JSON insertion order) makes the concat index space deterministic, so the
     dataset build and the row planner agree regardless of how the index file was written.
+
+    TWO FORMATS, because the corpus outlived the first one.
+
+    * **v2 (write this)** -- ``{"version": 2, "base": "../derived224", "roots": {"1000":
+      "task_1000"}}``. Roots are RELATIVE and ``base`` is itself relative to the index file, so
+      the whole corpus tree can be copied to another machine, or moved on this one, and still
+      resolve. ``$AXIS_PRETRAIN_CORPUS_ROOT`` overrides ``base`` when a copy is split apart.
+    * **v1 (still read)** -- a bare ``{"1000": "/abs/path/task_1000"}`` mapping.
+
+    v1 embeds absolute paths, which pinned an index to the machine that built it: shipping the
+    identical shards to another box produced a file naming directories that did not exist there,
+    and the corpus had to be re-indexed by hand. Reading it is kept because a training run in
+    flight is using one, and changing what an already-launched run reads is not a refactor.
     """
-    mapping = json.loads(pathlib.Path(roots_index).read_text())
-    return sorted(((int(k), str(v)) for k, v in mapping.items()), key=lambda kv: kv[0])
+    import os
+
+    path = pathlib.Path(roots_index)
+    data = json.loads(path.read_text())
+
+    if isinstance(data, dict) and "roots" in data:
+        mapping = data["roots"]
+        override = os.environ.get(CORPUS_ROOT_ENV)
+        base = pathlib.Path(override) if override else path.parent / str(data.get("base", "."))
+    else:
+        mapping = data          # v1: values are absolute and self-sufficient
+        base = None
+
+    out: list[tuple[int, str]] = []
+    for key, value in mapping.items():
+        root = pathlib.Path(str(value))
+        if root.is_absolute():
+            resolved = root
+        elif base is None:
+            raise ValueError(
+                f"{path} has a relative root {value!r} but no 'base' key. A bare mapping is "
+                f"read as the legacy absolute-path format; add \"version\": 2 and \"base\", or "
+                f"set ${CORPUS_ROOT_ENV}."
+            )
+        else:
+            resolved = base / root
+        out.append((int(key), str(resolved)))
+    return sorted(out, key=lambda kv: kv[0])
+
+
+def plan_rows_and_weights_from_roots(
+    roots_index: str | pathlib.Path,
+    ranges_path: str | pathlib.Path,
+    weights_path: str | pathlib.Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flat training rows AND their AWR weights, resolved in ONE pass.
+
+    Returned together, from the same loop over the same sub-datasets, because the flat index
+    space depends on the task order and on every episode length across ~476 sub-datasets. A
+    weights artifact keyed by flat index would have to agree with this loop exactly, and would
+    fail SILENTLY if one episode were added or dropped, or if the offline builder sorted task
+    ids as strings ("1000" < "800") -- applying the right weights to the wrong frames, with no
+    error and no log line.
+
+    The artifact is therefore keyed by `episode_key(task_id, episode_index)`, the same key this
+    function computes, and the join happens here.
+
+    A row whose episode is absent from the artifact, or whose weight is non-finite, RAISES. The
+    alternative -- defaulting to 0.0, as the SLB wrapper does -- would leave those rows in the
+    batch contributing nothing, which is a training-set reduction disguised as a weighting.
+    """
+
+
+    rows = plan_rows_from_roots(roots_index, ranges_path)
+
+    payload = json.loads(pathlib.Path(weights_path).read_text())
+    by_key = payload["weights"] if isinstance(payload, dict) and "weights" in payload else payload
+
+    # Rebuild the same flat space the rows were planned in, then place each episode's weights.
+    entries: list[tuple[int, dict[int, tuple[int, int]], int]] = []
+    for task_id, root in _ordered_roots(roots_index):
+        episodes, total = read_episode_offsets(root)
+        entries.append((task_id, episodes, total))
+    subdatasets, total_rows = pretrain_sampler.build_subdatasets(entries)
+
+    flat = np.full(int(total_rows), np.nan, dtype=np.float32)
+    missing: list[str] = []
+    for sub in subdatasets:
+        for ep_index, (local_start, length) in sub.episodes.items():
+            key = pretrain_sampler.episode_key(sub.task_id, ep_index)
+            w = by_key.get(key)
+            if w is None:
+                missing.append(key)
+                continue
+            if len(w) != length:
+                raise ValueError(
+                    f"{key}: weights have {len(w)} entries but the episode has {length} rows. "
+                    f"The weights artifact was built against a different corpus."
+                )
+            base = sub.global_base + local_start
+            flat[base : base + length] = np.asarray(w, dtype=np.float32)
+
+    if missing:
+        raise ValueError(
+            f"{len(missing)} episodes have no weights (e.g. {missing[:5]}). Every episode the "
+            f"loader can sample must carry one, even if that weight is the neutral 1.0 -- a "
+            f"missing key would otherwise be filled by a reader default and silently reweight "
+            f"training."
+        )
+
+    weights = flat[rows]
+    if not np.isfinite(weights).all():
+        bad = int(np.sum(~np.isfinite(weights)))
+        raise ValueError(
+            f"{bad} planned rows have no finite weight. Rows and weights disagree about the "
+            f"corpus; refusing to train on a partially-weighted objective."
+        )
+    return rows, weights
 
 
 def plan_rows_from_roots(roots_index: str | pathlib.Path, ranges_path: str | pathlib.Path) -> np.ndarray:

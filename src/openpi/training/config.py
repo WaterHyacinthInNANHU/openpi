@@ -138,6 +138,11 @@ class DataConfig:
     # keyed "task_<id>--<episode_index>"). Left None for every non-pretraining config, which
     # keeps the single-dataset behaviour. These never coexist with the slb_* fields.
     pretrain_roots_index: str | None = None
+    # AWR weights for the pretrain path: a JSON artifact keyed by `task_<id>--<episode>` ->
+    # per-frame float, built offline by `axis.dataset.awr_weights`. Unset means uniform,
+    # unweighted pretraining -- the plain-BC baseline. The two supervision arms differ from that
+    # baseline, and from each other, ONLY in which file this points at.
+    pretrain_awr_weights: str | None = None
     pretrain_ranges_path: str | None = None
 
 
@@ -498,7 +503,9 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     Unlike the single-task SLB factory this trains over many tasks at once. The per-task
     __droid8d LeRobot sub-datasets are concatenated by the loader (roots named in
     ``roots_index``) and rows are restricted to the non-idle sample-ranges in ``ranges_path``.
-    No SLB variant sidecars, no AWR/CFG conditioning.
+    No SLB variant sidecars and no CFG conditioning. AWR IS supported here: set
+    ``pretrain_awr_weights`` (or $AXIS_PRETRAIN_AWR_WEIGHTS) and the loader applies
+    per-row weights via WVM Eq E.5.
 
     Norm stats are the config's OWN (computed by scripts/compute_norm_stats.py), NOT DROID's:
     a prior experiment showed DROID's stats do not fit this action/state distribution, and a
@@ -509,6 +516,10 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
 
     roots_index: str | None = None
     ranges_path: str | None = None
+    # Path to the AWR weights artifact, or None for uniform unweighted pretraining. This is the
+    # ONLY field that differs between the plain-BC baseline and either supervision arm, which is
+    # what makes the three runs a controlled comparison rather than three separate experiments.
+    awr_weights: str | None = None
     default_prompt: str | None = None
     # Relative-EEF action space (LIBERO-Plus proxy benchmark): feed the baked `state_eef`(8) /
     # `action_eef`(7, robosuite OSC_POSE delta) columns and slice the output to 7. Default False
@@ -550,6 +561,7 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=(action_col,),
             pretrain_roots_index=self.roots_index,
+            pretrain_awr_weights=self.awr_weights,
             pretrain_ranges_path=self.ranges_path,
         )
 
@@ -1080,6 +1092,7 @@ def _axis_pretrain_config(
             repo_id="Devon018/Franka-Datasets-v2",
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
+            awr_weights=os.environ.get("AXIS_PRETRAIN_AWR_WEIGHTS"),
             base_config=DataConfig(prompt_from_task=True),
             # relative-EEF (LIBERO-Plus proxy) feeds state_eef/action_eef; else DROID-8D joint-vel.
             eef_action=eef,
@@ -1201,8 +1214,11 @@ _CONFIGS = [
     #            already exists and needs no edit: `combine()` applies WVM Eq E.5 the moment a
     #            weight is present. `DataConfig.awr_tau` (10.0) / `awr_delta` (2.0) carry the
     #            Eq E.7 constants.
-    # Neither path exists for these two configs yet -- both factories build their repack from a
-    # bare RepackTransform, and the pretrain loader branch draws rows uniformly with no weights.
+    # STATUS: the AWR path now EXISTS and is what the onelayer_v3 arms train on. The pretrain
+    # branch of `create_torch_data_loader` wraps its RowSampler in `StrictWeightedRowDataset`
+    # whenever `DataConfig.pretrain_awr_weights` is set (fed from $AXIS_PRETRAIN_AWR_WEIGHTS).
+    # The CFG path is still unbuilt: both factories still build their repack from a bare
+    # RepackTransform, so no conditioning tag reaches the prompt.
     _axis_pretrain_config(eef=True, paper=True, batch_size=8, num_train_steps=100_000),
     # INFERENCE-ONLY: serve the pi05_axis_pretrain_eef checkpoint to the LIBERO-Plus client.
     _axis_eef_libero_serve_config(),

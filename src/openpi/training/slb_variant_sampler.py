@@ -10,7 +10,7 @@ row -> weight map: WVM (arXiv 2606.24742) Eq E.5 puts the weights in the OBJECTI
 (a weighted LOSS), not in the sampler. See openpi.training.slb_awr_loss for the
 objective and for why weighted resampling is not the same estimator.
 
-Window semantics (see benchmarks/slb_pilot/adv_proxy.chunk_deltas): window index
+Window semantics (see axis/dataset/adv_proxy.chunk_deltas): window index
 ``s`` is the sliding-window START frame ``s`` of the attempt's episode. So the
 window->row map is the identity offset: ``row = episode_from[episode_index] + s``.
 
@@ -20,7 +20,7 @@ including vanilla -- must restrict to success-episode windows; the non-success
 episodes and each episode's last H-1 frames are never emitted.
 
 Imports only numpy + torch here plus the numpy-only sidecar readers from the
-outer ``benchmarks`` package (bridged via PYTHONPATH). Never imports
+outer ``axis`` package (bridged via PYTHONPATH). Never imports
 scipy/mujoco/overlay, so it is safe under the openpi venv.
 """
 from __future__ import annotations
@@ -61,7 +61,16 @@ def plan_indices(
     *,
     fps: float,
     ep_len: Mapping[int, int],
-    awr_tau: float = 3.0,
+    # NO NUMERIC DEFAULT, deliberately. This used to default to 3.0 while the paper value
+    # (WVM Eq E.7 / Table E.5 at H=10, and `DataConfig.awr_tau`) is 10.0 -- a silent 3.3x
+    # deviation for any caller that omitted it. The weight is exp(tau * delta), so tau is the
+    # single most consequential number in the AWR arm: at tau=3 almost every weight sits far
+    # below the delta=2.0 cap and the arm degenerates toward vanilla BC. Nothing would have
+    # reported that -- the run would simply have been a different experiment.
+    #
+    # `None` rather than a required argument so the four non-AWR variants, for which tau is
+    # meaningless, are not forced to state one; it is enforced below only where it is used.
+    awr_tau: float | None = None,
     awr_delta: float = 2.0,
     render_aligned_rows: bool = True,
 ) -> tuple[np.ndarray, np.ndarray | None]:
@@ -85,6 +94,12 @@ def plan_indices(
     rows: list[int] = []
     weights: list[float] = []
     is_awr = variant == "awr"
+    if is_awr and awr_tau is None:
+        raise ValueError(
+            "variant='awr' needs an explicit awr_tau (WVM Eq E.7; 10.0 at H=10, carried by "
+            "DataConfig.awr_tau). Refusing to pick one silently: the weight is "
+            "exp(awr_tau * delta), so a wrong tau produces a different experiment, not an error."
+        )
     # vanilla and cfg both keep every success window (keep_mask is all-True); cfg's
     # conditioning is injected in the action expert at train time, not by row
     # restriction here. Only filt_bin/top70 drop rows; only awr attaches weights.
@@ -212,6 +227,44 @@ class WeightedRowDataset:
         return item
 
 
+class StrictWeightedRowDataset:
+    """Like `WeightedRowDataset`, but a row with no weight RAISES instead of getting 0.0.
+
+    For the SLB path a 0.0 default is a defensible tripwire: the weight map covers the variant's
+    keep-set and anything outside it genuinely should not train. The PRETRAIN path is different.
+    Its weights come from a separate offline pass over ~476 tasks and 1.2M rows, so a partial or
+    misaligned map is a live possibility -- and there, 0.0 means the row still enters the batch
+    and contributes NOTHING to the loss. That is a silent training-set reduction. A fully
+    misaligned map yields `loss = 0/eps = 0` and zero gradient forever, which looks like a
+    converged run.
+
+    Backed by a dense float32 array rather than a dict: 1.2M dict entries copied into each of 8
+    dataloader workers is ~150-200 MB per worker per run, against 4.8 MB for the array.
+    """
+
+    def __init__(self, dataset, weights_by_row: np.ndarray):
+        from openpi.training.slb_awr_loss import LOSS_WEIGHT_KEY
+
+        self._dataset = dataset
+        self._w = np.asarray(weights_by_row, dtype=np.float32)
+        self._key = LOSS_WEIGHT_KEY
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, index):
+        i = int(index)
+        w = self._w[i]
+        if not np.isfinite(w):
+            raise KeyError(
+                f"row {i} has no AWR weight. The weights artifact does not cover the rows the "
+                f"sampler is drawing; training would silently reweight or zero this frame."
+            )
+        item = dict(self._dataset[index])
+        item[self._key] = np.float32(w)
+        return item
+
+
 def _unwrap_to_base(dataset):
     """Peel TransformedDataset wrappers to reach the underlying LeRobotDataset."""
     base = dataset
@@ -313,7 +366,11 @@ def build_sampler(dataset, data_config, *, seed: int = 0) -> tuple[RowSampler, d
         episode_from, sidecar, join_index, variant,
         fps=fps, ep_len=ep_len,
         awr_tau=data_config.awr_tau, awr_delta=data_config.awr_delta,
-        render_aligned_rows=getattr(data_config, "slb_render_aligned_rows", False),
+        # NOT getattr(..., False): False selects the branch this module documents as
+        # "LEGACY, measurably wrong by one frame ... never use". DataConfig declares this
+        # field with default True, so read it plainly and let a missing field crash loudly
+        # rather than silently flipping every SLB run onto the wrong row map.
+        render_aligned_rows=data_config.slb_render_aligned_rows,
     )
     weights_by_row = None if weights is None else row_weight_map(rows, weights)
     logging.info(
