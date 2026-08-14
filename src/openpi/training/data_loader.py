@@ -317,6 +317,30 @@ def _check_schedule_unsupported_on_pytorch(data_config: _config.DataConfig) -> N
         )
 
 
+def _check_quality_unsupported_on_pytorch(data_config: _config.DataConfig) -> None:
+    """The CFG arm is defined on the jax path only, and its central claim is why.
+
+    Coverage neutrality -- "this arm draws exactly the rows the round-1 control draws, in the same
+    order" -- is a statement about `RowSampler(plan_rows_from_roots(...), seed)`, which is built in
+    the jax branch of `create_torch_data_loader` and nowhere else. Under `framework="pytorch"` the
+    pretrain row plan is never consulted at all (that branch goes straight to a
+    `DistributedSampler` over the whole concatenated dataset, idle frames included), so neither
+    the arm nor its control draws that sequence and the comparison the experiment rests on simply
+    does not hold. Nothing in a loss curve says so.
+
+    `scripts/train_pytorch.py` calls this function's caller with `framework="pytorch"`.
+    """
+    quality_path = getattr(data_config, "pretrain_quality_path", None)
+    if quality_path:
+        raise ValueError(
+            f"pretrain_quality_path={quality_path!r} is set, but the PyTorch training path "
+            f"(scripts/train_pytorch.py, framework='pytorch') does not build the pretrain row "
+            f"plan -- only the jax branch of create_torch_data_loader does. This arm's whole "
+            f"claim is that it draws the round-1 control's rows in the control's order, and that "
+            f"is not true here. Use scripts/train.py (framework='jax') for the CFG arm."
+        )
+
+
 def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
     """A resume replays the schedule from row 0 while the optimiser continues from step k.
 
@@ -455,6 +479,9 @@ def create_torch_data_loader(
         # through here would silently train as the plain control. See train_pytorch.py, which
         # is the only caller of this branch.
         _check_schedule_unsupported_on_pytorch(data_config)
+        # ...and the CFG arm likewise: its coverage-neutrality claim is about the RowSampler this
+        # branch never builds. See `_check_quality_unsupported_on_pytorch`.
+        _check_quality_unsupported_on_pytorch(data_config)
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,

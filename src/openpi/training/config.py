@@ -157,6 +157,18 @@ class DataConfig:
     # NAME to the artifact it was actually launched with, so handing `pi05_axis_drop` an anneal
     # artifact would otherwise train anneal under the drop name and pass every other check.
     pretrain_expected_mode: str | None = None
+    # A precomputed dense per-row quality tag (`axis.dataset.build_quality_labels`): uint8 over
+    # the CONCATENATED corpus row space, 0 = dropped out (the unconditional branch), 1..5 =
+    # `Quality: q`, 255 = not trainable. When set, the loader wraps the raw dataset so each sample
+    # carries its tag and prepends `quality_conditioning.AxisQualityConditioning` to the transform
+    # chain (via `wrap_and_transform`, which is the only supported way to assemble the two).
+    #
+    # It changes WHAT THE MODEL SEES, never WHICH ROWS ARE DRAWN -- which is why it is a separate
+    # field from `pretrain_schedule_path`, why the two are mutually exclusive, and why a config
+    # carrying it still falls through to the control's own `RowSampler`. That coverage neutrality
+    # is this arm's distinguishing property against its round-2 siblings and is asserted rather
+    # than assumed (config_cfg_arm_test.py, data_loader_cfg_test.py).
+    pretrain_quality_path: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -561,6 +573,18 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # data_loader.py -- binds the config NAME to the artifact's actual content, since nothing
     # else does (see DataConfig.pretrain_expected_mode).
     expected_mode: str | None = None
+    # Path to a quality-tag artifact (`axis.dataset.build_quality_labels`), or None for the
+    # untagged control. NOT an env var, for the same reason `schedule_path` is not: a checkpoint's
+    # arm must be recoverable from its config (name + this field) alone -- and the SLB path's
+    # `SLB_CFG_METADATA` switch is explicitly the pattern NOT to copy here.
+    quality_path: str | None = None
+    # True for `pi05_axis_cfg`: `create()` raises if this is set but `quality_path` is empty, so a
+    # launch that forgets the artifact flag fails loudly instead of quietly training the plain
+    # control under the arm's name (the only other symptom is an ABSENT log line). There is no
+    # `expected_mode` twin: the artifact's own filename<->reward_id binding
+    # (`QualityTags.check_reward_id`) is what separates `cfg_v2` from `cfg_phase`, which share
+    # this one config name.
+    quality_required: bool = False
     # The config NAME whose norm stats this one must read (round 1's, for the round-2 schedule
     # arms), or None to keep its own. A name, not a path, deliberately: `TrainConfig.assets_dirs`
     # is `assets_base_dir / name`, so resolving the sibling from the `assets_dirs` handed to
@@ -617,8 +641,47 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
                 "supervision (which rows, in what order); combining it with loss reweighting "
                 "would make this run two arms at once."
             )
+        if self.quality_required and not self.quality_path:
+            # A launch that omits --data.quality_path trains the plain BC control under this arm's
+            # name; the log line announcing the conditioning simply never appears.
+            raise ValueError(
+                "this is a named quality-conditioning arm but quality_path is not set. Pass "
+                "--data.quality_path=<artifact path> at launch (the quality_<reward_id>.npz "
+                "built by axis.dataset.build_quality_labels); otherwise this run trains the "
+                "plain BC control under the arm's name."
+            )
+        if self.quality_path and not self.roots_index:
+            # The tag array is dense over the CONCATENATED multi-task dataset, which only exists
+            # when roots_index names its parts. Without it the pretrain branch of the loader never
+            # runs, the artifact is silently ignored, and the arm trains as the plain baseline.
+            raise ValueError(
+                "quality_path is set but roots_index is not; the tag array is dense over the "
+                "concatenated pretrain dataset, so it is meaningless without one "
+                "(set $AXIS_PRETRAIN_ROOTS_INDEX)."
+            )
+        if self.quality_path and self.schedule_path:
+            raise ValueError(
+                "quality_path and schedule_path are both set. CFG's distinguishing property is "
+                "coverage neutrality -- it draws exactly the rows the round-1 control draws, in "
+                "the same order -- and a schedule replaces that draw entirely. Combining them "
+                "would silently give up the one thing that makes this arm comparable to the "
+                "control, and would make the run two arms at once."
+            )
+        if self.quality_path and self.awr_weights:
+            raise ValueError(
+                "quality_path and awr_weights are both set; conditioning and loss reweighting "
+                "are two different mechanisms, so this run would be two arms at once."
+            )
         state_col = "state_eef" if self.eef_action else "observation.state"
         action_col = "action_eef" if self.eef_action else "action"
+        # NO quality conditioning transform here, deliberately, and this is load-bearing.
+        # `quality_conditioning.wrap_and_transform` -- the only supported way to assemble the
+        # dataset wrapper and `AxisQualityConditioning`, and what the loader calls -- PREPENDS the
+        # conditioning to the transform list it is handed, which is `transform_dataset`'s and
+        # therefore starts with these very inputs. Heading the repack group as well would append
+        # the tag TWICE ("...\nQuality: 5\nQuality: 5"): in range, tokenizable, unmatched by any
+        # eval-time prompt, and silent. So the repack group stays exactly the control's, with and
+        # without an artifact -- asserted in config_cfg_arm_test.py.
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -652,6 +715,7 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             pretrain_ranges_path=self.ranges_path,
             pretrain_schedule_path=self.schedule_path,
             pretrain_expected_mode=self.expected_mode,
+            pretrain_quality_path=self.quality_path,
         )
 
 
@@ -1114,6 +1178,7 @@ def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
     eef: bool = False, paper: bool = False, name: str | None = None,
     schedule_required: bool = False, expected_mode: str | None = None,
+    quality_required: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1166,9 +1231,12 @@ def _axis_pretrain_config(
     that value (measured: one unique post-warmup value, float32(5e-5)). No new schedule class
     is needed and the warmup ramp stays the one every other openpi config uses.
 
-    `name` overrides the flag-composed name for the index-schedule arms (`pi05_axis_drop`,
-    `pi05_axis_anneal`), which are not distinguished by any flag this factory takes -- their arm
-    lives in `data.schedule_path`, supplied per run. Passing it also switches the AWR weights off
+    `name` overrides the flag-composed name for the round-2 arms (`pi05_axis_drop`,
+    `pi05_axis_anneal`, `pi05_axis_cfg`), which are not distinguished by any flag this factory
+    takes -- their arm lives in `data.schedule_path` / `data.quality_path`, supplied per run.
+    (`pi05_axis_cfg` is the coverage-neutral one: it carries no schedule, so it falls through to
+    the control's own `RowSampler` and draws exactly the control's rows.)
+    Passing it also switches the AWR weights off
     at the source: those arms inherit the launch environment, and reading
     $AXIS_PRETRAIN_AWR_WEIGHTS there would silently add round 1's loss reweighting on top of the
     schedule (`AxisFrankaPretrainDataConfig.create` refuses that combination anyway, so the
@@ -1236,6 +1304,11 @@ def _axis_pretrain_config(
             # and `DataConfig.pretrain_expected_mode`).
             schedule_required=schedule_required,
             expected_mode=expected_mode,
+            # Named quality arm (`pi05_axis_cfg`) only: require the artifact flag at launch. No
+            # `expected_mode` twin here -- the artifact's own filename<->reward_id binding
+            # (quality_conditioning.QualityTags.check_reward_id) is what separates `cfg_v2` from
+            # `cfg_phase`, which share this one config name.
+            quality_required=quality_required,
             # NB: for every arm but the round-2 schedule ones the `assets` above is the empty
             # default -> own norm stats (compute_norm_stats), NOT pi05_droid's. See the class
             # docstring / reports/pretrain_dataloader_design.md.
@@ -1386,6 +1459,28 @@ _CONFIGS = [
                           name="pi05_axis_drop", schedule_required=True, expected_mode="drop"),
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
                           name="pi05_axis_anneal", schedule_required=True, expected_mode="anneal"),
+    #
+    # ROUND-2 MECHANISM 3: pi0.7 quality conditioning. Same recipe and budget as the two arms
+    # above (asserted against `pi05_axis_drop` itself in config_cfg_arm_test.py, so no
+    # hyper-parameter can drift in unnoticed), differing from them only in the mechanism: the tag
+    # rides the PROMPT instead of replacing the row draw.
+    #
+    # THE ONLY COVERAGE-NEUTRAL ROUND-2 ARM, and that is its distinguishing claim. It carries no
+    # schedule and no AWR weights, so the pretrain branch of `create_torch_data_loader` falls
+    # through to `RowSampler(rows, seed)` -- the round-1 control's own sampler, at the same seed
+    # -- giving a byte-identical row sequence and 100% coverage, where its siblings each carry a
+    # disclosed coverage asymmetry. `create()` REFUSES `quality_path` together with either of
+    # those two fields rather than leaving the claim to a convention.
+    #
+    # Both CFG rewards (`cfg_v2`, `cfg_phase`) run under this ONE name; which one a run used is
+    # in `data.quality_path`, bound to the artifact's own `meta["reward_id"]` by
+    # `QualityTags.check_reward_id`. `quality_required=True` makes a launch that forgets the flag
+    # fail loudly instead of training the plain BC control under this name.
+    #
+    # WARMUP IS NOT ROUND 1's HERE either -- see the schedule arms above; the arm TOML must carry
+    # the same `lr_schedule.*` overrides.
+    _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
+                          name="pi05_axis_cfg", quality_required=True),
     # INFERENCE-ONLY: serve the pi05_axis_pretrain_eef checkpoint to the LIBERO-Plus client.
     _axis_eef_libero_serve_config(),
     #

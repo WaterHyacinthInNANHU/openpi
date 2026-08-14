@@ -304,6 +304,24 @@ def test_pytorch_framework_without_a_schedule_does_not_raise():
     _data_loader._check_schedule_unsupported_on_pytorch(data_config)  # must not raise
 
 
+def test_pytorch_framework_with_quality_conditioning_raises():
+    """The CFG arm's coverage-neutrality claim is defined against the jax path only.
+
+    The pretrain row plan (`plan_rows_from_roots` -> `RowSampler`) is built in the jax branch of
+    `create_torch_data_loader` and nowhere else, so under `framework="pytorch"` neither the arm
+    nor its control draws the row sequence the arm claims to share -- the comparison the whole
+    experiment rests on does not hold there, and nothing in a loss curve says so.
+    """
+    data_config = dataclasses.replace(_config.DataConfig(), pretrain_quality_path="quality_v2.npz")
+    with pytest.raises(ValueError, match="pytorch"):
+        _data_loader._check_quality_unsupported_on_pytorch(data_config)
+
+
+def test_pytorch_framework_without_quality_conditioning_does_not_raise():
+    data_config = _config.DataConfig()
+    _data_loader._check_quality_unsupported_on_pytorch(data_config)  # must not raise
+
+
 # --- the filename<->reward_id binding -----------------------------------------------------------
 #
 # `_check_schedule_mode` cannot separate `drop_v2` from `drop_phase`: same config name
