@@ -17,6 +17,7 @@ import pytest
 import torch
 
 import openpi.transforms as _transforms
+from openpi.models import tokenizer as _tokenizer
 from openpi.training.quality_conditioning import N_BINS
 from openpi.training.quality_conditioning import NO_TAG
 from openpi.training.quality_conditioning import NOT_TRAINABLE
@@ -24,6 +25,7 @@ from openpi.training.quality_conditioning import QUALITY_KEY
 from openpi.training.quality_conditioning import AxisQualityConditioning
 from openpi.training.quality_conditioning import QualityTaggedDataset
 from openpi.training.quality_conditioning import QualityTags
+from openpi.training.quality_conditioning import check_token_budget
 from openpi.training.quality_conditioning import wrap_and_transform
 
 
@@ -568,3 +570,177 @@ def test_wrap_and_transform_still_binds_the_artifact_to_the_corpus(tmp_path):
     tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 3]))
     with pytest.raises(ValueError, match="corpus mismatch"):
         wrap_and_transform(concat, tags, [])
+
+
+# ---------------------------------------------------------------------------------------------
+# The token-budget guard: pi0.5 uses max_token_len=200 (Pi0Config.__post_init__, non-KI), and
+# PaligemmaTokenizer.tokenize truncates from the right with only a `logging.warning` -- deleting
+# the tail of "Task: {text}, State: {32 ints};\nAction: " (the `Action:` marker) for the CFG arm
+# ONLY, since only the CFG arm lengthens the prompt. `check_token_budget` must raise instead.
+#
+# `_tok` below is a REAL PaligemmaTokenizer, never skipped for a missing sentencepiece model: a
+# skipped guard test is indistinguishable from a passing one, the same lesson as the anti-inert
+# tripwire above. Round-1 training has already populated the download cache on every box this
+# runs on.
+# ---------------------------------------------------------------------------------------------
+
+
+def _tok(max_len: int) -> _tokenizer.PaligemmaTokenizer:
+    return _tokenizer.PaligemmaTokenizer(max_len)
+
+
+def test_returns_the_margin_when_every_tagged_prompt_fits():
+    """The happy path. Also pins that the margin is measured against the TAGGED prompt: if it
+    were measured against the untagged one, `margin < untagged` below could never hold, because
+    both sides would be the same number. Caught by mutation (see report)."""
+    margin = check_token_budget(["pick up the bowl"], 200, tokenizer=_tok(200))
+    assert margin > 0
+    untagged = check_token_budget(["pick up the bowl"], 200, q=None, tokenizer=_tok(200))
+    assert margin < untagged
+
+
+def test_a_prompt_that_overflows_raises_and_names_the_margin():
+    """Catches: relying on the upstream truncation warning. Upstream logs and continues; here the
+    only acceptable behaviour is a raise, because the truncated token is the `Action:` marker.
+    The prompt genuinely overflows a 64-token budget (measured raw length 235 with worst-case
+    state) -- this is not a test-only artifact of a broken measurement."""
+    long_prompt = " ".join(["place the red mug on the second shelf of the wooden cabinet"] * 8)
+    with pytest.raises(ValueError, match="token budget") as excinfo:
+        check_token_budget([long_prompt], 64, tokenizer=_tok(64))
+    assert "64" in str(excinfo.value)
+
+
+def test_it_raises_rather_than_warning(caplog):
+    """Catches: a copy of upstream's `logging.warning` path sneaking in here, OR a same-budget
+    tokenizer being used for measurement (which would run upstream's OWN warning before this
+    function ever gets to raise). The spec's rule is absolute -- every guard raises, and no
+    warning of any kind reaches the log, upstream's included.
+
+    The brief's own version of this test only checked `pytest.raises`, never `caplog.records` --
+    so it could not have caught either bug. Fixed here to actually assert silence; mutation-
+    tested (see report) by measuring with `tokenizer` directly instead of an oversized probe,
+    which reproduces upstream's warning and fails this assertion.
+    """
+    long_prompt = " ".join(["place the red mug on the shelf"] * 20)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ValueError):
+            check_token_budget([long_prompt], 48, tokenizer=_tok(48))
+    assert caplog.records == [], [r.message for r in caplog.records]
+
+
+def test_the_tag_is_what_pushes_a_borderline_prompt_over():
+    """The attribution test: the guard must fire on prompts the CONTROL tokenizes fine. Catches a
+    check that tokenizes the bare prompt and therefore can never distinguish the arm's cost.
+
+    Finding the borderline point needs the TRUE, untruncated token count. The brief's own version
+    of this loop read `len(tok.tokenize(prompt, state=...)[0])` as if it were that count -- but
+    `PaligemmaTokenizer.tokenize` always returns an array padded OR truncated to `tok`'s own
+    `max_len`, so that length is the CONSTANT 200 for every prompt, `fits_untagged` is always
+    True, `tagged` is never `> 200`, and the loop runs to exhaustion and fails on every input
+    (verified: this is not hypothetical, the literal brief code was run and always hit
+    `pytest.fail`, regardless of `check_token_budget`'s correctness). A separate, deliberately
+    oversized probe recovers the real count via `mask.sum()` instead.
+    """
+    probe = _tok(4096)
+    state = np.ones(32, np.float32)
+
+    def real_len(text: str) -> int:
+        _, mask = probe.tokenize(text, state=state)
+        return int(mask.sum())
+
+    for n in range(1, 60):
+        prompt = " ".join(["open the drawer"] * n)
+        fits_untagged = real_len(prompt) <= 200
+        tagged = real_len(prompt + "\nQuality: 5")
+        if fits_untagged and tagged > 200:
+            break
+    else:
+        pytest.fail("no borderline prompt found; the tag must cost at least one token")
+    check_token_budget([prompt], 200, q=None, tokenizer=_tok(200))  # control passes
+    with pytest.raises(ValueError, match="token budget"):  # arm does not
+        check_token_budget([prompt], 200, tokenizer=_tok(200))
+
+
+def test_an_empty_prompt_list_raises():
+    """A guard with nothing to check must say so, not pass. Same class as the EACCES swallows: a
+    probe that answers confidently when it should fail."""
+    with pytest.raises(ValueError, match="no prompts"):
+        check_token_budget([], 200, tokenizer=_tok(200))
+
+
+# --- coverage beyond the brief's list -----------------------------------------------------------
+# The brief's five tests all exercise a SINGLE prompt. None of them pin the "MINIMUM margin over
+# the corpus" contract the docstring promises, none pin that the guard reads the same tag spelling
+# the transform actually emits (a drifted reimplementation would check a DIFFERENT string than the
+# one that ships), and none probe the guard's own defensive ceiling. Added below, matching the
+# pattern of the sibling coverage block above this one.
+
+
+def test_the_margin_is_the_worst_prompt_in_the_corpus_not_the_first():
+    """Catches: returning the FIRST prompt's margin, or the last, instead of the minimum over the
+    whole list -- silently passing a corpus whose actual worst prompt overflows because a
+    comfortable early or late entry masked it."""
+    short = "pick up the bowl"
+    long_ = " ".join(["place the red mug on the second shelf of the wooden cabinet"] * 3)
+    margin_short_alone = check_token_budget([short], 200, tokenizer=_tok(200))
+    margin_long_alone = check_token_budget([long_], 200, tokenizer=_tok(200))
+    assert margin_long_alone < margin_short_alone
+    combined = check_token_budget([short, long_, short], 200, tokenizer=_tok(200))
+    assert combined == margin_long_alone
+
+
+def test_the_guard_measures_the_exact_string_the_transform_emits():
+    """Catches: a reimplementation of the tag format drifting from `slb_cfg.apply_metadata`, the
+    one the online transform actually calls. If this check built its own `f"...Quality: {q}"`
+    instead of calling `apply_metadata`, a spelling change to the real tag (e.g. a future added
+    field) would silently stop being covered by the budget guard."""
+    from openpi.training.quality_conditioning import AxisQualityConditioning
+
+    prompt = "pick up the bowl"
+    transform_output = AxisQualityConditioning()({"prompt": prompt, QUALITY_KEY: 5})["prompt"]
+    probe = _tok(4096)
+    state = np.full(32, 1.0, np.float32)
+    expected_n = int(probe.tokenize(transform_output, state=state)[1].sum())
+    margin = check_token_budget([prompt], 200, tokenizer=_tok(200))
+    assert margin == 200 - expected_n
+
+
+def test_a_prompt_beyond_even_the_probes_reach_raises_rather_than_under_report():
+    """Catches: silently trusting a saturated probe's `mask.sum()`, which is a LOWER bound once
+    the probe itself truncates -- reporting a margin computed from that number could read as a
+    (very negative but bounded) ordinary overflow, when the true excess is unknown and could be
+    far larger.
+
+    `match=` deliberately targets the dedicated-branch phrase "own probe length", not just the
+    number 8192: the saturated `n` also gets reported as "tokenizes to 8192 tokens" by the
+    GENERIC overflow message once the branch that names the real cause is removed, since a
+    saturated probe reports exactly `_PROBE_MAX_LEN` either way. Verified by mutation (see
+    report) that matching on the bare number does NOT discriminate the two branches -- both
+    contain "8192" -- while "own probe length" only appears on the dedicated path.
+    """
+    absurd_prompt = " ".join(["open the drawer"] * 4000)
+    with pytest.raises(ValueError, match="own probe length"):
+        check_token_budget([absurd_prompt], 200, tokenizer=_tok(200))
+
+
+def test_q_defaults_to_five(monkeypatch):
+    """Pins the documented default (`slb_cfg.INFER_QUALITY`, what CFG conditions on at
+    inference) against silent drift, e.g. someone "fixing" the signature to `q: int | None = 1`.
+
+    Token cost does not vary across q=1..5 for any of the 1401 real AXIS task names (measured),
+    so comparing MARGINS between the default and an explicit q=5 cannot tell q=1 from q=5 apart
+    -- both would produce the identical number. This spies on the actual value passed to
+    `apply_metadata` instead of inferring it from a margin that cannot carry the signal.
+    """
+    import openpi.training.quality_conditioning as qc
+
+    seen = []
+    real_apply_metadata = qc.apply_metadata
+
+    def spy(prompt, q_ep, mistake, **kwargs):
+        seen.append(q_ep)
+        return real_apply_metadata(prompt, q_ep, mistake, **kwargs)
+
+    monkeypatch.setattr(qc, "apply_metadata", spy)
+    check_token_budget(["pick up the bowl"], 200, tokenizer=_tok(200))
+    assert seen == [5]

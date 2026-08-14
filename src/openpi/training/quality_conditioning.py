@@ -303,6 +303,103 @@ class AxisQualityConditioning(_transforms.DataTransformFn):
         return {**data, "prompt": apply_metadata(data["prompt"], q, None)}
 
 
+# The worst-case discrete state: pi0.5 serialises 32 digitized ints into the prompt
+# (`Task: {text}, State: {32 ints};\nAction: `), and `np.digitize(state, bins=linspace(-1,1,257)
+# [:-1])-1` maps any value >= 1.0 to the top bin, 255 -- 3 characters, the widest spelling
+# (measured: state=-1.0 digitizes to 0, 1 character; the difference is 64 prompt tokens on
+# "pick up the bowl", 79 vs 143). Building the worst case here rather than sampling one makes
+# the guard a bound, not an observation.
+_WORST_STATE_VALUE = 1.0
+
+# `PaligemmaTokenizer.tokenize()` pads OR truncates to ITS OWN configured `max_len` and returns
+# a full-length (tokens, mask) pair either way -- so `len(tokenize(...)[0])` is a CONSTANT equal
+# to that max_len, never the prompt's real token count, and `mask.sum()` saturates at max_len
+# too once truncation happens. A tokenizer sized at (or near) the budget under test therefore
+# cannot tell "exactly fits" apart from "far over, truncated" -- and calling it on an over-budget
+# prompt has ALREADY run upstream's own `logging.warning` before this function gets to raise,
+# which is precisely the warning-not-raise failure this guard exists to replace. So measurement
+# here never tokenizes with a budget-sized tokenizer: it probes with one sized far beyond
+# anything a real corpus prompt plus tag could produce (measured max over all 1401 AXIS task
+# names + worst-case state: ~155 tokens), so upstream's truncation branch can never fire and
+# `mask.sum()` is the TRUE, unclamped count.
+_PROBE_MAX_LEN = 8192
+
+
+def check_token_budget(
+    prompts,
+    max_token_len: int,
+    *,
+    state_dim: int = 32,
+    q: int | None = 5,
+    tokenizer=None,
+) -> int:
+    """Tokenize every corpus prompt WITH the tag and RAISE if any exceeds `max_token_len`.
+
+    `PaligemmaTokenizer.tokenize` truncates from the right and only logs a warning, which under
+    `PYTHONUNBUFFERED` redirection is one line in a ten-hour log. What it truncates is the tail of
+    `"Task: {text}, State: {32 ints};\\nAction: "` -- the `Action:` marker itself -- and it
+    happens for the CFG arm ONLY, because only the CFG arm lengthens the prompt (measured: the
+    tag itself costs 4-5 tokens depending on the prompt's trailing text, e.g. trailing
+    punctuation or whitespace changes how sentencepiece merges across the `\\n` boundary -- NOT
+    a constant, so every corpus prompt has to be measured rather than one representative sample).
+    So this is not a convenience check: it is the difference between an arm and a silently
+    malformed arm.
+
+    Returns the MINIMUM margin in tokens, for the run record. `q=None` measures the untagged
+    prompt, which is what makes "the tag is what pushed it over" a statement a test can make.
+    `q` defaults to 5 (`slb_cfg.INFER_QUALITY`, the value CFG conditions on at inference), and
+    -- measured across all 1401 AXIS task names -- the tag's cost does not vary across q=1..5 for
+    a fixed prompt, only across prompts, so checking one q is not a shortcut that hides risk.
+    """
+    prompts = [str(p) for p in prompts]
+    if not prompts:
+        raise ValueError(
+            "no prompts to check: the token-budget guard would pass vacuously. The artifact must "
+            "carry the corpus's task strings (QualityTags.prompts)."
+        )
+    max_token_len = int(max_token_len)
+    # Only the CLASS is taken from a caller-supplied tokenizer, never the instance: reusing the
+    # instance directly would mean measuring with (or near) the exact budget under test, which is
+    # the ambiguous, warning-triggering case explained above.
+    tokenizer_cls = type(tokenizer) if tokenizer is not None else None
+    if tokenizer_cls is None:
+        from openpi.models import tokenizer as _tok
+
+        tokenizer_cls = _tok.PaligemmaTokenizer
+    probe_max_len = max(_PROBE_MAX_LEN, max_token_len * 2)
+    probe = tokenizer_cls(probe_max_len)
+    state = np.full(int(state_dim), _WORST_STATE_VALUE, dtype=np.float32)
+
+    margin = max_token_len
+    worst = prompts[0]
+    for prompt in prompts:
+        text = prompt if q is None else apply_metadata(prompt, int(q), None)
+        _, mask = probe.tokenize(text, state=state)
+        n = int(np.asarray(mask).sum())
+        if n >= probe_max_len:
+            # The probe itself saturated, so its own truncation branch (and warning) may have
+            # fired and `n` is a lower bound, not the true count. Silently continuing would risk
+            # UNDER-reporting an overflow this severe. Raise and name the fix rather than guess.
+            raise ValueError(
+                f"prompt {prompt[:120]!r} tokenizes to >= this guard's own probe length "
+                f"({probe_max_len}); its true length is unknown. Raise _PROBE_MAX_LEN before "
+                f"trusting a result for a prompt this long."
+            )
+        candidate_margin = max_token_len - n
+        if candidate_margin < margin:
+            margin, worst = candidate_margin, prompt
+    if margin < 0:
+        raise ValueError(
+            f"token budget exceeded by {-margin} tokens: the longest corpus prompt "
+            f"{worst[:120]!r} plus the {('Quality: %d' % q) if q is not None else 'no'} tag "
+            f"tokenizes to {max_token_len - margin} tokens against max_token_len={max_token_len}. "
+            f"PaligemmaTokenizer would truncate from the right, deleting the 'Action:' marker "
+            f"for THIS ARM ONLY -- and it would only log a warning. Raise max_token_len, or "
+            f"shorten the tag."
+        )
+    return margin
+
+
 def wrap_and_transform(dataset, tags: QualityTags, transforms):
     """Build the arm. THE ONLY supported way to assemble these two objects.
 
