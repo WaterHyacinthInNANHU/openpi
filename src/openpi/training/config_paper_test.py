@@ -165,9 +165,13 @@ def test_supervision_arms_are_off_so_the_loss_is_plain_bc(name: str) -> None:
     assert data_config.slb_sidecar_root is None
     assert data_config.slb_task_id is None
     assert data_config.slb_variant == "vanilla"
-    # And no CFG conditioning transform was prepended ahead of the repack.
+    # And no CFG conditioning transform was prepended ahead of the repack. `Rotate180Images` is
+    # permitted AFTER it (stage 2 only): it is an image-orientation transform that touches no
+    # prompt and no loss weight, added 2026-08-14 because the box-local LIBERO build stores frames
+    # 180 degrees from the eval client. See openpi.training.libero_orientation.
     transform_names = [type(t).__name__ for t in data_config.repack_transforms.inputs]
-    assert transform_names == ["RepackTransform"], transform_names
+    assert transform_names[0] == "RepackTransform", transform_names
+    assert set(transform_names) <= {"RepackTransform", "Rotate180Images"}, transform_names
 
 
 def test_vanilla_loss_is_bitwise_the_unweighted_mean() -> None:

@@ -151,6 +151,21 @@ def create_torch_dataset(
     # camera_fixed folder inside a larger HF repo); load it by path via `root=`.
     root = getattr(data_config, "slb_dataset_root", None)
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+
+    # THE DAY-ONE CHECK for LIBERO configs (None everywhere else, so nothing else is touched).
+    # `HF_LEROBOT_HOME` decides which BUILD a repo id resolves to, and the two LIBERO builds
+    # store frames 180 degrees apart. This is the first moment both facts -- what the config
+    # declared and what is actually on disk -- exist in the same process.
+    declared_orientation = getattr(data_config, "libero_image_orientation", None)
+    if declared_orientation is not None:
+        from openpi.training import libero_orientation
+
+        libero_orientation.check_dataset_build(
+            repo_id=repo_id,
+            declared_orientation=declared_orientation,
+            info=dataset_meta.info,
+        )
+
     extra_kwargs = {}
     if root is not None:
         # Our re-rendered SLB videos carry sub-millisecond frame-timestamp jitter that

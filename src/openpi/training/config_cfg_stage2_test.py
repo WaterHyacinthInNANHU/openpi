@@ -114,7 +114,16 @@ def test_the_twin_heads_the_repack_group_with_the_conditioning():
     inputs = _repack_inputs(twin)
     assert isinstance(inputs[0], LiberoQualityConditioning)
     assert isinstance(inputs[1], _transforms.RepackTransform)
-    assert len(inputs) == 2
+    # Exactly ONE conditioning entry, still the claim this length check was protecting: two of
+    # them give `"...\nQuality: 5\nQuality: 5"`. Spelled by counting the conditioning rather than
+    # the group, because the group also carries `Rotate180Images` since 2026-08-14 -- an image
+    # transform that tags nothing (see openpi.training.libero_orientation).
+    assert sum(isinstance(t, LiberoQualityConditioning) for t in inputs) == 1
+    assert [type(t).__name__ for t in inputs] == [
+        "LiberoQualityConditioning",
+        "RepackTransform",
+        "Rotate180Images",
+    ]
 
 
 def test_the_twin_tags_the_quality_inference_asks_for():
@@ -134,14 +143,22 @@ def test_the_twin_keeps_stage_ones_dropout_rates():
 
 
 def test_the_parent_repacks_exactly_what_it_repacked_before():
-    """The other half of the inert test: the untagged parent's repack group must be the bare
-    `RepackTransform`, byte-identical to `pi05_libero`'s. Catches a transform that tags
-    unconditionally, which would silently condition all five other arms too."""
+    """The other half of the inert test: the untagged parent carries NO conditioning, and repacks
+    exactly what `pi05_libero` repacks. Catches a transform that tags unconditionally, which would
+    silently condition all five other arms too.
+
+    Since 2026-08-14 the parent's group also carries `Rotate180Images` -- both stage-2 legs read
+    the box-local LIBERO build, which stores frames 180 degrees from the eval client. That is an
+    image transform, not a conditioning one, and it is on BOTH legs, so the "conditioning is the
+    only difference" claim is unchanged; it is asserted below by comparing against upstream's
+    group PLUS the rotation rather than by a length.
+    """
     parent, upstream = _config.get_config(PARENT), _config.get_config("pi05_libero")
     inputs = _repack_inputs(parent)
-    assert len(inputs) == 1
+    assert not any(isinstance(t, LiberoQualityConditioning) for t in inputs)
     assert isinstance(inputs[0], _transforms.RepackTransform)
-    assert inputs == _repack_inputs(upstream)
+    assert inputs[:1] == _repack_inputs(upstream), "the repack MAP drifted from upstream's"
+    assert [type(t).__name__ for t in inputs] == ["RepackTransform", "Rotate180Images"]
 
 
 def test_the_rest_of_the_pipeline_is_the_parents():

@@ -26,6 +26,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.libero_orientation as libero_orientation
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -169,6 +170,14 @@ class DataConfig:
     # is this arm's distinguishing property against its round-2 siblings and is asserted rather
     # than assumed (config_cfg_arm_test.py, data_loader_cfg_test.py).
     pretrain_quality_path: str | None = None
+
+    # --- LIBERO image orientation (see openpi.training.libero_orientation) ---
+    # "upright" / "inverted": which way up the LIBERO build this config reads stores its frames.
+    # Set by `LeRobotLiberoDataConfig` from its own declaration and carried here for ONE consumer
+    # -- `create_torch_dataset`, which is the first and only place the declaration can be checked
+    # against the dataset that `HF_LEROBOT_HOME` actually resolved. None for every non-LIBERO
+    # config, which skips the check entirely.
+    libero_image_orientation: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -395,6 +404,27 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
     extra_delta_transform: bool = False
 
+    # WHICH WAY UP THE DATASET THIS CONFIG READS STORES ITS FRAMES -- "upright" or "inverted".
+    #
+    # Not a rotate/don't-rotate switch: the 180 degree turn is DERIVED from this
+    # (`libero_orientation.rotation_needed`), so a config cannot declare the data upright and
+    # rotate it anyway. Default "upright" means no rotation, which keeps every config that reads
+    # Physical Intelligence's official copy -- `pi05_libero`, `pi0_libero`, `pi0_fast_libero` and
+    # the serve configs -- byte-identical to what it was; PI's own converter already baked the
+    # rotation in.
+    #
+    # "inverted" is for the stage-2 arms, which read the box-local re-conversion at
+    # /data/lerobot_hdf5 (HF_LEROBOT_HOME in axis_stage2.sh). Same repo id, opposite convention,
+    # because that copy was converted straight from the LIBERO HDF5 with no flip after lerobot
+    # 0.4.4 rejected PI's v2.0 copy. This is a run-record field on purpose: reading a registry
+    # entry six months from now must answer "which way up did this run train?" without going to
+    # the box to look at a dataset.
+    #
+    # The model-facing convention is UPRIGHT for all three stages -- the AXIS stage-1 corpus
+    # stores right-side-up with no flip anywhere in its input path, and the LIBERO-Plus eval
+    # client flips MuJoCo's render before it sends anything. See `libero_orientation`.
+    dataset_image_orientation: str = libero_orientation.UPRIGHT
+
     # STAGE-2 CFG TWIN ONLY; None for every other LIBERO arm, which must stay byte-identical.
     #
     # A CONSTANT π0.7 quality tag, not a per-row one: stage 2 finetunes on uniformly expert data,
@@ -453,6 +483,15 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             quality_inputs = [
                 quality_conditioning.LiberoQualityConditioning(q_ep=int(self.quality_tag))
             ]
+        # THE ORIENTATION FIX, and it is deliberately in the repack group rather than in
+        # `data_transforms`: inference never runs repack transforms (`serve_policy.py` passes
+        # none), and the eval client ALREADY flips MuJoCo's render, so a rotation that also ran at
+        # serve time would apply twice and leave us upside-down again with a new explanation.
+        # It sits AFTER the repack, on the canonical `observation/...` keys, and rotates BOTH of
+        # them -- see `libero_orientation.Rotate180Images`.
+        rotate_inputs: list[_transforms.DataTransformFn] = []
+        if libero_orientation.rotation_needed(self.dataset_image_orientation):
+            rotate_inputs = [libero_orientation.Rotate180Images()]
         repack_transform = _transforms.Group(
             inputs=[
                 *quality_inputs,
@@ -465,6 +504,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "prompt": "prompt",
                     }
                 ),
+                *rotate_inputs,
             ]
         )
 
@@ -508,6 +548,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            # Carried so `create_torch_dataset` can refuse a build that is not the one this
+            # declaration is about. The transform above is derived from the SAME field, so the
+            # check and the rotation cannot drift apart.
+            libero_image_orientation=self.dataset_image_orientation,
         )
 
 
@@ -1749,6 +1793,13 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+            # Reads the box-local re-conversion (HF_LEROBOT_HOME=/data/lerobot_hdf5), which stores
+            # frames 180 degrees from the eval client and from the AXIS stage-1 corpus. See
+            # `LeRobotLiberoDataConfig.dataset_image_orientation`. The run this config already
+            # produced trained upside-down and is retracted; this is not a schedule change, it is
+            # a statement of what the data on disk is, so it is corrected in place rather than
+            # forked into a twin.
+            dataset_image_orientation="inverted",
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1811,6 +1862,13 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+            # NOT a recipe change and NOT a deviation from Table 11 -- a statement about the bytes
+            # on disk. This arm reads the box-local re-conversion at /data/lerobot_hdf5, which
+            # stores frames 180 degrees from PI's official copy, so the pipeline rotates them back
+            # to the UPRIGHT convention that stage 1 and the eval client already use. The three
+            # stage-2 runs made before this field existed trained upside-down (0/12 through the
+            # client's rotation, 11/12 with the client's rotation removed) and are retracted.
+            dataset_image_orientation="inverted",
         ),
         batch_size=64,
         # Byte-identical to upstream `pi05_libero`'s schedule; see the note above.
@@ -1858,6 +1916,11 @@ _CONFIGS = [
             # transform's own default IS that constant, and config_cfg_stage2_test.py pins the
             # two equal so this literal cannot drift away from what inference asks for.
             quality_tag=5,
+            # NOT a treatment difference either: the same statement about the same bytes on disk
+            # as the parent's. If these two ever disagree the CFG arm would be the only stage-2
+            # leg trained at a different orientation, which config_cfg_stage2_test.py's field-by-
+            # field diff would call a second treatment. See the parent for the measurement.
+            dataset_image_orientation="inverted",
             # NOT a treatment difference -- the opposite. This is what makes the twin READ the
             # parent's norm stats instead of resolving to its own (nonexistent) assets dir, so
             # the two stage-2 legs are normalised identically. See the field's own comment.
