@@ -28,14 +28,18 @@ def _input_chain(
     data_config: _config.DataConfig,
     norm_stats: dict[str, transforms.NormStats],
     cfg_label: int | None,
+    quality_tag: int | None = None,
+    quality_drop_all: bool = False,
 ) -> list[transforms.DataTransformFn]:
     """Build the inference input chain, optionally carrying a fixed CFG advantage tag.
 
     Single source of truth for BOTH guidance branches: the conditional and unconditional
-    chains are two calls that differ only in `cfg_label`, so nothing except the prompt tag
-    can drift between them. Guidance compares two velocities that are supposed to share
-    everything but the prompt; if the chains were spelled out twice, any later edit to one
-    would silently turn guidance into a comparison of two unrelated inputs.
+    chains are two calls that differ only in the tag argument (`cfg_label`, or
+    `quality_drop_all` for the π0.7 route), so nothing except the prompt tag can drift
+    between them. Guidance compares two velocities that are supposed to share everything but
+    the prompt; if the chains were spelled out twice, any later edit to one would silently
+    turn guidance into a comparison of two unrelated inputs. There is exactly ONE `return`
+    below for that reason -- the branches choose a tag, never a chain.
 
     The tag sits directly after `InjectDefaultPrompt` -- as early as training applies it
     (see AxisFrankaSlbDataConfig, where SlbCfgConditioning heads the repack group) and
@@ -43,10 +47,39 @@ def _input_chain(
     when `prompt` is absent; both branches then no-op identically, so a missing prompt
     degrades guidance to plain conditional sampling rather than to a wrong tag.
     """
+    cfg_tag: list[transforms.DataTransformFn]
+    # π0.7 QUALITY CONDITIONING (the round-2 CFG arms). Selected by a NAMED serve config plus an
+    # explicit flag -- never by an environment variable, because a checkpoint's arm must be
+    # recoverable from what it was launched with. Checked FIRST so `SLB_CFG_METADATA` being
+    # exported on the box cannot redirect this route into the SLB spelling, which appends a
+    # `Mistake` token neither stage of this arm ever trained.
+    if quality_tag is not None:
+        if cfg_label is not None:
+            raise ValueError(
+                "quality_tag and cfg_label are both set: two conditioning schemes at once, and "
+                "the served arm would not be recoverable from the config it was launched with"
+            )
+        # Local import: `quality_conditioning` imports `openpi.transforms` and is reached only by
+        # this one route, matching how the training factories reach it.
+        from openpi.training.quality_conditioning import FixedQualityConditioning
+
+        cfg_tag = [
+            FixedQualityConditioning(q_ep=int(quality_tag), drop_all=bool(quality_drop_all))
+        ]
+    elif quality_drop_all:
+        # The unconditional half of a quality-guided pair, built without the tag it is the
+        # counterpart OF. Silently this would be the plain chain -- identical to the conditional
+        # one -- so (v_cond - v_uncond) == 0 and guidance vanishes at every β, i.e. a sweep that
+        # reproduces the β = 1 cell at every scale and reports four distinct numbers for it.
+        raise ValueError(
+            "quality_drop_all=True with quality_tag=None: this is the unconditional branch of a "
+            "pair whose conditional branch carries no tag, so the two chains would be identical "
+            "and guidance would vanish at every scale."
+        )
     # π0.7 metadata mode (env SLB_CFG_METADATA=1): serve with quality=max/mistake=no on the
     # conditional branch and the bare prompt on the unconditional branch (drop_all), matching
     # SlbCfgMetadataConditioning at train time. Else the legacy single advantage tag.
-    if cfg_label is None:
+    elif cfg_label is None:
         cfg_tag = []
     elif _slb_cfg.metadata_enabled():
         cfg_tag = [_slb_cfg.FixedCfgMetadataConditioning(drop_all=(cfg_label == _slb_cfg.NULL_LABEL))]
@@ -73,6 +106,7 @@ def create_trained_policy(
     pytorch_device: str | None = None,
     cfg_conditioning: bool = False,
     guidance_scale: float = 0.0,
+    quality_tag: int | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -98,16 +132,35 @@ def create_trained_policy(
             injected when w != 0, keeping models whose `sample_actions` has no
             `guidance_scale` parameter (pi0-FAST, the PyTorch path) working untouched.
 
+            NOTE THE OFF-BY-ONE. π0.7's β is the TOTAL conditional weight, i.e. the `(1 + w)`
+            above, so **β = 1 + guidance_scale** and this argument takes `β - 1`. Handing β
+            straight through turns a β = 1.3 cell into β = 2.3 and nothing reports it, which is
+            why `beta` is published in `policy_metadata` beside `guidance_scale`.
+        quality_tag: π0.7 quality bin for the round-2 CFG arms (5 = what both stages condition
+            on, 3 = the placebo cell). Appends `"\\nQuality: {q}"` to the conditional branch and
+            builds the bare-prompt unconditional branch. A NAMED argument, never an environment
+            variable: it takes precedence over the `SLB_CFG_METADATA` route -- which additionally
+            appends a `Mistake` token this arm never trained -- so an exported variable on the
+            box cannot change what a launched run is conditioning on.
+
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
-    if guidance_scale != 0.0 and not cfg_conditioning:
+    if quality_tag is not None and cfg_conditioning:
+        raise ValueError(
+            "quality_tag and cfg_conditioning are both set: two conditioning schemes at once, "
+            "and the served arm would not be recoverable from the config it was launched with"
+        )
+    if guidance_scale != 0.0 and not cfg_conditioning and quality_tag is None:
         # Without the tag the two branches are the same input, (v_cond - v_uncond) == 0 and
-        # guidance vanishes at every scale -- i.e. a `cfg` sweep that silently reproduces
-        # vanilla. That is exactly the failure this plumbing exists to remove, so refuse it.
-        raise ValueError("guidance_scale != 0 requires cfg_conditioning=True")
+        # guidance vanishes at every scale -- i.e. a β sweep that silently reproduces the
+        # β = 1 cell four times over. That is exactly the failure this plumbing exists to
+        # remove, so refuse it.
+        raise ValueError(
+            "guidance_scale != 0 requires cfg_conditioning=True or a quality_tag"
+        )
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     # Check if this is a PyTorch model by looking for model.safetensors
@@ -144,12 +197,22 @@ def create_trained_policy(
         "norm_stats": norm_stats,
     }
     input_transforms = _input_chain(
-        **chain_kwargs, cfg_label=CFG_POSITIVE_LABEL if cfg_conditioning else None
+        **chain_kwargs,
+        cfg_label=CFG_POSITIVE_LABEL if cfg_conditioning else None,
+        quality_tag=quality_tag,
     )
-    uncond_transforms = _input_chain(**chain_kwargs, cfg_label=_slb_cfg.NULL_LABEL) if cfg_conditioning else None
+    if quality_tag is not None:
+        # Same call, same tag, one field apart -- see `_input_chain`'s docstring.
+        uncond_transforms = _input_chain(
+            **chain_kwargs, cfg_label=None, quality_tag=quality_tag, quality_drop_all=True
+        )
+    elif cfg_conditioning:
+        uncond_transforms = _input_chain(**chain_kwargs, cfg_label=_slb_cfg.NULL_LABEL)
+    else:
+        uncond_transforms = None
 
     metadata = train_config.policy_metadata
-    if cfg_conditioning:
+    if cfg_conditioning or quality_tag is not None:
         # Served over a websocket, the sampling config is invisible to the rollout driver.
         # Publishing it lets the driver refuse to label a w=2 run as w=0 (or vice versa).
         sample_kwargs = dict(sample_kwargs or {})
@@ -160,6 +223,13 @@ def create_trained_policy(
             "cfg_conditioning": True,
             "guidance_scale": float(guidance_scale),
         }
+        if quality_tag is not None:
+            metadata["quality_tag"] = int(quality_tag)
+            # THE PAPER'S PARAMETER, recorded ALONGSIDE w rather than instead of it. β is what
+            # the sweep and the write-up name; w is what openpi's arithmetic takes. Publishing
+            # only one of them is how a β = 1.3 cell gets reported as β = 2.3 with every
+            # artifact agreeing.
+            metadata["beta"] = 1.0 + float(guidance_scale)
 
     return _policy.Policy(
         model,

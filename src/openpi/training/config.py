@@ -1878,6 +1878,45 @@ _CONFIGS = [
         num_train_steps=30_000,
         fsdp_devices=8,
     ),
+    # INFERENCE-ONLY config that serves the STAGE-2 CFG checkpoint above to the LIBERO-Plus
+    # client, with the π0.7 quality tag selected BY NAME.
+    #
+    # WHY A CONFIG AND NOT A FLAG ON pi05_libero: round 2 permits no env-var mode switches, and
+    # the existing serve-time π0.7 spelling is reachable only through `SLB_CFG_METADATA`. The arm
+    # a checkpoint was served under has to be recoverable from the launch line, so the mode is
+    # chosen by this name plus `--quality-tag`.
+    #
+    # IT MIRRORS `pi05_libero`, NOT `pi05_axis_eef_libero_serve`. That other serve config is
+    # action_horizon=16 and belongs to the non-paper stage-1 arm; what this serves is a
+    # HORIZON-10 stage-2 checkpoint. Cloning the 16 would emit chunks of the wrong length with no
+    # error anywhere -- plausible rollout numbers that mean nothing. `model` and `data.repo_id`
+    # are pinned equal to `pi05_libero_axisinit_paper_cfg`'s in policy_cfg_quality_test.py.
+    #
+    # A SECOND LITERAL, not `dataclasses.replace(pi05_libero, ...)`, for the same reason as the
+    # stage-2 twin: a derived config makes the parity test vacuously true. If you edit
+    # `pi05_libero`'s model or data, edit this too -- the test will say so.
+    #
+    # NO `quality_tag=` ON THE DATA CONFIG. That field wires `LiberoQualityConditioning` into
+    # `repack_transforms`, which inference never runs (`serve_policy.py` passes no
+    # repack_transforms), so it would be inert here AND it carries a dropout that has no meaning
+    # at serve time. The serve-time tag comes from `policy_config._input_chain`, which also
+    # builds the paired unconditional branch. Pinned by a test.
+    #
+    # Serve: scripts/serve_policy.py --env LIBERO --quality-tag 5 --guidance-scale <beta - 1>
+    #        policy:checkpoint --policy.config pi05_axis_cfg_libero_serve --policy.dir <ckpt>
+    # NOTE beta = 1 + guidance_scale; see conf/experiments/onelayer_v3_round2_cfg_eval.toml.
+    TrainConfig(
+        name="pi05_axis_cfg_libero_serve",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            # -> asset_id "physical-intelligence/libero", which is the key `checkpoints.save_assets`
+            # wrote the stage-2 norm stats under, so `create_trained_policy` reads the served
+            # CHECKPOINT's own stats rather than any config-local assets dir.
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+    ),
     #
     # Fine-tuning AXIS Franka SLB configs (pi0.5 LoRA, HF-rendered Franka dataset).
     #

@@ -632,3 +632,66 @@ class LiberoQualityConditioning(_transforms.DataTransformFn):
             # emit `Quality: 0`.
             return data
         return {**data, "prompt": apply_metadata(data["prompt"], int(self.q_ep), None)}
+
+
+# =================================================================================================
+# SERVE TIME (the round-2 β sweep). No dropout, no artifact -- one constant tag, and its paired
+# unconditional spelling. Built by `policy_config._input_chain`, never by hand.
+# =================================================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class FixedQualityConditioning(_transforms.DataTransformFn):
+    """Serve-time quality tag: quality ONLY, no `Mistake` component.
+
+    Conditional branch = `Quality: q`; unconditional branch = the SAME object with
+    `drop_all=True`, which leaves the prompt bare. Both branches are built by one call site
+    (`policy_config._input_chain`) so the two guidance inputs differ in this one field and in
+    nothing else -- guidance compares two velocities that are supposed to share everything but
+    the prompt, and branches spelled out separately drift.
+
+    DISTINCT FROM `slb_cfg.FixedCfgMetadataConditioning`, which appends a `Mistake` token as
+    well. Neither stage of this arm ever trains a `Mistake` component, so serving one would
+    condition on a string the model has never seen -- and that transform reaches the serve path
+    ONLY through the `SLB_CFG_METADATA` environment variable, which round 2 forbids because a
+    checkpoint's arm must be recoverable from what it was launched with.
+
+    A missing `prompt` NO-OPS here rather than raising, deliberately unlike the train-time
+    transforms above: both branches then no-op identically, so guidance degrades to plain
+    conditional sampling instead of to a wrong tag. That is the behaviour `_input_chain`'s
+    docstring already documents for the SLB tag.
+    """
+
+    q_ep: int = INFER_QUALITY
+    # The UNCONDITIONAL branch. Not a second class, and not an omitted transform: the two
+    # branches must be the same object in the same position so that a later edit cannot move one
+    # without the other.
+    drop_all: bool = False
+
+    def __post_init__(self) -> None:
+        q = int(self.q_ep)
+        if not 1 <= q <= N_BINS:
+            # `--quality-tag 0` reads like "off" and would instead serve `Quality: 0` -- a sixth
+            # condition neither stage trained, matched by no prompt the model has seen. Refused at
+            # CONSTRUCTION, i.e. when the server starts, not after the eval client has connected.
+            raise ValueError(
+                f"serve-time quality tag {q} is not a bin in [1, {N_BINS}]. Inference asks for "
+                f"{INFER_QUALITY} (slb_cfg.INFER_QUALITY) and the placebo cell for 3; {NO_TAG} is "
+                f"the untagged sentinel and must never reach a prompt. To serve without "
+                f"conditioning, leave `quality_tag` unset."
+            )
+
+    @override
+    def __call__(self, data: dict) -> dict:
+        if "prompt" not in data or self.drop_all:
+            return data
+        if is_tagged(data["prompt"]):
+            # DOUBLE TAG -- `"...\nQuality: 5\nQuality: 5"`: in range, tokenizable, logged
+            # nowhere, and matched by nothing either stage trained. `_input_chain` builds exactly
+            # one of these, so the route here is a client that already tags its own prompts.
+            raise ValueError(
+                f"prompt {str(data['prompt'])[:120]!r} already carries a quality tag "
+                f"({PROMPT_TAG_MARKER!r}), so serving it would apply the tag TWICE. The eval "
+                f"client must send the bare task string; the tag is the serve config's job."
+            )
+        return {**data, "prompt": apply_metadata(data["prompt"], int(self.q_ep), None)}

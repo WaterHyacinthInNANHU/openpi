@@ -60,7 +60,20 @@ class Args:
 
     # Classifier-free guidance scale `w`. Inference-only, so a sweep re-serves the SAME
     # checkpoint with a different value; w=0 is plain conditional sampling.
+    #
+    # BETA = 1 + GUIDANCE_SCALE. openpi computes v = v_uncond + (1 + w)(v_cond - v_uncond) and
+    # π0.7's β is the TOTAL conditional weight, so a β = 1.3 cell passes 0.3 here. Passing 1.3
+    # would serve β = 2.3 and nothing would report it; the sweep spec
+    # (conf/experiments/onelayer_v3_round2_cfg_eval.toml) is the one table where that mapping is
+    # written down, and the server publishes `beta` in its metadata so the driver can check it.
     guidance_scale: float = 0.0
+
+    # π0.7 quality tag for the round-2 CFG arms: 5 is what both stages condition on, 3 is the
+    # placebo cell (same checkpoint, same β, wrong label). A FLAG, not an environment variable,
+    # so it lands in the run record and a checkpoint's arm is recoverable from its launch line.
+    # Takes precedence over the SLB_CFG_METADATA route, which also appends a `Mistake` token
+    # this arm never trained.
+    quality_tag: int | None = None
 
 
 # Default checkpoints that should be used for each environment.
@@ -103,6 +116,7 @@ def create_policy(args: Args) -> _policy.Policy:
                 default_prompt=args.default_prompt,
                 cfg_conditioning=args.cfg_conditioning,
                 guidance_scale=args.guidance_scale,
+                quality_tag=args.quality_tag,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
