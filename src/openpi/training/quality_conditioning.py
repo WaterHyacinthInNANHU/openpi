@@ -2,9 +2,18 @@
 
 ONLINE TIER.
 
-There is deliberately NO randomness here. The dropout was decided offline and baked into the
-artifact (`axis.dataset.build_quality_labels`), so the realized tagged fraction is a number read
-off disk rather than a reconstruction from eight workers' RNG states.
+STAGE 1 (pretraining) has deliberately NO randomness here. The dropout was decided offline and
+baked into the artifact (`axis.dataset.build_quality_labels`), so the realized tagged fraction is
+a number read off disk rather than a reconstruction from eight workers' RNG states.
+
+STAGE 2 (the LIBERO finetune, `LiberoQualityConditioning` at the bottom of this file) has no
+artifact and cannot have one without a second offline pipeline over a third-party dataset, which
+is out of scope. It therefore draws its dropout from a KEYED HASH of `(seed, episode_index,
+frame_index)` -- a pure function of the row, not a stream. That is a stated deviation from design
+decision D5, and it preserves the property D5 exists to protect: the realized dropout is
+reproducible from the run record (the seed, which is in the config) without knowing any worker's
+RNG state. It is also the mechanism `slb_cfg.SlbCfgMetadataConditioning` already uses. The
+deviation belongs in the paper's method note, beside the stage-2 parity cost.
 
 TWO OBJECTS, and the split is load-bearing. `QualityTaggedDataset` runs BEFORE any transform and
 injects the tag using `__getitem__`'s own index argument -- the only unambiguously concat-global
@@ -22,12 +31,14 @@ and a wiring task naturally reaches for the wrapper alone.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import pathlib
 
 import numpy as np
 from typing_extensions import override
 
+from openpi.training.slb_cfg import INFER_QUALITY
 from openpi.training.slb_cfg import QUALITY_KEY as _PROMPT_TAG_KEY
 from openpi.training.slb_cfg import apply_metadata
 import openpi.transforms as _transforms
@@ -65,6 +76,23 @@ NO_TAG = 0
 NOT_TRAINABLE = 255
 N_BINS = 5
 _NAME_PREFIX = "quality_"
+
+# STAGE 2's copy of π0.7's two dropout levels (design D8), held LITERALLY equal to stage 1's so
+# both stages train the unconditional branch at the same 1 - 0.85*0.95 = 0.1925 marginal. A
+# different rate here would mean the two stages disagree about how often the model sees a bare
+# prompt, which nothing in a loss curve or a checkpoint would reveal and no write-up would state.
+#
+# Named separately from `axis.dataset.quality_labels.DROP_WHOLE/DROP_COMPONENT` rather than
+# imported, for the same reason `N_BINS` is duplicated: those live in the OFFLINE tier and nothing
+# under openpi/ imports `axis`. The duplicate is pinned by config_cfg_stage2_test.py against the
+# same 0.8075 tagged marginal the offline suite asserts.
+DROP_WHOLE_STAGE2 = 0.15
+DROP_COMPONENT_STAGE2 = 0.05
+
+# The two LeRobot row keys the stage-2 draw is keyed on. `RepackTransform` drops both, which is
+# why `LiberoQualityConditioning` must HEAD the repack group -- see its docstring.
+EPISODE_INDEX_KEY = "episode_index"
+FRAME_INDEX_KEY = "frame_index"
 
 
 class QualityTags:
@@ -474,3 +502,133 @@ def wrap_and_transform(dataset, tags: QualityTags, transforms):
     return TransformedDataset(
         QualityTaggedDataset(dataset, tags), [AxisQualityConditioning(), *transforms]
     )
+
+
+# =================================================================================================
+# STAGE 2 (the LIBERO finetune). One class, no wrapper, no artifact -- see the module docstring.
+# =================================================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class LiberoQualityConditioning(_transforms.DataTransformFn):
+    """Append a CONSTANT `"\\nQuality: {q_ep}"` to the prompt. Heads the LIBERO repack group.
+
+    WHY A CONSTANT (D9). Stage 2 finetunes on LIBERO, which is uniformly expert data -- there is
+    nothing to bin, so every sample carries the same tag. Two things follow, and both are the
+    point: the conditional branch is anchored at exactly the value inference asks for
+    (`slb_cfg.INFER_QUALITY`), and the dropout keeps the unconditional branch trained so guidance
+    at eval still has something to subtract. The guidance scale β is therefore swept at EVAL, not
+    at training time; there is no β here.
+
+    WHY A KEYED HASH RATHER THAN AN ARTIFACT, unlike stage 1. Building one would mean a second
+    offline pipeline over a third-party dataset (LIBERO), which is out of scope. What D5 exists to
+    protect is that the realized dropout be reconstructable WITHOUT knowing any worker's RNG
+    state -- so the draw is a pure function of `(seed, episode_index, frame_index)`, which
+    `dropped()` exposes so a row's fate can be recomputed offline from the run record alone. Two
+    passes over one row agree; eight workers agree; a rerun agrees; and unlike a per-batch RNG the
+    answer does not depend on batch order, worker count, or how many rows were drawn first. This
+    deviation from D5 is disclosed in the plan and belongs in the paper's method note.
+
+    WHERE IT RUNS. At the HEAD of `LeRobotLiberoDataConfig`'s repack group, i.e. before
+    `RepackTransform`, which rebuilds the dict from its structure map and drops `episode_index`
+    and `frame_index` along with everything else not in it. Placed after it, every lookup would
+    miss -- so both keys RAISE rather than defaulting. `slb_cfg.SlbCfgMetadataConditioning`, the
+    sibling that uses this same keying, returns `data` unchanged on a miss; that is the silent
+    version of this failure and is not repeated here.
+
+    Note there is no `QualityTaggedDataset` twin: stage 1 needs a wrapper because its tag comes
+    from a per-row artifact indexed by the concat-global row number, which no transform can see.
+    A constant tag needs no lookup at all.
+    """
+
+    q_ep: int = INFER_QUALITY
+    drop_whole: float = DROP_WHOLE_STAGE2
+    drop_component: float = DROP_COMPONENT_STAGE2
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        q = int(self.q_ep)
+        if not 1 <= q <= N_BINS:
+            # NO_TAG (0) is the most likely wrong value -- `quality_tag=0` reads like "off" and
+            # would instead emit `Quality: 0`, a sixth condition the tokenizer has never seen and
+            # that no eval prompt can match. Refused at CONSTRUCTION so it fails when the config
+            # is built, not on the first batch of a 15-hour run.
+            raise ValueError(
+                f"stage-2 quality tag {q} is not a bin in [1, {N_BINS}]. Stage 2 conditions on a "
+                f"CONSTANT tag and inference asks for {INFER_QUALITY} "
+                f"(slb_cfg.INFER_QUALITY); {NO_TAG} is the untagged sentinel and must never "
+                f"reach a prompt. To disable conditioning, leave `quality_tag` unset."
+            )
+        for name, p in (("drop_whole", self.drop_whole), ("drop_component", self.drop_component)):
+            if not 0.0 <= float(p) < 1.0:
+                raise ValueError(
+                    f"{name}={p} is outside [0, 1). A rate of 1 would drop every row, leaving the "
+                    f"CONDITIONAL branch untrained while the config and the write-up say the arm "
+                    f"is conditioned."
+                )
+        if float(self.drop_whole) == 0.0 and float(self.drop_component) == 0.0:
+            # Stage 1's counterpart is `QualityTags.__init__`'s refusal of an artifact with no
+            # NO_TAG rows. With no dropout the model never sees the bare prompt, never learns
+            # p(a | no tag), and guidance -- which subtracts an unconditional forward pass -- is
+            # undefined. Nothing online would notice: loss, throughput and every prompt look fine.
+            raise ValueError(
+                "both stage-2 dropout levels are zero, so every row is tagged and CFG has no "
+                "unconditional branch to guide away from -- the arm degenerates to plain "
+                "conditional BC while still being called CFG."
+            )
+
+    def dropped(self, episode_index: int, frame_index: int) -> bool:
+        """Whether this row's tag is dropped. PURE in `(seed, episode_index, frame_index)`.
+
+        Public because that purity is the whole of the D5 deviation's defence: the realized
+        dropout of any row of any run is recomputable from the run record (the config's `seed`)
+        plus the row's own identity, with no worker RNG state involved.
+
+        Mixed through SHA-256 rather than an ad-hoc integer product because adjacent `(ep, fr)`
+        -- which is what consecutive rows of one episode are -- must not yield correlated draws.
+        Both levels are drawn UNCONDITIONALLY (`random(2)`, not a short-circuited second call) so
+        a future second metadata component slots in without moving the first component's stream,
+        exactly as `axis.dataset.quality_labels.two_level_dropout` does offline.
+        """
+        digest = hashlib.sha256(
+            f"{int(self.seed)}:{int(episode_index)}:{int(frame_index)}".encode()
+        ).digest()
+        u = np.random.default_rng(int.from_bytes(digest[:8], "little")).random(2)
+        return bool(u[0] < float(self.drop_whole) or u[1] < float(self.drop_component))
+
+    @override
+    def __call__(self, data: dict) -> dict:
+        if "prompt" not in data:
+            raise KeyError(
+                "'prompt' is not in the sample, so a quality tag has no instruction to attach "
+                "to. Either the dataset is configured with prompt_from_task=False, or this "
+                "transform runs after a repack that does not surface 'prompt'. Tagging a "
+                "synthesised empty prompt would condition the arm on a bare 'Quality: <n>'."
+            )
+        for key in (EPISODE_INDEX_KEY, FRAME_INDEX_KEY):
+            if key not in data:
+                raise KeyError(
+                    f"{key!r} is not in the sample. The stage-2 dropout draw is keyed on the row, "
+                    f"and RepackTransform drops this key while rebuilding the dict -- so this "
+                    f"transform must HEAD the repack group. Placed after it, every row would be "
+                    f"treated identically and the arm would silently train with no dropout at "
+                    f"all (or none at all tagged), with nothing in the loss curve to show it."
+                )
+        if is_tagged(data["prompt"]):
+            # DOUBLE TAG, the same failure `AxisQualityConditioning` refuses: two conditioning
+            # entries in one chain yield `"...\nQuality: 5\nQuality: 5"` -- in range, tokenizable,
+            # logged nowhere, and matched by no eval-time prompt.
+            raise ValueError(
+                f"prompt {str(data['prompt'])[:120]!r} already carries a quality tag "
+                f"({PROMPT_TAG_MARKER!r}), so tagging it would apply the tag TWICE. Either this "
+                f"transform is in the chain twice (it belongs ONLY at the head of the LIBERO "
+                f"repack group -- see LeRobotLiberoDataConfig.quality_tag), or the corpus's task "
+                f"strings were built with the tag already in them."
+            )
+        ep = int(np.asarray(data[EPISODE_INDEX_KEY]).reshape(-1)[0])
+        fr = int(np.asarray(data[FRAME_INDEX_KEY]).reshape(-1)[0])
+        if self.dropped(ep, fr):
+            # The BARE prompt is the unconditional branch, which is why a dropped row must not
+            # emit `Quality: 0`.
+            return data
+        return {**data, "prompt": apply_metadata(data["prompt"], int(self.q_ep), None)}

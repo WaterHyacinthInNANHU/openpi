@@ -395,6 +395,38 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
     extra_delta_transform: bool = False
 
+    # STAGE-2 CFG TWIN ONLY; None for every other LIBERO arm, which must stay byte-identical.
+    #
+    # A CONSTANT π0.7 quality tag, not a per-row one: stage 2 finetunes on uniformly expert data,
+    # so there is nothing to bin. The point is that the conditional branch is anchored where
+    # inference asks for it (D9), while the two-level dropout inside the transform keeps the
+    # unconditional branch trained. Unlike stage 1 there is no artifact and no dataset wrapper --
+    # the dropout is a keyed hash of the row, a disclosed deviation from D5. See
+    # `quality_conditioning.LiberoQualityConditioning`.
+    quality_tag: int | None = None
+
+    # The config NAME whose norm stats this one must read, or None to keep its own. Set on the
+    # CFG twin so it shares `pi05_libero_axisinit_paper`'s stats rather than resolving to
+    # `<assets_base_dir>/pi05_libero_axisinit_paper_cfg/...`, which does not exist anywhere -- the
+    # LIBERO stage-2 norm stats were computed once, on the training box, and are published
+    # nowhere (reports/portability_and_publish_plan.md). Without this the twin dies at loader
+    # construction telling you to run `compute_norm_stats --config-name=<your-config>`, and doing
+    # that would be a SECOND parity break: the CFG row must differ from the other stage-2 arms in
+    # the conditioning ONLY, and this project has already retracted two conclusions that came
+    # from norm stats quietly belonging to a different dataset than the one being trained on.
+    #
+    # A NAME, not a path, for the reason `AxisFrankaPretrainDataConfig.norm_stats_from` records at
+    # length: `TrainConfig.assets_dirs` is `assets_base_dir / name`, so swapping the last
+    # component follows an `--assets-base-dir` override instead of stranding this config on the
+    # default base while the config it must match moves elsewhere.
+    norm_stats_from: str | None = None
+
+    @override
+    def norm_stats_dir(self, assets_dirs: pathlib.Path) -> epath.Path | None:
+        if self.norm_stats_from is None:
+            return super().norm_stats_dir(assets_dirs)
+        return super().norm_stats_dir(pathlib.Path(assets_dirs).parent / self.norm_stats_from)
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # The repack transform is *only* applied to the data coming from the dataset,
@@ -405,8 +437,25 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # For your own dataset, first figure out what keys your environment passes to the policy server
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
+        #
+        # The CFG twin HEADS this group with its conditioning, and that position is load-bearing
+        # in both directions: the transform needs `episode_index`/`frame_index` (which
+        # RepackTransform drops) to key its dropout draw, and it needs to be the ONLY conditioning
+        # entry in the chain or the tag lands twice. Unlike stage 1 there is no
+        # `wrap_and_transform` here -- a constant tag needs no dataset wrapper, so the repack
+        # group IS the right place, not the forbidden one.
+        quality_inputs: list[_transforms.DataTransformFn] = []
+        if self.quality_tag is not None:
+            # Local import: `quality_conditioning` is only reached by the one twin, and keeping it
+            # off this module's import path matches how the SLB factory reaches `slb_cfg`.
+            from openpi.training import quality_conditioning
+
+            quality_inputs = [
+                quality_conditioning.LiberoQualityConditioning(q_ep=int(self.quality_tag))
+            ]
         repack_transform = _transforms.Group(
             inputs=[
+                *quality_inputs,
                 _transforms.RepackTransform(
                     {
                         "observation/image": "image",
@@ -415,7 +464,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "actions": "actions",
                         "prompt": "prompt",
                     }
-                )
+                ),
             ]
         )
 
@@ -1765,6 +1814,56 @@ _CONFIGS = [
         ),
         batch_size=64,
         # Byte-identical to upstream `pi05_libero`'s schedule; see the note above.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "AXIS_EEF_PAPER_INIT_CKPT",
+                "/unset/set-AXIS_EEF_PAPER_INIT_CKPT-to-a-pi05_axis_pretrain_eef_paper-step/params",
+            )
+        ),
+        num_train_steps=30_000,
+        fsdp_devices=8,
+    ),
+    # STAGE 2 FOR THE CFG ARMS ONLY, and the ONE place round 2 breaks the "stage 2 is identical
+    # across arms" rule that `conf/experiments/onelayer_v3_stage2_libero.toml` states.
+    #
+    # It is the mechanism, not an oversight. Stage 1's CFG checkpoint was trained with a
+    # `Quality: q` tag in ~81% of its prompts; finetuning it on bare LIBERO prompts and then
+    # evaluating with a tag (guidance needs one) would ask it about a prompt distribution stage 2
+    # taught it to forget. So stage 2 keeps conditioning on -- at the CONSTANT top bin, because
+    # LIBERO is uniformly expert data and that is what inference asks for (D9). The guidance
+    # scale β is swept at EVAL, not here; nothing about β appears in this config.
+    #
+    # THE COST, which must be stated beside the result: the CFG row of the 4x2 table carries a
+    # two-stage treatment where the drop/anneal/AWR rows carry a one-stage one.
+    #
+    # EVERY OTHER FIELD IS A VERBATIM COPY of pi05_libero_axisinit_paper above -- deliberately a
+    # second literal, matching how `pi05_libero_axisinit` and its `_paper` twin are written, and
+    # NOT `dataclasses.replace`: `config_cfg_stage2_test.py` diffs the two field by field and
+    # asserts they differ in exactly {name, data}, which a `replace` would make vacuously true.
+    # If you edit the parent's schedule/batch/EMA/budget, edit this too -- the test will say so.
+    TrainConfig(
+        name="pi05_libero_axisinit_paper_cfg",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            # THE TREATMENT, and the only one. 5 == `slb_cfg.INFER_QUALITY`, spelled as a literal
+            # because a registry entry should be readable without chasing an import; the
+            # transform's own default IS that constant, and config_cfg_stage2_test.py pins the
+            # two equal so this literal cannot drift away from what inference asks for.
+            quality_tag=5,
+            # NOT a treatment difference -- the opposite. This is what makes the twin READ the
+            # parent's norm stats instead of resolving to its own (nonexistent) assets dir, so
+            # the two stage-2 legs are normalised identically. See the field's own comment.
+            norm_stats_from="pi05_libero_axisinit_paper",
+        ),
+        batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
         ),
