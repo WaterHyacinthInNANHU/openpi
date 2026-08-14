@@ -288,6 +288,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        num_train_steps=config.num_train_steps,
     )
 
 
@@ -304,6 +305,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    num_train_steps: int | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -321,6 +323,8 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        num_train_steps: The training budget, when known. Only consulted by the index-schedule
+            path, which must refuse a budget longer than its artifact (see ScheduleSampler).
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
@@ -361,15 +365,49 @@ def create_torch_data_loader(
             # sample-ranges, drawn UNIFORMLY -- and, when an AWR weights artifact is configured,
             # carry a per-row Eq E.7 weight into the batch so the loss can reweight.
             #
-            # Rows are drawn uniformly in BOTH cases. WVM Eq E.5 puts the weights in the
+            # Rows are drawn uniformly in BOTH of those cases. WVM Eq E.5 puts the weights in the
             # OBJECTIVE, not in the sampling distribution: weighted resampling has a different
             # estimator variance and, drawing with replacement, changes the epoch composition
             # independently of the weights. See slb_awr_loss's module docstring.
+            #
+            # The third case is the round-2 index-schedule arms: `pretrain_schedule_path` names a
+            # precomputed (steps, batch) block of rows that replaces the draw entirely. It is
+            # checked first because nothing else in this branch applies once the sampling has
+            # been decided offline.
             from openpi.training import pretrain_dataset
             from openpi.training import slb_variant_sampler
 
             weights_path = getattr(data_config, "pretrain_awr_weights", None)
-            if weights_path:
+            schedule_path = getattr(data_config, "pretrain_schedule_path", None)
+            if schedule_path:
+                # Round-2 arms: WHICH rows (drop) and IN WHAT ORDER (anneal) were decided
+                # offline, so there is nothing left to draw here -- the artifact is replayed
+                # verbatim and its row t becomes the batch at step t. That also means the run's
+                # coverage numbers are read off the artifact rather than reconstructed from an
+                # RNG state.
+                from openpi.training.schedule_sampler import ScheduleSampler
+
+                if weights_path:
+                    raise ValueError(
+                        f"both an index schedule ({schedule_path}) and AWR weights "
+                        f"({weights_path}) are configured; the schedule already encodes the "
+                        f"supervision, so this run would be two arms at once"
+                    )
+                sampler = ScheduleSampler(schedule_path)
+                sampler.check_batch(local_batch_size)
+                sampler.check_dataset_rows(len(dataset))
+                if num_train_steps is not None:
+                    sampler.check_num_train_steps(num_train_steps)
+                logging.info(
+                    "index schedule %s: mode=%s reward=%s steps=%d batch=%d keep_fraction=%s "
+                    "unique_episodes=%s unique_frames=%s epochs=%.2f seed=%s config_hash=%s",
+                    schedule_path, sampler.meta.get("mode"), sampler.meta.get("reward_id"),
+                    sampler.total_steps, sampler.batch, sampler.meta.get("keep_fraction"),
+                    sampler.meta.get("unique_episodes"), sampler.meta.get("unique_frames"),
+                    sampler.meta.get("epochs_over_unique_rows", 0.0), sampler.meta.get("seed"),
+                    sampler.meta.get("config_hash"),
+                )
+            elif weights_path:
                 rows, weights = pretrain_dataset.plan_rows_and_weights_from_roots(
                     data_config.pretrain_roots_index,
                     data_config.pretrain_ranges_path,
@@ -390,7 +428,9 @@ def create_torch_data_loader(
                 rows = pretrain_dataset.plan_rows_from_roots(
                     data_config.pretrain_roots_index, data_config.pretrain_ranges_path
                 )
-            sampler = slb_variant_sampler.RowSampler(rows, seed=seed)
+            if not schedule_path:
+                # The schedule IS the sampler; only the uniform arms plan their own rows.
+                sampler = slb_variant_sampler.RowSampler(rows, seed=seed)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

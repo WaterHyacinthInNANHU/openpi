@@ -1,0 +1,112 @@
+"""Read a precomputed index schedule and hand the loader the exact rows for each step.
+
+ONLINE TIER. There is deliberately NO randomness here: the arm's sampling was decided offline
+(`axis.dataset.build_index_schedule`), so "what did step k train on?" is answered by reading row k
+of a file, and samples-seen is a fact on disk rather than a reconstruction from RNG state.
+
+That makes an exact resume EXPRESSIBLE (`rows_for_step(k)`) but does not by itself deliver one:
+openpi checkpoints no data-loader position (`checkpoints.restore_state` drops its `data_loader`
+argument), so a resumed run replays the schedule from row 0 while the optimiser continues. Until
+a start offset is plumbed through `create_data_loader`, a died arm is restarted clean -- which is
+already what conf/experiments/onelayer_v3_stage1_arms.toml tells you to do, for the same reason.
+
+The artifact holds an int64 `(total_steps, batch)` block of flat dataset indices plus a JSON
+`meta` string. Row t IS the batch trained at step t, which is why this class is itself the torch
+`Sampler`: torch consumes a sampler as a flat index stream and cuts it into batches of
+`batch_size`, so yielding the artifact row-major reproduces its batches one for one. Anything
+that reshuffles, wraps, pads or reshapes destroys that correspondence and with it the arm's
+audit trail -- hence `check_batch` and `rows_for_step` raise rather than adapt.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import pathlib
+
+import numpy as np
+import torch
+
+
+class ScheduleSampler(torch.utils.data.Sampler[int]):
+    """The offline schedule, replayed verbatim as a torch row sampler."""
+
+    def __init__(self, path: str | pathlib.Path):
+        self.path = pathlib.Path(path)
+        with np.load(self.path, allow_pickle=False) as z:
+            self._rows = z["rows"].astype(np.int64)
+            self.meta = json.loads(str(z["meta"]))
+        if self._rows.ndim != 2:
+            raise ValueError(f"schedule {self.path} has shape {self._rows.shape}, expected 2-D")
+
+    @property
+    def total_steps(self) -> int:
+        return int(self._rows.shape[0])
+
+    @property
+    def batch(self) -> int:
+        return int(self._rows.shape[1])
+
+    def check_batch(self, batch: int) -> None:
+        if batch != self.batch:
+            raise ValueError(
+                f"schedule {self.path} was built for batch {self.batch}, but training requests "
+                f"{batch}. The artifact IS the experiment's record of what was seen; regenerate it "
+                f"rather than reshaping it here."
+            )
+
+    def check_num_train_steps(self, num_train_steps: int) -> None:
+        """The run must not outlast its schedule.
+
+        `rows_for_step` refuses to step past the end, but the torch loader never asks it: it just
+        restarts an exhausted sampler, so a budget longer than the artifact replays the schedule
+        from row 0 and quietly grants the extra pass this design exists to prevent. A budget
+        SHORTER than the artifact is merely a truncated run, but it invalidates the coverage
+        numbers (epochs, unique frames) the artifact reports, so it is logged loudly.
+        """
+        if num_train_steps > self.total_steps:
+            raise ValueError(
+                f"num_train_steps={num_train_steps} exceeds schedule {self.path} "
+                f"({self.total_steps} steps). The loader would restart the schedule from row 0 "
+                f"and train an extra pass nobody asked for; rebuild the artifact with "
+                f"--total-steps {num_train_steps}, or shorten the run."
+            )
+        if num_train_steps < self.total_steps:
+            logging.warning(
+                "num_train_steps=%d is short of schedule %s (%d steps): the run will see only "
+                "%.1f%% of the scheduled batches, so the artifact's epochs/unique-frames numbers "
+                "do NOT describe it.",
+                num_train_steps, self.path, self.total_steps,
+                100.0 * num_train_steps / self.total_steps,
+            )
+
+    def check_dataset_rows(self, n_dataset_rows: int) -> None:
+        """Every scheduled index must exist in this dataset.
+
+        The artifact stores flat indices into the concatenated pretrain dataset, so a schedule
+        built against a different corpus points at frames that are either absent (an IndexError
+        deep inside a worker, hours in) or -- worse, if the corpus merely grew -- present but
+        belonging to some other episode. Fail here, at loader construction, instead.
+        """
+        hi = int(self._rows.max(initial=-1))
+        if hi >= n_dataset_rows:
+            raise ValueError(
+                f"schedule {self.path} draws row {hi}, which is outside the dataset "
+                f"({n_dataset_rows} rows). The schedule was built against a different corpus; "
+                f"rebuild it against this roots index rather than truncating it."
+            )
+
+    def rows_for_step(self, t: int) -> np.ndarray:
+        if not 0 <= t < self.total_steps:
+            raise IndexError(
+                f"step {t} is beyond the schedule ({self.total_steps} steps). Wrapping would give "
+                f"the model an extra pass nobody asked for; extend num_train_steps deliberately."
+            )
+        return self._rows[t]
+
+    def __len__(self) -> int:
+        return self.total_steps * self.batch
+
+    def __iter__(self):
+        # Row-major, no generator, no epoch counter: the order is the artifact's.
+        yield from self._rows.reshape(-1).tolist()

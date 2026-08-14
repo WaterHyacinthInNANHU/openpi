@@ -144,6 +144,13 @@ class DataConfig:
     # baseline, and from each other, ONLY in which file this points at.
     pretrain_awr_weights: str | None = None
     pretrain_ranges_path: str | None = None
+    # A precomputed index schedule (`axis.dataset.build_index_schedule`): an int64
+    # (num_train_steps, batch) block of flat dataset rows plus a meta block. When set, the loader
+    # replays it verbatim -- row t IS the batch trained at step t -- instead of drawing rows
+    # itself, which is what makes the `drop` (which rows) and `anneal` (in what order) arms
+    # differ from the uniform baseline. Mutually exclusive with pretrain_awr_weights: the
+    # schedule already encodes the supervision, so a run carrying both would be two arms at once.
+    pretrain_schedule_path: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -520,6 +527,10 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # ONLY field that differs between the plain-BC baseline and either supervision arm, which is
     # what makes the three runs a controlled comparison rather than three separate experiments.
     awr_weights: str | None = None
+    # Path to an index-schedule artifact (`axis.dataset.build_index_schedule`), or None for the
+    # loader's own uniform draw. NOT an env var, unlike round 1's $AXIS_PRETRAIN_AWR_WEIGHTS: a
+    # checkpoint's arm must be recoverable from its config (name + this field) alone.
+    schedule_path: str | None = None
     default_prompt: str | None = None
     # Relative-EEF action space (LIBERO-Plus proxy benchmark): feed the baked `state_eef`(8) /
     # `action_eef`(7, robosuite OSC_POSE delta) columns and slice the output to 7. Default False
@@ -530,6 +541,22 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         from openpi.policies import axis_franka_policy
 
+        if self.schedule_path and not self.roots_index:
+            # The schedule stores flat rows of the CONCATENATED multi-task dataset, which only
+            # exists when roots_index names its parts. Without it the pretrain branch of the
+            # loader never runs and the schedule would be silently ignored -- i.e. the arm would
+            # train as the plain baseline under the arm's name.
+            raise ValueError(
+                "schedule_path is set but roots_index is not; the schedule indexes the "
+                "concatenated pretrain dataset, so it is meaningless without one "
+                "(set $AXIS_PRETRAIN_ROOTS_INDEX)."
+            )
+        if self.schedule_path and self.awr_weights:
+            raise ValueError(
+                "schedule_path and awr_weights are both set. The schedule already encodes the "
+                "supervision (which rows, in what order); combining it with loss reweighting "
+                "would make this run two arms at once."
+            )
         state_col = "state_eef" if self.eef_action else "observation.state"
         action_col = "action_eef" if self.eef_action else "action"
         repack_transform = _transforms.Group(
@@ -563,6 +590,7 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             pretrain_roots_index=self.roots_index,
             pretrain_awr_weights=self.awr_weights,
             pretrain_ranges_path=self.ranges_path,
+            pretrain_schedule_path=self.schedule_path,
         )
 
 
@@ -1017,7 +1045,7 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
 
 def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
-    eef: bool = False, paper: bool = False,
+    eef: bool = False, paper: bool = False, name: str | None = None,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1069,6 +1097,14 @@ def _axis_pretrain_config(
     that value (measured: one unique post-warmup value, float32(5e-5)). No new schedule class
     is needed and the warmup ramp stays the one every other openpi config uses.
 
+    `name` overrides the flag-composed name for the index-schedule arms (`pi05_axis_drop`,
+    `pi05_axis_anneal`), which are not distinguished by any flag this factory takes -- their arm
+    lives in `data.schedule_path`, supplied per run. Passing it also switches the AWR weights off
+    at the source: those arms inherit the launch environment, and reading
+    $AXIS_PRETRAIN_AWR_WEIGHTS there would silently add round 1's loss reweighting on top of the
+    schedule (`AxisFrankaPretrainDataConfig.create` refuses that combination anyway, so the
+    alternative is a confusing hard failure on a box where the variable happens to be exported).
+
     The paper's action space is NOT changed here: Appendix F's "7D joint-position action" is
     a typo for the LIBERO/robosuite OSC_POSE 7-D delta `[dpos(3), daxis-angle(3), gripper]`,
     which is what `eef=True` already feeds (axis_franka_policy / eef_math). Quantile
@@ -1077,7 +1113,8 @@ def _axis_pretrain_config(
     q01/q99 -- is met by this factory's deliberate lack of an `assets=` override.
     """
     return TrainConfig(
-        name=(
+        name=name
+        or (
             "pi05_axis_pretrain"
             + ("_eef" if eef else "")
             + ("_ki" if knowledge_insulation else "")
@@ -1092,7 +1129,9 @@ def _axis_pretrain_config(
             repo_id="Devon018/Franka-Datasets-v2",
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
-            awr_weights=os.environ.get("AXIS_PRETRAIN_AWR_WEIGHTS"),
+            # Schedule arms (name given) never take AWR weights from the environment; see the
+            # docstring's `name` paragraph.
+            awr_weights=None if name else os.environ.get("AXIS_PRETRAIN_AWR_WEIGHTS"),
             base_config=DataConfig(prompt_from_task=True),
             # relative-EEF (LIBERO-Plus proxy) feeds state_eef/action_eef; else DROID-8D joint-vel.
             eef_action=eef,
@@ -1220,6 +1259,28 @@ _CONFIGS = [
     # The CFG path is still unbuilt: both factories still build their repack from a bare
     # RepackTransform, so no conditioning tag reaches the prompt.
     _axis_pretrain_config(eef=True, paper=True, batch_size=8, num_train_steps=100_000),
+    #
+    # ROUND-2 INDEX-SCHEDULE ARMS. Both carry round 1's model, optimiser and budget (20,605 steps
+    # = one epoch of the rung-5000 corpus, at GLOBAL batch 64) and differ from the `bc` control,
+    # and from each other, ONLY in the schedule artifact handed to `data.schedule_path` at launch:
+    #   drop    -- keep only the Delta >= 0 rows, drawn uniformly (which rows).
+    #   anneal  -- keep every row, but ramp the draw toward the high-quality bins (in what order).
+    # The path is a CONFIG FIELD, not an env var, so a checkpoint's arm is recoverable from the
+    # config it was launched with. Two names rather than one because the checkpoint directory and
+    # the run record are keyed by config name, and "which arm is this?" must not require reading a
+    # command line back out of a log. The schedule is the whole difference: with it unset both
+    # names train the plain baseline, which `AxisFrankaPretrainDataConfig.create` cannot detect
+    # (an unset field is legitimate for a smoke test), so the arm TOMLs own that path.
+    #
+    # WARMUP IS NOT ROUND 1's HERE. `paper=True` keeps the literal 10,000-step warmup, and round 1
+    # overrode it to 2,060 (10% of this budget, the fraction the paper uses) from its arm TOML.
+    # Round 2's TOML must carry the same `lr_schedule.*` overrides or the arms are off parity with
+    # the control they are compared against; a config-level default cannot enforce that, because
+    # CLI overrides bypass it silently. See conf/experiments/onelayer_v3_stage1_arms.toml.
+    _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
+                          name="pi05_axis_drop"),
+    _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
+                          name="pi05_axis_anneal"),
     # INFERENCE-ONLY: serve the pi05_axis_pretrain_eef checkpoint to the LIBERO-Plus client.
     _axis_eef_libero_serve_config(),
     #
