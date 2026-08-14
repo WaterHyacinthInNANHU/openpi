@@ -42,10 +42,25 @@ def test_arm_matches_the_round_one_recipe(name: str) -> None:
     assert cfg.data.eef_action is True
 
 
-def test_the_two_arms_differ_only_in_their_name() -> None:
-    """Same recipe, same data config; the schedule artifact supplied at launch is the arm."""
+def test_the_two_arms_differ_only_in_their_name_and_expected_mode() -> None:
+    """Same recipe, same data config, aside from the mode binding each name carries.
+
+    The schedule artifact supplied at launch is still the arm's actual content, but its
+    `meta["mode"]` must now match what the config's name promises (`expected_mode`) -- see
+    `DataConfig.pretrain_expected_mode`. Before that binding existed the two configs were equal
+    modulo `name` alone; now they are equal modulo `name` and this one field, which is exactly
+    the fix: `pi05_axis_drop` and `pi05_axis_anneal` are no longer interchangeable data configs
+    that merely differ in which artifact happens to be handed to them at launch.
+    """
     drop, anneal = (_config.get_config(n) for n in ARMS)
-    assert dataclasses.replace(drop, name=anneal.name) == anneal
+    assert drop.data.expected_mode == "drop"
+    assert anneal.data.expected_mode == "anneal"
+    twin = dataclasses.replace(
+        drop,
+        name=anneal.name,
+        data=dataclasses.replace(drop.data, expected_mode=anneal.data.expected_mode),
+    )
+    assert twin == anneal
 
 
 @pytest.mark.parametrize("name", ARMS)
@@ -77,6 +92,48 @@ def test_schedule_together_with_awr_weights_raises(tmp_path) -> None:
     with pytest.raises(ValueError, match="two arms at once"):
         _factory(roots_index="roots.json", schedule_path="s.npz",
                  awr_weights="w.json").create(tmp_path, pi0_config.Pi0Config(pi05=True))
+
+
+@pytest.mark.parametrize(("name", "mode"), [("pi05_axis_drop", "drop"), ("pi05_axis_anneal", "anneal")])
+def test_registered_arms_require_their_schedule(name: str, mode: str) -> None:
+    """The registered configs must carry the guard, even though `schedule_path` itself is unset
+    (per-run, from conf/experiments) -- see `test_no_schedule_is_baked_into_the_registered_config`."""
+    data = _config.get_config(name).data
+    assert data.schedule_required is True
+    assert data.expected_mode == mode
+
+
+@pytest.mark.parametrize("name", ARMS)
+def test_a_named_schedule_arm_launched_without_a_schedule_path_raises(name: str, tmp_path) -> None:
+    """A launch that omits --data.schedule_path must not silently train the plain BC control
+    under the arm's name; the only prior symptom was the absence of the "index schedule" log
+    line, which is easy to miss."""
+    cfg = _config.get_config(name)
+    with pytest.raises(ValueError, match="schedule_path"):
+        cfg.data.create(tmp_path, cfg.model)
+
+
+def test_schedule_required_raises_even_off_the_registered_arms(tmp_path) -> None:
+    with pytest.raises(ValueError, match="schedule_path"):
+        _factory(roots_index="roots.json", schedule_required=True, expected_mode="drop").create(
+            tmp_path, pi0_config.Pi0Config(pi05=True)
+        )
+
+
+@pytest.mark.parametrize("mode", ["drop", "anneal"])
+def test_expected_mode_reaches_the_data_config(mode: str, tmp_path) -> None:
+    """`create()` is the only bridge to the loader (see `test_schedule_path_reaches_the_data_config`
+    above): expected_mode must cross it too, or the mismatch check in data_loader.py has nothing
+    to compare against."""
+    data = _factory(
+        roots_index="roots.json", schedule_path="s.npz", schedule_required=True, expected_mode=mode
+    ).create(tmp_path, pi0_config.Pi0Config(pi05=True))
+    assert data.pretrain_expected_mode == mode
+
+
+def test_no_expected_mode_leaves_the_field_unset(tmp_path) -> None:
+    data = _factory(roots_index="roots.json").create(tmp_path, pi0_config.Pi0Config(pi05=True))
+    assert data.pretrain_expected_mode is None
 
 
 def test_schedule_arm_ignores_the_round_one_env_var(monkeypatch) -> None:

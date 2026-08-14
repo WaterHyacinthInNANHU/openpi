@@ -251,6 +251,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    resuming: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -261,6 +262,11 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        resuming: Whether this run is actually resuming from a checkpoint (not merely
+            `config.resume` -- see scripts/train.py's `initialize_checkpoint_dir`, which also
+            covers the "resume requested but no checkpoint exists yet" case). Only consulted by
+            the index-schedule path, which must refuse to resume: see ScheduleSampler's module
+            docstring and `_check_schedule_resume`.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
@@ -289,7 +295,70 @@ def create_data_loader(
         skip_norm_stats=skip_norm_stats,
         framework=framework,
         num_train_steps=config.num_train_steps,
+        resuming=resuming,
     )
+
+
+def _check_schedule_unsupported_on_pytorch(data_config: _config.DataConfig) -> None:
+    """The index-schedule wiring lives only in the jax branch of `create_torch_data_loader`.
+
+    `scripts/train_pytorch.py` calls this function's caller with `framework="pytorch"`; without
+    this guard a schedule config would train there as the plain control, silently.
+    """
+    schedule_path = getattr(data_config, "pretrain_schedule_path", None)
+    if schedule_path:
+        raise ValueError(
+            f"pretrain_schedule_path={schedule_path!r} is set, but the PyTorch training path "
+            f"(scripts/train_pytorch.py, framework='pytorch') does not wire the index-schedule "
+            f"sampler -- only the jax branch of create_torch_data_loader does. Training this "
+            f"config through train_pytorch.py would silently drop the schedule and run the plain "
+            f"BC control instead. Use scripts/train.py (framework='jax') for schedule arms."
+        )
+
+
+def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
+    """A resume replays the schedule from row 0 while the optimiser continues from step k.
+
+    openpi checkpoints no data-loader position (`checkpoints.restore_state` drops its
+    `data_loader` argument), so this is not merely "coverage is off" -- for the anneal arm,
+    whose ramp only starts at `ramp_start_step ~= 0.85 * num_train_steps`, any resume before the
+    last ~15% of training means the ramp is never reached and the arm silently degenerates into
+    the uniform control.
+    """
+    if resuming:
+        raise ValueError(
+            f"config.resume is set together with pretrain_schedule_path={schedule_path!r}, but "
+            f"openpi checkpoints do not save data-loader position (checkpoints.restore_state "
+            f"drops its data_loader argument): a resume at step k would replay the schedule from "
+            f"row 0 while the optimiser continues from k. For the anneal arm "
+            f"(ramp_start_step ~= 0.85 * num_train_steps) this means the high-quality ramp is "
+            f"never reached unless the resume happens in the last ~15% of training, silently "
+            f"degenerating the arm into the plain control. Restart the run clean instead of "
+            f"resuming -- this is the same standing instruction round 1 gives in "
+            f"conf/experiments/onelayer_v3_stage1_arms.toml."
+        )
+
+
+def _check_schedule_mode(data_config: _config.DataConfig, sampler_meta: dict) -> None:
+    """Bind the artifact's own `meta["mode"]` to the arm this config's name promises.
+
+    Nothing else checks this: handing `pi05_axis_drop` an anneal artifact would train anneal
+    under the drop name and pass every other check (batch size, dataset bounds, step budget all
+    still line up), directly contradicting the rule that a checkpoint's arm be recoverable from
+    its config name alone.
+    """
+    expected = getattr(data_config, "pretrain_expected_mode", None)
+    if expected is None:
+        return
+    actual = sampler_meta.get("mode")
+    if actual != expected:
+        raise ValueError(
+            f"schedule mode mismatch: this config expects mode={expected!r} (from "
+            f"DataConfig.pretrain_expected_mode) but the schedule artifact's own meta reports "
+            f"mode={actual!r}. Handing the {actual!r} artifact to the {expected!r} arm would "
+            f"train {actual!r} under the {expected!r} name; pass the {expected!r} schedule "
+            f"artifact instead."
+        )
 
 
 def create_torch_data_loader(
@@ -306,6 +375,7 @@ def create_torch_data_loader(
     seed: int = 0,
     framework: str = "jax",
     num_train_steps: int | None = None,
+    resuming: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -325,6 +395,8 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
         num_train_steps: The training budget, when known. Only consulted by the index-schedule
             path, which must refuse a budget longer than its artifact (see ScheduleSampler).
+        resuming: Whether this run is actually resuming from a checkpoint. Only consulted by the
+            index-schedule path, which must refuse to resume (see `_check_schedule_resume`).
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
@@ -334,6 +406,10 @@ def create_torch_data_loader(
     # For JAX, divide by process count
     sampler = None
     if framework == "pytorch":
+        # The index-schedule wiring below lives ONLY in the jax branch; a schedule config run
+        # through here would silently train as the plain control. See train_pytorch.py, which
+        # is the only caller of this branch.
+        _check_schedule_unsupported_on_pytorch(data_config)
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
@@ -393,7 +469,16 @@ def create_torch_data_loader(
                         f"({weights_path}) are configured; the schedule already encodes the "
                         f"supervision, so this run would be two arms at once"
                     )
+                # openpi checkpoints no loader position (checkpoints.restore_state drops its
+                # data_loader argument), so a resume at step k would replay the schedule from
+                # row 0 while the optimiser continues from k -- see `_check_schedule_resume`.
+                _check_schedule_resume(schedule_path, resuming)
                 sampler = ScheduleSampler(schedule_path)
+                # Bind the artifact's own content to the arm this config's NAME promises: nothing
+                # else ties `pi05_axis_drop`/`pi05_axis_anneal` to the file handed to them at
+                # launch, so a mismatched artifact would otherwise train silently under the wrong
+                # name. See `DataConfig.pretrain_expected_mode`.
+                _check_schedule_mode(data_config, sampler.meta)
                 sampler.check_batch(local_batch_size)
                 sampler.check_dataset_rows(len(dataset))
                 if num_train_steps is not None:

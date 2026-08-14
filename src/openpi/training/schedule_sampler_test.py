@@ -96,3 +96,21 @@ def test_one_dimensional_artifact_is_rejected(tmp_path):
     np.savez(p, rows=np.arange(8, dtype=np.int64), meta=np.array(json.dumps({"mode": "drop"})))
     with pytest.raises(ValueError, match="expected 2-D"):
         ScheduleSampler(p)
+
+
+def test_a_float_rows_array_is_rejected_rather_than_silently_truncated(tmp_path):
+    """`.astype(np.int64)` truncates instead of raising -- a wrong row is not distinguishable
+    from a right one once training starts, so a float artifact must fail at load time."""
+    p = tmp_path / "s.npz"
+    np.savez(p, rows=np.arange(8, dtype=np.float64).reshape(2, 4), meta=np.array(json.dumps({"mode": "drop"})))
+    with pytest.raises(ValueError, match="integer"):
+        ScheduleSampler(p)
+
+
+def test_a_negative_row_index_raises(tmp_path):
+    """Torch indexes a negative int as `from the end`, so a negative row would silently draw
+    from the dataset tail instead of raising -- catch it here, at loader construction."""
+    rows = np.array([[0, 1], [2, -1]], dtype=np.int64)
+    s = ScheduleSampler(_write(tmp_path, rows))
+    with pytest.raises(ValueError, match="negative"):
+        s.check_dataset_rows(100)

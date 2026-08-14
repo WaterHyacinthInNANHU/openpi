@@ -34,7 +34,17 @@ class ScheduleSampler(torch.utils.data.Sampler[int]):
     def __init__(self, path: str | pathlib.Path):
         self.path = pathlib.Path(path)
         with np.load(self.path, allow_pickle=False) as z:
-            self._rows = z["rows"].astype(np.int64)
+            rows = z["rows"]
+            if not np.issubdtype(rows.dtype, np.integer):
+                # `.astype(np.int64)` would silently TRUNCATE a float artifact (e.g. a row index
+                # that was never rounded) rather than fail -- and a truncated row is a WRONG row,
+                # indistinguishable from a correct one once training starts.
+                raise ValueError(
+                    f"schedule {self.path} stores rows as dtype {rows.dtype}, not an integer "
+                    f"dtype. Casting would silently truncate; regenerate the artifact with an "
+                    f"integer rows array instead."
+                )
+            self._rows = rows.astype(np.int64)
             self.meta = json.loads(str(z["meta"]))
         if self._rows.ndim != 2:
             raise ValueError(f"schedule {self.path} has shape {self._rows.shape}, expected 2-D")
@@ -88,6 +98,16 @@ class ScheduleSampler(torch.utils.data.Sampler[int]):
         deep inside a worker, hours in) or -- worse, if the corpus merely grew -- present but
         belonging to some other episode. Fail here, at loader construction, instead.
         """
+        lo = int(self._rows.min(initial=0))
+        if lo < 0:
+            # torch indexes a negative int as "from the end", so a negative row would silently
+            # draw from the dataset TAIL instead of raising -- the opposite of the bounds check
+            # below, and just as capable of training on the wrong frame.
+            raise ValueError(
+                f"schedule {self.path} contains a negative row index ({lo}). Torch would wrap "
+                f"that to the dataset tail rather than raise; the artifact is corrupt or was "
+                f"built against the wrong indexing convention -- rebuild it."
+            )
         hi = int(self._rows.max(initial=-1))
         if hi >= n_dataset_rows:
             raise ValueError(

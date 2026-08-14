@@ -151,6 +151,12 @@ class DataConfig:
     # differ from the uniform baseline. Mutually exclusive with pretrain_awr_weights: the
     # schedule already encodes the supervision, so a run carrying both would be two arms at once.
     pretrain_schedule_path: str | None = None
+    # "drop" / "anneal" for a named schedule arm, or None for every other config. Set by
+    # AxisFrankaPretrainDataConfig.expected_mode and checked against the artifact's own
+    # `meta["mode"]` where the sampler is built (data_loader.py): nothing else ties a config
+    # NAME to the artifact it was actually launched with, so handing `pi05_axis_drop` an anneal
+    # artifact would otherwise train anneal under the drop name and pass every other check.
+    pretrain_expected_mode: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -531,6 +537,16 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # loader's own uniform draw. NOT an env var, unlike round 1's $AXIS_PRETRAIN_AWR_WEIGHTS: a
     # checkpoint's arm must be recoverable from its config (name + this field) alone.
     schedule_path: str | None = None
+    # True for the named schedule arms (`pi05_axis_drop`, `pi05_axis_anneal`): `create()` raises
+    # if this is set but `schedule_path` is empty, so a launch that forgets the artifact flag
+    # fails loudly instead of quietly training the plain control under the arm's name (the only
+    # symptom would otherwise be the ABSENCE of the "index schedule" log line).
+    schedule_required: bool = False
+    # "drop" / "anneal" for a named schedule arm, or None otherwise. Reaches DataConfig as
+    # `pretrain_expected_mode` and is checked against the artifact's own `meta["mode"]` in
+    # data_loader.py -- binds the config NAME to the artifact's actual content, since nothing
+    # else does (see DataConfig.pretrain_expected_mode).
+    expected_mode: str | None = None
     default_prompt: str | None = None
     # Relative-EEF action space (LIBERO-Plus proxy benchmark): feed the baked `state_eef`(8) /
     # `action_eef`(7, robosuite OSC_POSE delta) columns and slice the output to 7. Default False
@@ -541,6 +557,16 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         from openpi.policies import axis_franka_policy
 
+        if self.schedule_required and not self.schedule_path:
+            # A launch that omits --data.schedule_path trains the plain BC control under this
+            # arm's name; the log line announcing the schedule simply never appears. Fail at
+            # config-construction time instead of leaving that to be noticed later.
+            raise ValueError(
+                f"this is a named schedule arm (expected_mode={self.expected_mode!r}) but "
+                f"schedule_path is not set. Pass --data.schedule_path=<artifact path> at launch "
+                f"(the {self.expected_mode!r} artifact built by axis.dataset.build_index_schedule); "
+                f"otherwise this run trains the plain BC control under the arm's name."
+            )
         if self.schedule_path and not self.roots_index:
             # The schedule stores flat rows of the CONCATENATED multi-task dataset, which only
             # exists when roots_index names its parts. Without it the pretrain branch of the
@@ -591,6 +617,7 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             pretrain_awr_weights=self.awr_weights,
             pretrain_ranges_path=self.ranges_path,
             pretrain_schedule_path=self.schedule_path,
+            pretrain_expected_mode=self.expected_mode,
         )
 
 
@@ -1046,6 +1073,7 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
 def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
     eef: bool = False, paper: bool = False, name: str | None = None,
+    schedule_required: bool = False, expected_mode: str | None = None,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1135,6 +1163,11 @@ def _axis_pretrain_config(
             base_config=DataConfig(prompt_from_task=True),
             # relative-EEF (LIBERO-Plus proxy) feeds state_eef/action_eef; else DROID-8D joint-vel.
             eef_action=eef,
+            # Named schedule arms only: require the artifact flag at launch, and bind this
+            # config's name to the artifact's own meta["mode"] (see `AxisFrankaPretrainDataConfig`
+            # and `DataConfig.pretrain_expected_mode`).
+            schedule_required=schedule_required,
+            expected_mode=expected_mode,
             # NB: deliberately NO assets override -> own norm stats (compute_norm_stats),
             # NOT pi05_droid's. See the class docstring / reports/pretrain_dataloader_design.md.
         ),
@@ -1268,9 +1301,12 @@ _CONFIGS = [
     # The path is a CONFIG FIELD, not an env var, so a checkpoint's arm is recoverable from the
     # config it was launched with. Two names rather than one because the checkpoint directory and
     # the run record are keyed by config name, and "which arm is this?" must not require reading a
-    # command line back out of a log. The schedule is the whole difference: with it unset both
-    # names train the plain baseline, which `AxisFrankaPretrainDataConfig.create` cannot detect
-    # (an unset field is legitimate for a smoke test), so the arm TOMLs own that path.
+    # command line back out of a log. The schedule is the whole difference, so both names pass
+    # `schedule_required=True` here: `AxisFrankaPretrainDataConfig.create` now RAISES if
+    # schedule_path is still unset at launch, and `expected_mode` ("drop"/"anneal") is asserted
+    # against the artifact's own `meta["mode"]` in data_loader.py -- a launch that forgets the
+    # flag, or hands the wrong artifact to the wrong name, fails loudly instead of silently
+    # training the plain baseline (or the other arm) under this name.
     #
     # WARMUP IS NOT ROUND 1's HERE. `paper=True` keeps the literal 10,000-step warmup, and round 1
     # overrode it to 2,060 (10% of this budget, the fraction the paper uses) from its arm TOML.
@@ -1278,9 +1314,9 @@ _CONFIGS = [
     # the control they are compared against; a config-level default cannot enforce that, because
     # CLI overrides bypass it silently. See conf/experiments/onelayer_v3_stage1_arms.toml.
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
-                          name="pi05_axis_drop"),
+                          name="pi05_axis_drop", schedule_required=True, expected_mode="drop"),
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
-                          name="pi05_axis_anneal"),
+                          name="pi05_axis_anneal", schedule_required=True, expected_mode="anneal"),
     # INFERENCE-ONLY: serve the pi05_axis_pretrain_eef checkpoint to the LIBERO-Plus client.
     _axis_eef_libero_serve_config(),
     #
