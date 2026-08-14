@@ -1552,6 +1552,20 @@ _CONFIGS = [
                           name="pi05_axis_drop", schedule_required=True, expected_mode="drop"),
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
                           name="pi05_axis_anneal", schedule_required=True, expected_mode="anneal"),
+    # The SELECTIVE Filtered-BC cut. `pi05_axis_drop` above is WVM Eq E.6 at kappa = 0.0 (keep
+    # Delta >= 0); this is the percentile variant of the same equation. It needs its own name and
+    # its own `expected_mode` precisely because the two are the same MECHANISM at different
+    # strengths -- sharing a mode string would let either artifact load under either name, which is
+    # the confusion `expected_mode` exists to prevent.
+    #
+    # WHY THIS ARM EXISTS AT ALL: on this corpus 75.7% of rows are already advantaged, so
+    # `pi05_axis_drop` shifts only ~1.32x of the gradient budget onto advantaged rows even as a
+    # hard filter, and WVM's own top-70% would be nearly indistinguishable from it. The artifact
+    # this name expects is built at `--keep-top-frac 0.30` (see index_schedule.DEFAULT_KEEP_TOP_FRAC
+    # for why 0.30, and why nothing below ~0.136 is constructible from the weights).
+    _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
+                          name="pi05_axis_drop_top", schedule_required=True,
+                          expected_mode="drop_top"),
     #
     # ROUND-2 MECHANISM 3: pi0.7 quality conditioning. Same recipe and budget as the two arms
     # above (asserted against `pi05_axis_drop` itself in config_cfg_arm_test.py, so no
