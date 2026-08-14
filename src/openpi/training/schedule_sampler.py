@@ -90,13 +90,26 @@ class ScheduleSampler(torch.utils.data.Sampler[int]):
                 100.0 * num_train_steps / self.total_steps,
             )
 
-    def check_dataset_rows(self, n_dataset_rows: int) -> None:
-        """Every scheduled index must exist in this dataset.
+    def check_dataset_rows(self, n_dataset_rows: int, roots_index: str | None = None) -> None:
+        """The dataset must be the very corpus this schedule was built against.
 
         The artifact stores flat indices into the concatenated pretrain dataset, so a schedule
         built against a different corpus points at frames that are either absent (an IndexError
-        deep inside a worker, hours in) or -- worse, if the corpus merely grew -- present but
-        belonging to some other episode. Fail here, at loader construction, instead.
+        deep inside a worker, hours in) or -- worse, if the corpus merely GREW or its task set
+        shifted -- present but belonging to some other episode. Bounds alone cannot see that
+        case: every index stays in range while every index means something else.
+
+        So the binding is on SIZE, not on range: the generator records the concatenated row
+        count it enumerated as `meta["n_rows"]`, and that number must equal `len(dataset)`
+        exactly. Row identity in this corpus is positional (episodes concatenated in the roots
+        index's order), so any insertion, removal or reorder that could move a row also moves
+        the total -- with the sole exception of an equal-sized swap, which no operation on this
+        pipeline performs. `roots_index` is passed in only to name the other side of the
+        disagreement in the error; the sampler never reads it.
+
+        The order below is deliberate: negative/out-of-range rows are corruption signatures with
+        their own remedies, so they report themselves first; the size equality is the catch-all
+        that closes the grew-silently case none of them can see.
         """
         lo = int(self._rows.min(initial=0))
         if lo < 0:
@@ -114,6 +127,25 @@ class ScheduleSampler(torch.utils.data.Sampler[int]):
                 f"schedule {self.path} draws row {hi}, which is outside the dataset "
                 f"({n_dataset_rows} rows). The schedule was built against a different corpus; "
                 f"rebuild it against this roots index rather than truncating it."
+            )
+        n_rows = self.meta.get("n_rows")
+        if n_rows is None:
+            raise ValueError(
+                f"schedule {self.path} has no meta['n_rows'], so there is nothing to bind it to "
+                f"the corpus it was built against -- an artifact predating that field cannot be "
+                f"told apart from one built on a different corpus. Rebuild it with "
+                f"axis.dataset.build_index_schedule."
+            )
+        if int(n_rows) != n_dataset_rows:
+            source = roots_index or "the configured roots index"
+            raise ValueError(
+                f"corpus mismatch: schedule {self.path} was built against a dataset of "
+                f"{int(n_rows)} rows (its own meta['n_rows']), but the dataset assembled from "
+                f"{source} has {n_dataset_rows} rows. The schedule's indices are POSITIONS in "
+                f"the concatenated corpus, so with a different row count they name different "
+                f"frames -- and a corpus that merely grew would pass every bounds check while "
+                f"training on the wrong episodes. Rebuild the schedule against this roots "
+                f"index, or point the run at the roots index the schedule was built from."
             )
 
     def rows_for_step(self, t: int) -> np.ndarray:

@@ -480,7 +480,10 @@ def create_torch_data_loader(
                 # name. See `DataConfig.pretrain_expected_mode`.
                 _check_schedule_mode(data_config, sampler.meta)
                 sampler.check_batch(local_batch_size)
-                sampler.check_dataset_rows(len(dataset))
+                # Not just a bounds check: this is what binds the artifact to THIS corpus, via
+                # the row count the generator recorded. `roots_index` is passed so the error can
+                # name both sides of the disagreement. See `ScheduleSampler.check_dataset_rows`.
+                sampler.check_dataset_rows(len(dataset), data_config.pretrain_roots_index)
                 if num_train_steps is not None:
                     sampler.check_num_train_steps(num_train_steps)
                 logging.info(

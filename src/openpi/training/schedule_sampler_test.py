@@ -8,9 +8,16 @@ import pytest
 from openpi.training.schedule_sampler import ScheduleSampler
 
 
-def _write(tmp_path, rows, meta=None):
-    p = tmp_path / "s.npz"
-    meta = meta or {"mode": "anneal", "total_steps": rows.shape[0], "batch": rows.shape[1]}
+def _write(tmp_path, rows, meta=None, n_rows=100, name="s.npz"):
+    p = tmp_path / name
+    meta = meta or {
+        "mode": "anneal",
+        "total_steps": rows.shape[0],
+        "batch": rows.shape[1],
+        # The corpus the schedule was built against, which check_dataset_rows binds to
+        # len(dataset). 100 is the size the row-bounds tests below assume.
+        "n_rows": n_rows,
+    }
     np.savez(p, rows=rows.astype(np.int64), meta=np.array(json.dumps(meta)))
     return p
 
@@ -89,6 +96,36 @@ def test_row_beyond_the_dataset_raises(tmp_path):
     s.check_dataset_rows(100)
     with pytest.raises(ValueError, match="outside the dataset"):
         s.check_dataset_rows(50)
+
+
+def test_a_dataset_of_the_scheduled_size_passes(tmp_path):
+    rows = np.array([[0, 1], [2, 3]], dtype=np.int64)
+    s = ScheduleSampler(_write(tmp_path, rows, n_rows=100))
+    s.check_dataset_rows(100)  # must not raise
+
+
+@pytest.mark.parametrize("n_dataset_rows", [99, 101])
+def test_a_corpus_of_a_different_size_raises(tmp_path, n_dataset_rows):
+    """The case bounds cannot see: a corpus that GREW (101) leaves every scheduled index in
+    range while each one now names a different episode's frame. A shrunk corpus (99) is caught
+    only because these particular rows are small; `meta["n_rows"]` catches it either way."""
+    rows = np.array([[0, 1], [2, 3]], dtype=np.int64)
+    s = ScheduleSampler(_write(tmp_path, rows, n_rows=100))
+    with pytest.raises(ValueError, match="corpus mismatch") as excinfo:
+        s.check_dataset_rows(n_dataset_rows, "roots_5000.json")
+    message = str(excinfo.value)
+    assert "100" in message  # the schedule's own n_rows
+    assert str(n_dataset_rows) in message  # ...and the dataset it was handed
+    assert "roots_5000.json" in message  # the roots index
+    assert "s.npz" in message  # ...and the artifact that disagrees with it
+
+
+def test_a_schedule_without_n_rows_is_rejected(tmp_path):
+    """An artifact with no recorded corpus size cannot be told apart from one built elsewhere."""
+    rows = np.array([[0, 1], [2, 3]], dtype=np.int64)
+    s = ScheduleSampler(_write(tmp_path, rows, meta={"mode": "drop"}))
+    with pytest.raises(ValueError, match="n_rows"):
+        s.check_dataset_rows(100)
 
 
 def test_one_dimensional_artifact_is_rejected(tmp_path):

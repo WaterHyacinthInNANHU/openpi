@@ -9,6 +9,7 @@ and an arm cannot silently inherit round 1's env var on top of its schedule.
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 
 import pytest
 
@@ -16,6 +17,9 @@ import openpi.models.pi0_config as pi0_config
 import openpi.training.config as _config
 
 ARMS = ("pi05_axis_drop", "pi05_axis_anneal")
+
+# The round-1 control these arms must be a single-variable change from.
+ROUND1 = "pi05_axis_pretrain_eef_paper"
 
 # Round 1's `bc` budget, which these arms must match exactly to join the same table.
 _BUDGET = {"num_train_steps": 20_605, "batch_size": 64, "action_horizon": 10, "ema_decay": 0.999}
@@ -134,6 +138,68 @@ def test_expected_mode_reaches_the_data_config(mode: str, tmp_path) -> None:
 def test_no_expected_mode_leaves_the_field_unset(tmp_path) -> None:
     data = _factory(roots_index="roots.json").create(tmp_path, pi0_config.Pi0Config(pi05=True))
     assert data.pretrain_expected_mode is None
+
+
+def _norm_stats_dir(name: str) -> pathlib.Path:
+    """Where `name` will actually read norm stats from, via the production resolution path."""
+    cfg = _config.get_config(name)
+    resolved = cfg.data.norm_stats_dir(cfg.assets_dirs)
+    assert resolved is not None
+    return pathlib.Path(str(resolved)).resolve()
+
+
+@pytest.mark.parametrize("name", ARMS)
+def test_arm_resolves_to_round_ones_norm_stats(name: str) -> None:
+    """The arms must SHARE round 1's stats, and this must be true by construction, not by luck.
+
+    `TrainConfig.assets_dirs` is `assets_base_dir / name`, so without an explicit override each
+    arm resolves to `./assets/pi05_axis_drop` (or `_anneal`), which does not exist -- and
+    `_load_norm_stats` swallows that miss, leaving the run to die later in `transform_dataset`
+    with an instruction (`compute_norm_stats --config-name=...`) that cannot be carried out,
+    since compute_norm_stats has no way to pass `--data.schedule_path` past `schedule_required`.
+
+    Recomputing per-arm stats is not the alternative: it would make the arms differ from the
+    round-1 control in TWO things rather than one, and stats that silently belong to a different
+    dataset than the one being trained on have already cost this project two retractions.
+    """
+    assert _norm_stats_dir(name) == _norm_stats_dir(ROUND1)
+
+
+@pytest.mark.parametrize("name", ARMS)
+def test_arm_does_not_resolve_to_its_own_assets_dir(name: str) -> None:
+    """Guards the assertion above against the degenerate way it could pass: if `assets_dirs`
+    ever stopped being keyed on `name`, all three configs would agree while each still pointed
+    somewhere unintended."""
+    cfg = _config.get_config(name)
+    assert name not in str(_norm_stats_dir(name))
+    assert pathlib.Path(cfg.assets_dirs).name == name  # ...and the pitfall is still real
+
+
+def test_round_one_keeps_its_own_norm_stats() -> None:
+    """The override is for the round-2 arms only; round 1 computed its own and must keep them."""
+    cfg = _config.get_config(ROUND1)
+    assert cfg.data.assets.assets_dir is None
+    assert pathlib.Path(cfg.assets_dirs).name == ROUND1
+
+
+@pytest.mark.parametrize("name", ARMS)
+def test_arm_actually_loads_round_ones_norm_stats(name: str, monkeypatch) -> None:
+    """Not just the same string: the arm must come out of `create()` with stats in hand.
+
+    `assets_dir` is repo-relative (as is upstream's `assets_base_dir` default), so this runs
+    from the repo root the way a launch does.
+    """
+    repo_root = pathlib.Path(_config.__file__).parents[3]
+    stats = repo_root / "assets" / ROUND1 / "Devon018" / "Franka-Datasets-v2" / "norm_stats.json"
+    if not stats.exists():
+        pytest.skip(f"round 1 norm stats not present at {stats}")
+    monkeypatch.chdir(repo_root)
+    cfg = _config.get_config(name)
+    # schedule_path is per-run (conf/experiments), so supply one the way a launch would.
+    data = dataclasses.replace(
+        cfg.data, roots_index="roots.json", schedule_path="schedules/x.npz"
+    ).create(cfg.assets_dirs, cfg.model)
+    assert data.norm_stats is not None
 
 
 def test_schedule_arm_ignores_the_round_one_env_var(monkeypatch) -> None:

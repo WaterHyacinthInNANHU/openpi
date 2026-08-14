@@ -264,16 +264,30 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=self._load_norm_stats(self.norm_stats_dir(assets_dirs)),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
-    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
+    def norm_stats_dir(self, assets_dirs: pathlib.Path) -> epath.Path | None:
+        """The directory `create_base_config` will read norm stats from, without reading them.
+
+        Split out of `_load_norm_stats` so a test can assert WHICH directory a config resolves
+        to. `_load_norm_stats` swallows a miss and returns None, and the resulting failure
+        surfaces much later as "Normalization stats not found" from `transform_dataset`, so
+        nothing else notices when two configs that must share one stats directory stop doing so
+        (see the round-2 index-schedule arms in `_axis_pretrain_config`).
+        """
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        asset_id = self.assets.asset_id or repo_id
         if asset_id is None:
             return None
+        return epath.Path(self.assets.assets_dir or assets_dirs) / asset_id
+
+    def _load_norm_stats(self, data_assets_dir: epath.Path | None) -> dict[str, _transforms.NormStats] | None:
+        if data_assets_dir is None:
+            return None
         try:
-            data_assets_dir = str(assets_dir / asset_id)
-            norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+            norm_stats = _normalize.load(_download.maybe_download(str(data_assets_dir)))
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             return norm_stats
         except FileNotFoundError:
@@ -1070,6 +1084,12 @@ def _axis_fullweight_speedtest(task_id: int = 1644, *, batch_size: int = 32, fsd
     )
 
 
+# Round 1's config name. The round-2 index-schedule arms bind their norm stats to ITS assets
+# directory instead of resolving to their own (which does not exist) -- see `_axis_pretrain_config`.
+_AXIS_ROUND1_NAME = "pi05_axis_pretrain_eef_paper"
+_AXIS_PRETRAIN_REPO_ID = "Devon018/Franka-Datasets-v2"
+
+
 def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
     eef: bool = False, paper: bool = False, name: str | None = None,
@@ -1111,7 +1131,8 @@ def _axis_pretrain_config(
 
     Everything Table 10 shares with the base arm is already true here and is NOT re-stated:
     init from pi05_base (the `eef` arm), full-model (no LoRA, no freeze_filter),
-    OWN norm stats (no assets override),
+    OWN norm stats (no assets override -- except the round-2 schedule arms, which reuse round
+    1's; see the `name` paragraphs below),
     action_dim padded to 32, and AdamW(b1=0.9, b2=0.95, eps=1e-8, wd=1e-10, clip=1.0), which
     is openpi's `_optimizer.AdamW` default field-for-field -- so the paper's optimizer block
     is reached by NOT passing an optimizer, and any future edit to those defaults is a
@@ -1132,6 +1153,23 @@ def _axis_pretrain_config(
     $AXIS_PRETRAIN_AWR_WEIGHTS there would silently add round 1's loss reweighting on top of the
     schedule (`AxisFrankaPretrainDataConfig.create` refuses that combination anyway, so the
     alternative is a confusing hard failure on a box where the variable happens to be exported).
+
+    Passing `name` ALSO pins norm stats to ROUND 1's assets directory
+    (`./assets/pi05_axis_pretrain_eef_paper/Devon018/Franka-Datasets-v2`) instead of the arm's
+    own. Two reasons, both load-bearing:
+
+    * Without it the arms do not run at all. `TrainConfig.assets_dirs` is
+      `assets_base_dir / name`, so `pi05_axis_drop` would resolve to `./assets/pi05_axis_drop`,
+      which does not exist; `_load_norm_stats` swallows the miss and `transform_dataset` then
+      dies telling you to run `scripts/compute_norm_stats.py --config-name=<your-config>` -- an
+      instruction that CANNOT be followed, because compute_norm_stats calls
+      `config.data.create(config.assets_dirs, config.model)` with no way to pass
+      `--data.schedule_path` and so trips `schedule_required` before computing anything.
+    * Recomputing per-arm stats would be a SECOND parity break against round 1. These arms must
+      differ from the round-1 control in exactly ONE thing -- the supervision the schedule
+      encodes -- and this project has already retracted two conclusions that came from norm
+      stats silently belonging to a different dataset than the one being trained on. So the
+      sharing is explicit here and asserted in config_schedule_arms_test.py, not incidental.
 
     The paper's action space is NOT changed here: Appendix F's "7D joint-position action" is
     a typo for the LIBERO/robosuite OSC_POSE 7-D delta `[dpos(3), daxis-angle(3), gripper]`,
@@ -1154,7 +1192,18 @@ def _axis_pretrain_config(
             **(_KI_MODEL_KWARGS if knowledge_insulation else {}),
         ),
         data=AxisFrankaPretrainDataConfig(
-            repo_id="Devon018/Franka-Datasets-v2",
+            repo_id=_AXIS_PRETRAIN_REPO_ID,
+            # Round-2 schedule arms (name given) SHARE round 1's norm stats; every other arm
+            # keeps the default (its own `assets_base_dir / name`). See the docstring's `name`
+            # paragraphs: without this the arms cannot resolve norm stats at all, and
+            # recomputing them per arm would break parity with the round-1 control.
+            assets=(
+                AssetsConfig(
+                    assets_dir=f"./assets/{_AXIS_ROUND1_NAME}", asset_id=_AXIS_PRETRAIN_REPO_ID
+                )
+                if name
+                else AssetsConfig()
+            ),
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             # Schedule arms (name given) never take AWR weights from the environment; see the
@@ -1168,8 +1217,9 @@ def _axis_pretrain_config(
             # and `DataConfig.pretrain_expected_mode`).
             schedule_required=schedule_required,
             expected_mode=expected_mode,
-            # NB: deliberately NO assets override -> own norm stats (compute_norm_stats),
-            # NOT pi05_droid's. See the class docstring / reports/pretrain_dataloader_design.md.
+            # NB: for every arm but the round-2 schedule ones the `assets` above is the empty
+            # default -> own norm stats (compute_norm_stats), NOT pi05_droid's. See the class
+            # docstring / reports/pretrain_dataloader_design.md.
         ),
         # EEF variant inits from pi05_base (its EEF control-mode head); the joint variant from
         # pi05_droid (DROID-8D joint-velocity). Only weights are reused; norm stats are ours.

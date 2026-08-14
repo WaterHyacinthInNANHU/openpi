@@ -89,11 +89,13 @@ def test_with_real_dataset():
 
 
 def test_torch_data_loader_replays_the_schedule_rows_in_order(tmp_path):
-    """If `sampler=sampler` regressed to `sampler=None` (or to any sampler other than the
-    ScheduleSampler), the loader would draw its own rows -- shuffled or sequential -- instead of
-    replaying the artifact, and the arm would silently train as plain BC. This is the exact
-    failure the whole index-schedule feature exists to prevent, so it must be caught by a test,
-    not only by a review of the wiring.
+    """`TorchDataLoader` must hand a ScheduleSampler's rows through unaltered.
+
+    Scope: this covers only the sampler -> torch DataLoader contract (no reshuffle, no reorder,
+    no padding), because it constructs the loader itself. It does NOT exercise the wiring inside
+    `create_torch_data_loader` -- see
+    `test_create_torch_data_loader_replays_the_schedule_rows_in_order` below, which is the test
+    that fails if `sampler=sampler` there ever regresses to `sampler=None`.
 
     Modeled on `test_torch_data_loader_parallel`: a small `FakeDataset` (deterministic per index
     via `jax.random.key(index)`) driven directly through `TorchDataLoader`.
@@ -128,6 +130,140 @@ def test_torch_data_loader_replays_the_schedule_rows_in_order(tmp_path):
         assert len(actual_leaves) == len(expected_leaves) > 0
         for a, e in zip(actual_leaves, expected_leaves, strict=True):
             np.testing.assert_array_equal(np.asarray(a), np.asarray(e))
+
+
+@pytest.mark.parametrize(
+    "transform", [_data_loader.transform_dataset, _data_loader.transform_iterable_dataset]
+)
+def test_missing_norm_stats_raise_rather_than_training_unnormalised(transform):
+    """`_load_norm_stats` SWALLOWS a missing assets directory and returns None, logging one INFO
+    line. That swallow is upstream behaviour and is not removed here, so what matters is whether
+    anything downstream can then reach training with `norm_stats=None` -- an arm trained
+    unnormalised and compared against a normalised control would look comparable and be invalid,
+    which is exactly the shape of the two conclusions this project has already retracted.
+
+    It cannot. Both transform entry points gate on `repo_id != "fake" and not skip_norm_stats`
+    and raise, and neither training entry point (scripts/train.py, scripts/train_pytorch.py)
+    passes `skip_norm_stats`, so a config with a real repo_id and missing assets fails at loader
+    construction. Pinned here for both transforms because this is the only thing standing
+    between a swallowed miss and a silently unnormalised run -- the assets binding in
+    `_axis_pretrain_config` fixes only the two round-2 arms, while the swallow is generic.
+    """
+    cfg = _config.get_config("pi05_axis_drop")
+    data_config = dataclasses.replace(
+        cfg.data,
+        # A fresh box, or any config whose assets have not been computed.
+        assets=_config.AssetsConfig(
+            assets_dir="/nonexistent/assets", asset_id="Devon018/Franka-Datasets-v2"
+        ),
+        roots_index="roots.json",
+        schedule_path="s.npz",
+    ).create(cfg.assets_dirs, cfg.model)
+    assert data_config.norm_stats is None
+    assert data_config.repo_id != "fake"
+
+    with pytest.raises(ValueError, match="Normalization stats not found"):
+        transform([{}], data_config)
+
+
+def test_create_torch_data_loader_replays_the_schedule_rows_in_order(tmp_path):
+    """The end-to-end wiring test: drive `create_torch_data_loader` and check what comes out.
+
+    Everything else about the index schedule is covered by tests that construct a
+    `ScheduleSampler`, or call a `_check_*` helper, themselves -- so deleting the corresponding
+    call site inside `create_torch_data_loader` leaves them all green while the arm silently
+    trains as plain BC on sequential rows. That failure (an arm built but never used) has
+    already happened twice in this work, so it needs a test that only the real construction path
+    can satisfy.
+
+    Verified to FAIL when `sampler=sampler` in `create_torch_data_loader` is changed to
+    `sampler=None`: the loader then yields rows 0..N sequentially and the very first batch
+    mismatches.
+
+    `repo_id="fake"` makes `create_torch_dataset` return a 1024-sample `FakeDataset` (returned
+    before the pretrain-concat branch, so no corpus is touched) and makes `transform_dataset`
+    skip norm stats -- but `pretrain_roots_index` is still what routes the loader into the
+    pretrain sampler branch, and `pretrain_schedule_path` into the schedule sub-branch, so the
+    exact code under test is the code that runs on the box.
+    """
+    model_config = pi0_config.Pi0Config(action_dim=8, action_horizon=4, max_token_len=16)
+    n_dataset_rows = 1024  # create_torch_dataset's FakeDataset size for repo_id="fake"
+
+    total_steps, batch = 3, 4
+    rng = np.random.default_rng(0)
+    # Repeats allowed and no row-major structure, so neither a sequential nor a shuffled sampler
+    # could reproduce this by accident.
+    rows = rng.integers(0, n_dataset_rows, size=(total_steps, batch)).astype(np.int64)
+    schedule_path = tmp_path / "schedule.npz"
+    np.savez(
+        schedule_path,
+        rows=rows,
+        meta=np.array(json.dumps({"mode": "drop", "n_rows": n_dataset_rows})),
+    )
+
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        repo_id="fake",
+        # Present only to select the pretrain branch; the schedule sub-branch never reads it.
+        pretrain_roots_index="roots_for_the_fake_dataset.json",
+        pretrain_schedule_path=str(schedule_path),
+        pretrain_expected_mode="drop",
+    )
+
+    loader = _data_loader.create_torch_data_loader(
+        data_config,
+        model_config,
+        action_horizon=model_config.action_horizon,
+        batch_size=batch,
+        num_batches=total_steps,
+        num_workers=0,
+        num_train_steps=total_steps,
+    )
+
+    # The same rows, read straight off the dataset the loader built, to compare against.
+    reference = _data_loader.transform_dataset(
+        _data_loader.create_torch_dataset(data_config, model_config.action_horizon, model_config),
+        data_config,
+    )
+
+    batches = list(loader)
+    assert len(batches) == total_steps
+    for t, (observation, actions) in enumerate(batches):
+        expected = _data_loader._collate_fn([reference[int(i)] for i in rows[t]])  # noqa: SLF001
+        np.testing.assert_array_equal(np.asarray(actions), np.asarray(expected["actions"]))
+        np.testing.assert_array_equal(np.asarray(observation.state), np.asarray(expected["state"]))
+
+
+def test_create_torch_data_loader_rejects_a_schedule_built_on_another_corpus(tmp_path):
+    """The corpus binding must be reached through the real construction path too: a schedule
+    whose `meta["n_rows"]` disagrees with the dataset it is handed indexes different frames."""
+    model_config = pi0_config.Pi0Config(action_dim=8, action_horizon=4, max_token_len=16)
+    rows = np.zeros((3, 4), dtype=np.int64)
+    schedule_path = tmp_path / "schedule.npz"
+    np.savez(
+        schedule_path,
+        rows=rows,
+        # 1023, not the FakeDataset's 1024: one episode short, every index still in bounds.
+        meta=np.array(json.dumps({"mode": "drop", "n_rows": 1023})),
+    )
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        repo_id="fake",
+        pretrain_roots_index="roots_for_the_fake_dataset.json",
+        pretrain_schedule_path=str(schedule_path),
+        pretrain_expected_mode="drop",
+    )
+    with pytest.raises(ValueError, match="corpus mismatch") as excinfo:
+        _data_loader.create_torch_data_loader(
+            data_config,
+            model_config,
+            action_horizon=model_config.action_horizon,
+            batch_size=4,
+            num_batches=3,
+            num_workers=0,
+            num_train_steps=3,
+        )
+    assert "roots_for_the_fake_dataset.json" in str(excinfo.value)
 
 
 def test_schedule_mode_mismatch_raises():
