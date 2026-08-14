@@ -561,11 +561,31 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # data_loader.py -- binds the config NAME to the artifact's actual content, since nothing
     # else does (see DataConfig.pretrain_expected_mode).
     expected_mode: str | None = None
+    # The config NAME whose norm stats this one must read (round 1's, for the round-2 schedule
+    # arms), or None to keep its own. A name, not a path, deliberately: `TrainConfig.assets_dirs`
+    # is `assets_base_dir / name`, so resolving the sibling from the `assets_dirs` handed to
+    # `create()` tracks any `--assets-base-dir` override. A literal `./assets/<round1>` would
+    # instead pin the arms to the DEFAULT base while an overridden round 1 moved elsewhere --
+    # silently leaving the arms on stats belonging to a different dataset, the exact failure this
+    # binding exists to prevent (and one this project has already retracted two conclusions over).
+    norm_stats_from: str | None = None
     default_prompt: str | None = None
     # Relative-EEF action space (LIBERO-Plus proxy benchmark): feed the baked `state_eef`(8) /
     # `action_eef`(7, robosuite OSC_POSE delta) columns and slice the output to 7. Default False
     # keeps the DROID-8D joint-velocity layout (for a future real-world checkpoint).
     eef_action: bool = False
+
+    @override
+    def norm_stats_dir(self, assets_dirs: pathlib.Path) -> epath.Path | None:
+        """Round-2 arms read a SIBLING config's stats dir, resolved from the base they were given.
+
+        `assets_dirs` is `TrainConfig.assets_base_dir / TrainConfig.name`, so swapping the last
+        component is the same computation round 1 does, under whatever base this run actually
+        uses. See `norm_stats_from` for why this is not the literal path it replaces.
+        """
+        if self.norm_stats_from is None:
+            return super().norm_stats_dir(assets_dirs)
+        return super().norm_stats_dir(pathlib.Path(assets_dirs).parent / self.norm_stats_from)
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -1154,9 +1174,11 @@ def _axis_pretrain_config(
     schedule (`AxisFrankaPretrainDataConfig.create` refuses that combination anyway, so the
     alternative is a confusing hard failure on a box where the variable happens to be exported).
 
-    Passing `name` ALSO pins norm stats to ROUND 1's assets directory
-    (`./assets/pi05_axis_pretrain_eef_paper/Devon018/Franka-Datasets-v2`) instead of the arm's
-    own. Two reasons, both load-bearing:
+    Passing `name` ALSO pins norm stats to ROUND 1's assets directory (`<assets_base_dir>/
+    pi05_axis_pretrain_eef_paper/Devon018/Franka-Datasets-v2`) instead of the arm's own -- by
+    round 1's config NAME (`norm_stats_from`), resolved against whatever `assets_base_dir` the run
+    uses, so an `--assets-base-dir` override moves the arms and round 1 together instead of
+    stranding the arms on the old stats. Two reasons, both load-bearing:
 
     * Without it the arms do not run at all. `TrainConfig.assets_dirs` is
       `assets_base_dir / name`, so `pi05_axis_drop` would resolve to `./assets/pi05_axis_drop`,
@@ -1196,14 +1218,11 @@ def _axis_pretrain_config(
             # Round-2 schedule arms (name given) SHARE round 1's norm stats; every other arm
             # keeps the default (its own `assets_base_dir / name`). See the docstring's `name`
             # paragraphs: without this the arms cannot resolve norm stats at all, and
-            # recomputing them per arm would break parity with the round-1 control.
-            assets=(
-                AssetsConfig(
-                    assets_dir=f"./assets/{_AXIS_ROUND1_NAME}", asset_id=_AXIS_PRETRAIN_REPO_ID
-                )
-                if name
-                else AssetsConfig()
-            ),
+            # recomputing them per arm would break parity with the round-1 control. Expressed as
+            # round 1's NAME, resolved against whatever `assets_base_dir` this run uses -- a
+            # literal `./assets/<round1>` would silently stop following round 1 the moment
+            # `--assets-base-dir` was passed. See `AxisFrankaPretrainDataConfig.norm_stats_from`.
+            norm_stats_from=_AXIS_ROUND1_NAME if name else None,
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             # Schedule arms (name given) never take AWR weights from the environment; see the

@@ -302,3 +302,44 @@ def test_pytorch_framework_with_a_schedule_raises():
 def test_pytorch_framework_without_a_schedule_does_not_raise():
     data_config = _config.DataConfig()
     _data_loader._check_schedule_unsupported_on_pytorch(data_config)  # must not raise
+
+
+# --- the filename<->reward_id binding -----------------------------------------------------------
+#
+# `_check_schedule_mode` cannot separate `drop_v2` from `drop_phase`: same config name
+# (`pi05_axis_drop`), same meta["mode"], different reward. Only the artifact's FILENAME says
+# which, and nothing checked it against the artifact's contents.
+
+
+@pytest.mark.parametrize(
+    ("stem", "mode", "reward_id"),
+    [("drop_v2", "drop", "v2"), ("drop_phase", "drop", "phase"),
+     ("anneal_v2", "anneal", "v2"), ("anneal_phase", "anneal", "phase")],
+)
+def test_the_four_shipped_artifact_names_match_their_own_meta(stem, mode, reward_id):
+    """The names and pairings the round-2 arms actually launch with (see
+    reports/round2_schedule_artifacts.md); the check must accept every one of them."""
+    _data_loader._check_schedule_reward_id(
+        f"/some/scratch/schedules/{stem}.npz", {"mode": mode, "reward_id": reward_id}
+    )  # must not raise
+
+
+def test_a_drop_artifact_rebuilt_from_the_other_reward_is_refused():
+    """`drop_v2.npz` carrying the phase reward would train under `exp_name=v3_5000_drop_v2` and
+    pass every other guard -- the mode matches, the corpus matches, the budget matches."""
+    with pytest.raises(ValueError, match="drop_phase"):
+        _data_loader._check_schedule_reward_id(
+            "schedules/drop_v2.npz", {"mode": "drop", "reward_id": "phase"}
+        )
+
+
+def test_a_mode_shaped_name_without_a_reward_id_in_the_meta_is_refused():
+    with pytest.raises(ValueError, match="reward_id"):
+        _data_loader._check_schedule_reward_id("schedules/drop_v2.npz", {"mode": "drop"})
+
+
+@pytest.mark.parametrize("path", ["s.npz", "/tmp/staging/schedule.npz", "run_2026-08-14.npz"])
+def test_a_name_that_makes_no_claim_is_left_alone(path):
+    """A name outside the `<mode>_<reward_id>` convention claims nothing, so there is nothing to
+    contradict: the guard must not turn a convention into a requirement."""
+    _data_loader._check_schedule_reward_id(path, {"mode": "drop", "reward_id": "v2"})

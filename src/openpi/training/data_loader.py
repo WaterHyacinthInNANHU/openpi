@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -361,6 +362,50 @@ def _check_schedule_mode(data_config: _config.DataConfig, sampler_meta: dict) ->
         )
 
 
+# The `mode`s `axis.dataset.index_schedule.MODES` can produce. Duplicated (three strings) rather
+# than imported: that module is offline tier. Used only to recognise a `<mode>_<reward_id>.npz`
+# artifact NAME, so a checkout drift here weakens `_check_schedule_reward_id` to a no-op on the
+# unrecognised name rather than making it wrong.
+_SCHEDULE_MODES = ("vanilla", "drop", "anneal")
+
+
+def _check_schedule_reward_id(schedule_path: str, sampler_meta: dict) -> None:
+    """Bind a `<mode>_<reward_id>.npz` filename to the artifact's own reward, since nothing else does.
+
+    `_check_schedule_mode` cannot separate the two drop arms from each other: `drop_v2` and
+    `drop_phase` both run under the config name `pi05_axis_drop` and both carry `meta["mode"] ==
+    "drop"`, so only the artifact FILENAME in the TOML's `data.schedule_path` says which reward
+    produced them -- and until this check, nothing compared that filename against the artifact's
+    contents. A `drop_v2.npz` accidentally rebuilt from the phase weights would train under
+    `exp_name=v3_5000_drop_v2`, pass every other guard, and differ only in one log line.
+
+    Only names of the `<mode>_<reward_id>` shape are checked, recognised by their leading token
+    being a schedule mode. Any other name (a staging path, `schedule.npz`, a dated file) makes no
+    claim about its contents, so there is nothing to contradict and this is a no-op -- the check
+    must not turn a naming convention into a requirement.
+    """
+    stem = pathlib.Path(schedule_path).stem
+    if stem.split("_", 1)[0] not in _SCHEDULE_MODES:
+        return
+    mode, reward_id = sampler_meta.get("mode"), sampler_meta.get("reward_id")
+    if reward_id is None:
+        raise ValueError(
+            f"schedule {schedule_path} is named for a mode and reward but its meta carries no "
+            f"'reward_id', so the name cannot be checked against the artifact. Rebuild it with "
+            f"axis.dataset.build_index_schedule, which stamps the reward the weights came from."
+        )
+    expected = f"{mode}_{reward_id}"
+    if stem != expected:
+        raise ValueError(
+            f"schedule {schedule_path} is named {stem!r} but its own meta reports mode={mode!r} "
+            f"and reward_id={reward_id!r}, i.e. {expected!r}. The filename is the ONLY thing that "
+            f"distinguishes the two rewards within one arm (both drop artifacts carry "
+            f"mode='drop' and run under the same config name), so this run would record itself as "
+            f"{stem!r} while training {expected!r}. Rebuild the artifact or launch the one the "
+            f"name promises."
+        )
+
+
 def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -479,6 +524,10 @@ def create_torch_data_loader(
                 # launch, so a mismatched artifact would otherwise train silently under the wrong
                 # name. See `DataConfig.pretrain_expected_mode`.
                 _check_schedule_mode(data_config, sampler.meta)
+                # ...and the mode alone cannot tell `drop_v2` from `drop_phase`: same config name,
+                # same meta["mode"], different reward. The filename is the only thing that
+                # separates them, so it is checked against the artifact's own reward_id.
+                _check_schedule_reward_id(schedule_path, sampler.meta)
                 sampler.check_batch(local_batch_size)
                 # Not just a bounds check: this is what binds the artifact to THIS corpus, via
                 # the row count the generator recorded. `roots_index` is passed so the error can

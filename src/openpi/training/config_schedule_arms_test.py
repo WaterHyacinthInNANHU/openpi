@@ -179,7 +179,29 @@ def test_round_one_keeps_its_own_norm_stats() -> None:
     """The override is for the round-2 arms only; round 1 computed its own and must keep them."""
     cfg = _config.get_config(ROUND1)
     assert cfg.data.assets.assets_dir is None
+    assert cfg.data.norm_stats_from is None
     assert pathlib.Path(cfg.assets_dirs).name == ROUND1
+
+
+@pytest.mark.parametrize("name", ARMS)
+def test_arm_follows_round_one_under_a_non_default_assets_base_dir(name: str, tmp_path) -> None:
+    """The binding must be to round 1's CONFIG, not to a path that happens to match it today.
+
+    `assets_dirs` is `assets_base_dir / name`, and `assets_base_dir` is a CLI flag. Expressed as
+    the literal `./assets/pi05_axis_pretrain_eef_paper` this agreed with round 1 only while the
+    default held: pass `--assets-base-dir` and round 1's stats move while the arms stay pinned to
+    the old directory -- silently training against stats belonging to a different dataset, which
+    is the exact failure the binding exists to prevent. The default-path assertion above cannot
+    see that, since both sides move together there by construction.
+    """
+    base = str(tmp_path / "elsewhere")
+    arm = dataclasses.replace(_config.get_config(name), assets_base_dir=base)
+    round1 = dataclasses.replace(_config.get_config(ROUND1), assets_base_dir=base)
+    resolved = arm.data.norm_stats_dir(arm.assets_dirs)
+    assert resolved is not None
+    assert pathlib.Path(str(resolved)) == pathlib.Path(str(round1.data.norm_stats_dir(round1.assets_dirs)))
+    # ...and it actually followed the override rather than staying on ./assets
+    assert str(resolved).startswith(base)
 
 
 @pytest.mark.parametrize("name", ARMS)
