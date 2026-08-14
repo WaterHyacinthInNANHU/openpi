@@ -704,9 +704,16 @@ class PresentationSampler(torch.utils.data.Sampler[int]):
     identical -- every row exactly once -- so it costs the twin nothing the parity claim covers.
 
     ON RESUME. Like `RowSampler`, this restarts at presentation 0, and openpi checkpoints no
-    loader position. A resumed stage-2 run therefore repeats presentation 0's dropout pattern
-    rather than continuing the sequence. Stage 2's claim is not coverage neutrality, so this is
-    not the `_check_quality_resume` hazard, but it is the same mechanism: restart clean.
+    loader position. A resumed stage-2 run therefore replays presentation 0's (or whichever
+    presentation the rebuilt sampler starts at) dropout pattern a second time instead of
+    continuing the sequence: rows that presentation dropped are dropped again, rows it kept are
+    kept again, and the later presentations the run's step budget was counting on are never
+    reached. Stage 2's claim is not coverage neutrality, so this is not exactly the
+    `_check_quality_resume` hazard -- but it protects a different property (per-example rather
+    than per-row dropout over ~5.7 epochs) that a resume degrades the same way, by partially
+    reintroducing the fixed-partition bug this whole class exists to remove. `data_loader`'s
+    `_check_stage2_quality_resume` REFUSES a resume while this path is active, for that reason --
+    it does not merely document "restart clean" and hope.
     """
 
     def __init__(self, n_rows: int, *, seed: int = 0, shuffle: bool = True):

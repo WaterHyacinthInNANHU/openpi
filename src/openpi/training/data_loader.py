@@ -449,6 +449,51 @@ def _check_quality_resume(quality_path: str, resuming: bool) -> None:
         )
 
 
+def _check_stage2_quality_resume(resuming: bool) -> None:
+    """A resume restarts `PresentationSampler` at presentation 0 while the optimiser continues
+    from step k.
+
+    Stage 2's claim is NOT coverage neutrality -- that is `_check_quality_resume`'s claim, about
+    stage 1's `RowSampler`. Stage 2's claim is that dropout is drawn PER EXAMPLE rather than per
+    row, because it runs ~5.7 epochs over the LIBERO corpus (30,000 x 64 samples over 338,575
+    frames) and a row-keyed draw would fit the unconditional branch on a FIXED 19.25% partition
+    instead: ~65k rows seen 5.7 times each, and the conditional branch never seeing them. That is
+    exactly why `PresentationSampler` exists and why `LiberoQualityConditioning.dropped` takes a
+    required presentation counter.
+
+    That property depends on the counter actually advancing across the run. `PresentationSampler`
+    restarts `self._presentation` at 0 every time it is constructed, and openpi checkpoints no
+    loader position at all (`checkpoints.restore_state` drops its `data_loader` argument). So a
+    resume rebuilds the sampler at presentation 0 and replays that pass's dropout pattern a second
+    time: rows the first pass dropped are dropped again rather than re-drawn, rows it kept are kept
+    again, and the later presentations the run's step budget was counting on are never reached.
+    That partially reintroduces the fixed-partition bug the presentation counter exists to remove
+    -- not a full reversion (only the replayed presentations repeat; presentations beyond the
+    resume point are simply never trained), but a real and undisclosed degradation of the same
+    property. Nothing in the loss curve, the checkpoint or the run record shows it.
+
+    Same cause as `_check_quality_resume` and `_check_schedule_resume` -- no loader position is
+    checkpointed -- and the same response: refuse rather than warn. `PresentationSampler`'s own
+    docstring used to argue this was fine because stage 2's claim is not coverage neutrality; that
+    is true but beside the point, since the presentation counter protects a different property
+    that a resume degrades just the same.
+    """
+    if resuming:
+        raise ValueError(
+            "config.resume is set together with stage-2 presentation-keyed quality conditioning "
+            "(LeRobotLiberoDataConfig.quality_tag), but openpi checkpoints no data-loader "
+            "position (checkpoints.restore_state drops its data_loader argument): "
+            "PresentationSampler restarts its presentation counter at 0 on every construction, so "
+            "a resume would replay presentation 0's dropout pattern instead of continuing the "
+            "sequence -- rows dropped the first time through are dropped again, rows kept are "
+            "kept again, and the later presentations the run's step budget assumed are never "
+            "reached. That partially reintroduces the fixed-partition bug the presentation "
+            "counter exists to remove: over stage 2's ~5.7 epochs the unconditional branch would "
+            "be skewed toward whichever rows the replayed presentation(s) happened to drop, with "
+            "nothing in the loss curve to show it. Restart the run clean instead of resuming."
+        )
+
+
 def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
     """A resume replays the schedule from row 0 while the optimiser continues from step k.
 
@@ -574,10 +619,11 @@ def create_torch_data_loader(
             which must refuse a budget longer than its artifact (see ScheduleSampler), and logged
             by the stage-2 quality path as the number of presentations the run will need.
         resuming: Whether this run is actually resuming from a checkpoint. Consulted by the
-            index-schedule path and by the stage-1 quality path, both of which must refuse to
-            resume: openpi checkpoints no loader position, so the row sequence would restart at 0
-            while the optimiser continued from step k. See `_check_schedule_resume` and
-            `_check_quality_resume`.
+            index-schedule path, the stage-1 quality path and the stage-2 quality path, all three
+            of which must refuse to resume: openpi checkpoints no loader position, so the row (or
+            presentation) sequence would restart at 0 while the optimiser continued from step k.
+            See `_check_schedule_resume`, `_check_quality_resume` and
+            `_check_stage2_quality_resume`.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     quality_path = getattr(data_config, "pretrain_quality_path", None)
@@ -595,6 +641,11 @@ def create_torch_data_loader(
                 f"tag the same prompt from different sources; one run cannot be both stages."
             )
         _check_stage2_quality_unsupported_on_pytorch(framework)
+        # RAISES. PresentationSampler restarts at presentation 0 on a resume while the optimiser
+        # continues from step k, so a mid-run resume would replay one presentation's dropout
+        # pattern instead of continuing the sequence -- see `_check_stage2_quality_resume`.
+        # Checked first, before anything expensive.
+        _check_stage2_quality_resume(resuming)
         # ONE call builds the wrapper and the sampler: drawn 0..n-1 by any other sampler, the
         # wrapper reports presentation 0 for every sample and stage 2 silently trains the fixed
         # 19.25% partition instead of a dropout. See `wrap_presentations`.

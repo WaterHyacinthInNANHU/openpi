@@ -97,7 +97,7 @@ def _decode(observation, i, tok) -> str:
     return tok._tokenizer.decode([int(t) for t in ids[mask]])  # noqa: SLF001
 
 
-def _drive(config_name: str, *, num_batches: int = 8, framework: str = "jax"):
+def _drive(config_name: str, *, num_batches: int = 8, framework: str = "jax", resuming: bool = False):
     """The REGISTERED config, through the real loader. `shuffle=False` and `num_workers=0` make
     the fetch order the row order WITHIN each presentation -- `PresentationSampler` yields
     `presentation * N_ROWS + row` in row order when it is not shuffling -- so a decoded prompt can
@@ -116,6 +116,7 @@ def _drive(config_name: str, *, num_batches: int = 8, framework: str = "jax"):
             shuffle=False,
             skip_norm_stats=True,
             framework=framework,
+            resuming=resuming,
         )
     )
 
@@ -240,6 +241,33 @@ def test_the_pytorch_path_refuses_the_stage2_arm(toy):
     fixed partition restored, with a realized rate that still reads 0.8075."""
     with pytest.raises(ValueError, match="presentation"):
         _drive(TWIN, framework="pytorch")
+
+
+def test_a_resume_is_refused_through_the_real_loader(toy):
+    """PER-EXAMPLE DROPOUT UNDER RESUME -- the one way this arm's property can be false while
+    every other guard here stays green.
+
+    `PresentationSampler` restarts its presentation counter at 0 on every construction and openpi
+    checkpoints no loader position, so a resume replays one presentation's dropout pattern a
+    second time instead of continuing the sequence: rows that presentation dropped are dropped
+    again, rows it kept are kept again, and the later presentations the run's step budget assumed
+    are never reached -- partially reintroducing the fixed-partition bug the presentation counter
+    exists to remove. There is no loss-curve signature.
+
+    Driven through the real loader, not by calling the checker directly: a unit test of
+    `_check_stage2_quality_resume` stays green if its call site inside `create_torch_data_loader`
+    is ever deleted, which is the failure this test exists to catch.
+    """
+    with pytest.raises(ValueError, match="resum"):
+        _drive(TWIN, resuming=True)
+
+
+def test_the_parent_still_resumes(toy):
+    """The refusal must be the STAGE-2 ARM's, not a blanket ban: the five arms with no quality
+    conditioning in their repack group are allowed to resume, and a guard that fired for every
+    config would be found only by a failed relaunch."""
+    toy.clear()
+    assert _drive(PARENT, resuming=True)
 
 
 def test_the_parent_is_untouched_by_the_presentation_wiring(toy):
