@@ -193,8 +193,18 @@ def create_rlds_dataset(
     )
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
-    """Transform the dataset by applying the data transforms."""
+def training_transforms(
+    data_config: _config.DataConfig, *, skip_norm_stats: bool = False
+) -> list[_transforms.DataTransformFn]:
+    """The ordered transform list `transform_dataset` applies, as a list.
+
+    Split out of `transform_dataset` for ONE caller: the quality-conditioning arm, which cannot
+    use `transform_dataset` at all. `quality_conditioning.wrap_and_transform` has to build the
+    wrapper and the transform TOGETHER (either alone is a bug, and one of the two is silent), so
+    it needs this list rather than an already-transformed dataset. Returning the list -- instead
+    of letting the arm assemble its own -- is what keeps the arm's chain identical to the
+    control's below the head: a second spelling of these four groups would drift.
+    """
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
@@ -204,15 +214,17 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-    )
+    return [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.model_transforms.inputs,
+    ]
+
+
+def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+    """Transform the dataset by applying the data transforms."""
+    return TransformedDataset(dataset, training_transforms(data_config, skip_norm_stats=skip_norm_stats))
 
 
 def transform_iterable_dataset(
@@ -468,7 +480,52 @@ def create_torch_data_loader(
             index-schedule path, which must refuse to resume (see `_check_schedule_resume`).
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    quality_path = getattr(data_config, "pretrain_quality_path", None)
+    if quality_path:
+        # π0.7 quality conditioning. This REPLACES the `transform_dataset` call below rather than
+        # wrapping around it, and that is the whole of the wiring's difficulty.
+        #
+        # The tag has to be in the sample when the FIRST transform runs: `RepackTransform` heads
+        # the chain and rebuilds the dict from its structure map, dropping `quality` along with
+        # everything else not in it. So the wrapper goes UNDER the transforms (not after them, the
+        # way the AWR weight wrapper goes -- that weight rides to the batch under its own key and
+        # never passes through a transform), and `AxisQualityConditioning` goes at the HEAD of the
+        # transform list, ahead of the repack.
+        #
+        # Both of those are done by `wrap_and_transform`, which is the only supported way to
+        # assemble the two objects: wrapper-without-transform injects a tag that the repack then
+        # drops, leaving every prompt bare and the arm training as the plain BC control under its
+        # own name -- silently. Hence no composition here, and NOTHING added to the repack group
+        # in config.py either: `wrap_and_transform` prepends to a list that already begins with
+        # `repack_transforms.inputs`, so an entry there too would tag twice.
+        from openpi.training import quality_conditioning
+
+        tags = quality_conditioning.QualityTags(quality_path)
+        # The filename is the only thing separating cfg_v2 from cfg_phase: one config name, one
+        # artifact structure, two rewards. Checked before anything expensive happens.
+        tags.check_reward_id(quality_path)
+        # Binds the artifact to THIS corpus. `QualityTaggedDataset.__init__` binds it again (it is
+        # the one place both lengths are in hand, so it cannot be forgotten); this call is here
+        # only because it can name the roots index in the error, and a run that hits this is
+        # reading somebody else's corpus.
+        tags.check_dataset_rows(len(dataset), getattr(data_config, "pretrain_roots_index", None))
+        # RAISES on overflow. PaligemmaTokenizer truncates from the right with only a warning, and
+        # what it truncates is the `Action:` marker -- for this arm only, because only this arm
+        # lengthens the prompt.
+        margin = quality_conditioning.check_token_budget(tags.prompts, model_config.max_token_len)
+        dataset = quality_conditioning.wrap_and_transform(
+            dataset, tags, training_transforms(data_config, skip_norm_stats=skip_norm_stats)
+        )
+        logging.info(
+            "quality conditioning %s: reward=%s n_rows=%s tagged=%s drop_whole=%s "
+            "drop_component=%s entropy_ratio=%s token_margin=%d config_hash=%s seed=%s",
+            quality_path, tags.reward_id, tags.meta.get("n_rows"),
+            tags.meta.get("realized_tagged_fraction"), tags.meta.get("realized_drop_whole"),
+            tags.meta.get("realized_drop_component"), tags.meta.get("q_given_task_entropy_ratio"),
+            margin, tags.meta.get("config_hash"), tags.meta.get("seed"),
+        )
+    else:
+        dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size

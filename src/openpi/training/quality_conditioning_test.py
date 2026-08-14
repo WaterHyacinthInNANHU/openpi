@@ -20,6 +20,8 @@ import openpi.transforms as _transforms
 from openpi.models import tokenizer as _tokenizer
 from openpi.training.quality_conditioning import N_BINS
 from openpi.training.quality_conditioning import NO_TAG
+from openpi.training.quality_conditioning import PROMPT_TAG_MARKER
+from openpi.training.quality_conditioning import is_tagged
 from openpi.training.quality_conditioning import NOT_TRAINABLE
 from openpi.training.quality_conditioning import QUALITY_KEY
 from openpi.training.quality_conditioning import AxisQualityConditioning
@@ -570,6 +572,66 @@ def test_wrap_and_transform_still_binds_the_artifact_to_the_corpus(tmp_path):
     tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 3]))
     with pytest.raises(ValueError, match="corpus mismatch"):
         wrap_and_transform(concat, tags, [])
+
+
+# --- the OTHER wrong composition: the tag applied twice (I1's mirror image) --------------------
+#
+# `wrap_and_transform` PREPENDS the conditioning to the list it is given, and the list the loader
+# gives it starts with `repack_transforms.inputs`. So adding the conditioning to the repack group
+# as well -- which reads as belt-and-braces, and which this task's original brief prescribed --
+# applies it twice: `"...\nQuality: 5\nQuality: 5"`. Every existing guard passes on that string
+# (the tag is in range, the tokenizer is happy), no log line mentions it, and the arm is
+# conditioned on something no eval-time prompt can match. Both routes to it now raise.
+
+
+def test_the_marker_is_exactly_what_a_tagged_prompt_carries():
+    """Pins `PROMPT_TAG_MARKER` against the string `apply_metadata` actually emits. If the two
+    drifted, `is_tagged` would silently stop recognising a tagged prompt and BOTH double-tag
+    guards below would pass vacuously on the one input they exist for."""
+    from openpi.training.slb_cfg import apply_metadata
+
+    tagged = apply_metadata("pick up the bowl", 5, None)
+    assert tagged == "pick up the bowl" + PROMPT_TAG_MARKER + "5"
+    assert is_tagged(tagged)
+    assert not is_tagged("pick up the bowl")
+
+
+def test_wrap_and_transform_refuses_a_transform_list_that_already_conditions(tmp_path):
+    """The repack-group re-add, refused where it is CONSTRUCTED. This is the arrangement a wiring
+    task produces, and the loader would otherwise build it without complaint."""
+    concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG]))
+    with pytest.raises(ValueError, match="twice"):
+        wrap_and_transform(concat, tags, [AxisQualityConditioning(), _repack()])
+
+
+def test_tagging_an_already_tagged_prompt_raises(tmp_path):
+    """The runtime half, for every route the constructor cannot see: two wrappers stacked, a
+    corpus whose task strings already carry the marker, or a third call site added later."""
+    with pytest.raises(ValueError, match="already carries a quality tag"):
+        AxisQualityConditioning()({QUALITY_KEY: 5, "prompt": "pick up the bowl\nQuality: 5"})
+
+
+def test_the_conditioning_applied_twice_raises_rather_than_doubling_the_tag(tmp_path):
+    """The composition end to end: two conditioning transforms in one chain must fail on the
+    first tagged row instead of yielding `"a\\nQuality: 1\\nQuality: 1"`."""
+    from openpi.training.data_loader import TransformedDataset
+
+    concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG]))
+    doubled = TransformedDataset(
+        QualityTaggedDataset(concat, tags),
+        [AxisQualityConditioning(), AxisQualityConditioning()],
+    )
+    with pytest.raises(ValueError, match="twice"):
+        doubled[0]
+
+
+def test_a_dropped_out_row_is_unaffected_by_the_double_tag_guard(tmp_path):
+    """The guard must not fire on the unconditional branch, which is the bare prompt."""
+    assert AxisQualityConditioning()({QUALITY_KEY: NO_TAG, "prompt": "pick up the bowl"}) == {
+        QUALITY_KEY: NO_TAG, "prompt": "pick up the bowl"
+    }
 
 
 # ---------------------------------------------------------------------------------------------

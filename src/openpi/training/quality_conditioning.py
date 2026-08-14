@@ -28,12 +28,23 @@ import pathlib
 import numpy as np
 from typing_extensions import override
 
+from openpi.training.slb_cfg import QUALITY_KEY as _PROMPT_TAG_KEY
 from openpi.training.slb_cfg import apply_metadata
 import openpi.transforms as _transforms
 
 # The key the wrapper injects and the transform consumes. Not in RepackTransform's map: the
 # transform runs first and rewrites `prompt`, after which the key has done its job.
 QUALITY_KEY = "quality"
+
+# The exact prefix `apply_metadata` puts in front of the bin, and the only trace the tag leaves in
+# a sample. Built from slb_cfg's own key rather than spelled out, so the two cannot drift; pinned
+# against a real tagged prompt in quality_conditioning_test.py.
+PROMPT_TAG_MARKER = f"\n{_PROMPT_TAG_KEY}: "
+
+
+def is_tagged(prompt) -> bool:
+    """True if this prompt already carries a quality tag."""
+    return PROMPT_TAG_MARKER in str(prompt)
 
 # Mirrors axis.dataset.quality_labels and axis.dataset.index_schedule.N_BINS. Duplicated (three
 # ints) rather than imported: those modules are offline tier, and nothing under openpi/ imports
@@ -288,6 +299,24 @@ class AxisQualityConditioning(_transforms.DataTransformFn):
                 "Appending to a synthesised empty prompt would condition on a bare "
                 "'Quality: <n>' with no task text."
             )
+        if is_tagged(data["prompt"]):
+            # DOUBLE TAG. This transform is in the chain twice -- the arrangement a wiring task
+            # falls into, because `wrap_and_transform` PREPENDS it to a list that already begins
+            # with `repack_transforms.inputs`, so heading the repack group with it as well reads
+            # like belt-and-braces and is not. The result is `"...\nQuality: 5\nQuality: 5"`: in
+            # range, tokenizable, logged nowhere, and matched by no eval-time prompt, which
+            # conditions the arm on a string it will never be asked about at inference.
+            #
+            # `wrap_and_transform` refuses that composition up front, but only for the lists IT is
+            # handed; this catches every other route to a tagged prompt, including a second
+            # wrapper and a corpus whose task strings already carry the marker.
+            raise ValueError(
+                f"prompt {str(data['prompt'])[:120]!r} already carries a quality tag "
+                f"({PROMPT_TAG_MARKER!r}), so tagging it would apply the tag TWICE. Either this "
+                f"transform is in the chain twice (it belongs ONLY at the head of the list "
+                f"`wrap_and_transform` builds -- never in the repack group as well), or the "
+                f"corpus prompts were built with the tag already in them."
+            )
         q = int(np.asarray(data[QUALITY_KEY]).reshape(-1)[0])
         if q != NO_TAG and not 1 <= q <= N_BINS:
             # NOT_TRAINABLE (255) leaking past a bypassed wrapper lands here, as does an artifact
@@ -422,6 +451,26 @@ def wrap_and_transform(dataset, tags: QualityTags, transforms):
     # import would be a cycle.
     from openpi.training.data_loader import TransformedDataset
 
+    already = [t for t in transforms if isinstance(t, AxisQualityConditioning)]
+    if already:
+        # THE DOUBLE TAG, refused where it is constructed rather than where it shows up. The list
+        # handed in is `transform_dataset`'s, which begins with `repack_transforms.inputs` -- so a
+        # conditioning entry added to the repack group in config.py arrives here, and prepending a
+        # second one would produce `"...\nQuality: 5\nQuality: 5"` on every tagged row. Nothing
+        # downstream raises on that: the tag is in range, the tokenizer is happy, the loss curve
+        # is normal, and the arm is conditioned on a string no eval-time prompt can match.
+        #
+        # The runtime guard in `AxisQualityConditioning.__call__` would also catch this, on the
+        # first tagged sample. Refusing here as well makes the arrangement unconstructable rather
+        # than merely fatal, and names the file to fix.
+        raise ValueError(
+            f"the transform list handed to wrap_and_transform already contains "
+            f"{len(already)} AxisQualityConditioning transform(s), so the tag would be applied "
+            f"twice ('...\\nQuality: 5\\nQuality: 5') -- in range, tokenizable, and matched by no "
+            f"eval-time prompt. This function is the ONLY place the conditioning belongs; remove "
+            f"it from the repack group (openpi/src/openpi/training/config.py), which is what this "
+            f"list starts with."
+        )
     return TransformedDataset(
         QualityTaggedDataset(dataset, tags), [AxisQualityConditioning(), *transforms]
     )
