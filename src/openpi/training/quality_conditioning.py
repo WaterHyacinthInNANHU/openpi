@@ -13,6 +13,10 @@ index available. `AxisQualityConditioning` runs at the HEAD of the repack group,
 instead would have been simpler and wrong: under `ConcatDataset` that key is the SUB-DATASET-local
 row (measured -- see quality_conditioning_test.py), so every tag past the first sub-dataset would
 land on the wrong frame with no error.
+
+TWO OBJECTS, ONE CONSTRUCTOR. The wiring does not get to compose them itself: `wrap_and_transform`
+is the only supported entry point, because wrapper-without-transform is silent (see its docstring)
+and a wiring task naturally reaches for the wrapper alone.
 """
 
 from __future__ import annotations
@@ -33,9 +37,19 @@ QUALITY_KEY = "quality"
 
 # Mirrors axis.dataset.quality_labels and axis.dataset.index_schedule.N_BINS. Duplicated (three
 # ints) rather than imported: those modules are offline tier, and nothing under openpi/ imports
-# `axis`. The duplication is caught by the transform's range guard, which refuses any tag that is
-# neither NO_TAG nor a bin in [1, N_BINS]. `_NAME_PREFIX` likewise mirrors the builder's filename
-# convention (build_quality_labels.check_artifact_filename).
+# `axis`.
+#
+# The transform's range guard catches only HALF of a drift in that duplicate. If the offline
+# N_BINS GREW (5 -> 7), tags 6 and 7 are outside [1, N_BINS] and the guard raises. If it SHRANK
+# (5 -> 3), every tag is still inside [1, 5], the guard never fires, and the arm trains 3-bin
+# conditioning while this file, the config and the write-up all say 5 -- silently. So the offline
+# bin count is read back from the artifact instead of inferred from the tags: `quality_meta`
+# writes `bin_row_counts` keyed "1".."N_BINS", and `QualityTags.__init__` requires its largest key
+# to equal N_BINS. That comparison is the ONLY place in the repo where the two tiers' bin counts
+# meet, which is why it lives in the reader and not in the wiring.
+#
+# `_NAME_PREFIX` likewise mirrors the builder's filename convention
+# (build_quality_labels.check_artifact_filename).
 NO_TAG = 0
 NOT_TRAINABLE = 255
 N_BINS = 5
@@ -47,11 +61,14 @@ class QualityTags:
 
     def __init__(self, path: str | pathlib.Path):
         self.path = pathlib.Path(path)
-        # NOT memory-mapped: `np.load(..., mmap_mode=...)` is silently ignored for a .npz (the
-        # members are deflated inside a zip, so there is nothing to map), and asking for it would
-        # only put a false claim in the code. The array is 2.2 MB and is read once in the parent
-        # before forking; CPython's refcounts touch the ndarray OBJECT header, not its data
-        # buffer, so the 2.2 MB of pages stay shared copy-on-write across the 8 workers anyway.
+        # NOT memory-mapped: `np.load(..., mmap_mode=...)` is silently ignored for a .npz. It
+        # returns an `NpzFile`, whose `__getitem__` reads each member through `zipfile` into a
+        # fresh in-memory array and never forwards `mmap_mode` -- so asking for it would only put
+        # a false claim in the code. NOT a compression story: measured, `np.savez` writes its
+        # members with compress_type=0, i.e. STORED, uncompressed; `savez_compressed` is the one
+        # that deflates. The array is 2.2 MB and is read once in the parent before forking;
+        # CPython's refcounts touch the ndarray OBJECT header, not its data buffer, so the 2.2 MB
+        # of pages stay shared copy-on-write across the 8 workers anyway.
         with np.load(self.path, allow_pickle=False) as z:
             self.tag = np.asarray(z["tag"])
             self.prompts = [str(s) for s in z["prompts"]]
@@ -77,7 +94,17 @@ class QualityTags:
                 f"axis.dataset.build_quality_labels."
             )
         declared = self.meta.get("n_rows")
-        if declared is not None and int(declared) != len(self.tag):
+        if declared is None:
+            # REQUIRED, matching the sibling reader (ScheduleSampler.check_dataset_rows): the
+            # builder always writes it, so an artifact without it predates the field and cannot be
+            # told apart from one whose tag array was truncated. Accepting it would make the
+            # self-consistency check below pass vacuously on exactly the file that needs it.
+            raise ValueError(
+                f"quality artifact {self.path} has no meta['n_rows'], so the tag array cannot be "
+                f"checked against the corpus size the builder recorded. Rebuild it with "
+                f"axis.dataset.build_quality_labels."
+            )
+        if int(declared) != len(self.tag):
             # The builder refuses to WRITE this (build_quality_labels.quality_meta), so the file
             # was truncated or hand-edited after the fact: every provenance line logged from meta
             # would then describe a corpus this file does not cover.
@@ -86,25 +113,71 @@ class QualityTags:
                 f"n_rows={int(declared)}; the file disagrees with itself about the index space it "
                 f"covers. Rebuild it with axis.dataset.build_quality_labels."
             )
+        self._check_bin_count()
+        if not bool((self.tag == NO_TAG).any()):
+            # DROP_WHOLE=0 (or a dropout that misfired) leaves every trainable row tagged, so the
+            # model never sees the bare prompt, never learns p(a | no tag), and guidance at
+            # inference -- which subtracts an unconditional forward pass -- is undefined. Nothing
+            # online would notice: training loss, throughput and every prompt look normal.
+            raise ValueError(
+                f"quality artifact {self.path} has no NO_TAG ({NO_TAG}) rows, so CFG has no "
+                f"unconditional branch to guide away from and the arm degenerates to plain "
+                f"conditional BC. Rebuild it with a non-zero dropout "
+                f"(axis.dataset.quality_labels.DROP_WHOLE)."
+            )
+
+    def _check_bin_count(self) -> None:
+        """Bind the offline tier's N_BINS to this file's copy of it.
+
+        The transform's range guard sees a GROWN offline bin count (tags outside [1, N_BINS]) and
+        misses a SHRUNK one entirely, since every tag of a 3-bin build is a legal 5-bin tag. The
+        artifact carries the answer: `bin_row_counts` is keyed "1".."N_BINS" by the builder.
+        """
+        counts = self.meta.get("bin_row_counts")
+        if not counts:
+            raise ValueError(
+                f"quality artifact {self.path} has no 'bin_row_counts' in its meta, so the bin "
+                f"count it was BUILT with cannot be compared against this tier's N_BINS="
+                f"{N_BINS}. A build with fewer bins would pass every range check and train a "
+                f"coarser arm than the config reports. Rebuild it with "
+                f"axis.dataset.build_quality_labels."
+            )
+        offline_bins = max(int(k) for k in counts)
+        if offline_bins != N_BINS:
+            raise ValueError(
+                f"bin-count mismatch: quality artifact {self.path} was built with "
+                f"{offline_bins} bins (its meta['bin_row_counts'] keys) but this tier's N_BINS is "
+                f"{N_BINS}. A smaller offline count is invisible to the transform's range guard "
+                f"-- every tag would be in [1, {N_BINS}] and the arm would train "
+                f"{offline_bins}-bin conditioning while the config and the write-up say {N_BINS}. "
+                f"Rebuild the artifact, or bring the two tiers' N_BINS back into agreement."
+            )
 
     @property
     def reward_id(self) -> str:
         return str(self.meta["reward_id"])
 
-    def check_reward_id(self, path: str | pathlib.Path) -> None:
+    def check_reward_id(self, path: str | pathlib.Path | None = None) -> None:
         """Bind a `quality_<reward_id>.npz` filename to the artifact's own reward.
 
         `cfg_v2` and `cfg_phase` run under ONE config name (`pi05_axis_cfg`) and their artifacts
         are structurally identical, so the filename in `data.quality_path` is the only thing that
         says which reward built the tags. Names that make no claim are not checked.
+
+        `path` defaults to `self.path` -- the file these tags were actually read from -- because
+        that is the only path whose name this object can speak to. A caller handing in some OTHER
+        path gets a check of that name against these tags, which is a vacuous pass whenever the
+        other name makes no claim; the argument is kept only so the wiring can name the
+        configured path in the error when the two are the same file by construction.
         """
-        stem = pathlib.Path(path).stem
+        named = pathlib.Path(self.path if path is None else path)
+        stem = named.stem
         if not stem.startswith(_NAME_PREFIX):
             return
         claimed = stem[len(_NAME_PREFIX):]
         if claimed != self.reward_id:
             raise ValueError(
-                f"quality artifact {path} is named for reward_id={claimed!r} but its own meta "
+                f"quality artifact {named} is named for reward_id={claimed!r} but its own meta "
                 f"reports {self.reward_id!r}. Both CFG arms run under pi05_axis_cfg, so this run "
                 f"would record itself as {claimed!r} while conditioning on {self.reward_id!r}."
             )
@@ -128,6 +201,15 @@ class QualityTags:
                 f"negative row index {i} into quality artifact {self.path}; numpy would read it "
                 f"from the tail and return some other row's tag."
             )
+        if i >= len(self.tag):
+            # numpy raises here too, but with a message that names neither the artifact nor the
+            # remedy -- and a test asserting a bare IndexError cannot tell that error apart from
+            # one thrown by an unrelated line.
+            raise IndexError(
+                f"row index {i} is beyond quality artifact {self.path} ({len(self.tag)} rows). "
+                f"The corpus is larger than the artifact; rebuild the artifact against this "
+                f"corpus rather than letting the tail of the run go untagged."
+            )
         q = int(self.tag[i])
         if q == NOT_TRAINABLE:
             raise KeyError(
@@ -148,6 +230,13 @@ class QualityTaggedDataset:
     """
 
     def __init__(self, dataset, tags: QualityTags):
+        # The bind is HERE, not left to the caller. `tag_for_row`'s bounds check cannot see a
+        # GROWN artifact: if len(tag) > len(dataset) every index the sampler can draw is in
+        # range, nothing raises, and the whole run is tagged off a longer index space -- i.e. the
+        # right-looking tag on the wrong frame, for every frame, for the entire run. This is the
+        # only place both lengths are in hand, and the composition test used to have to remember
+        # to call it by hand.
+        tags.check_dataset_rows(len(dataset))
         self._dataset = dataset
         self._tags = tags
 
@@ -170,10 +259,17 @@ class AxisQualityConditioning(_transforms.DataTransformFn):
     `q == NO_TAG` yields the BARE prompt: that IS the unconditional branch, and it is why a
     dropped row must not emit `Quality: 0`.
 
-    Every lookup RAISES on a miss. A `return data` fallback on either key would train the plain
-    control under the arm's name with no symptom but an absent log line -- once for a missing
-    wrapper, once for a repack order that put this transform after `RepackTransform` (which
-    rebuilds the dict from its structure map and drops everything else).
+    Every lookup RAISES on a miss, and the two misses catch DIFFERENT things. A missing
+    `quality` means no tag reached the transform -- an unwired wrapper, or this transform placed
+    after `RepackTransform`, which rebuilds the dict from its structure map and drops `quality`
+    along with everything else not in it. A missing `prompt` means the sample never carried one
+    (`prompt_from_task=False`), which the tag has nowhere to go on. A `return data` fallback on
+    either would train the plain control under the arm's name, with no symptom but an absent log
+    line.
+
+    Note the ORDER is load-bearing for the second case only in the sense that it cannot fire for
+    a mis-ordered repack: after `RepackTransform` the tag is gone too, so the `quality` guard
+    reports first and names the real fault.
     """
 
     @override
@@ -186,9 +282,11 @@ class AxisQualityConditioning(_transforms.DataTransformFn):
             )
         if "prompt" not in data:
             raise KeyError(
-                "'prompt' is not in the sample. This transform must run at the HEAD of the "
-                "repack group: RepackTransform rebuilds the dict from its structure map, so a "
-                "transform placed after it never sees the prompt and the tag is never applied."
+                "'prompt' is not in the sample, but a quality tag is. The sample carries no "
+                "instruction to append the tag to -- a dataset configured with "
+                "prompt_from_task=False, or a repack map that does not surface 'prompt'. "
+                "Appending to a synthesised empty prompt would condition on a bare "
+                "'Quality: <n>' with no task text."
             )
         q = int(np.asarray(data[QUALITY_KEY]).reshape(-1)[0])
         if q != NO_TAG and not 1 <= q <= N_BINS:
@@ -203,3 +301,30 @@ class AxisQualityConditioning(_transforms.DataTransformFn):
         if q == NO_TAG:
             return data
         return {**data, "prompt": apply_metadata(data["prompt"], q, None)}
+
+
+def wrap_and_transform(dataset, tags: QualityTags, transforms):
+    """Build the arm. THE ONLY supported way to assemble these two objects.
+
+    The wrapper and the transform are useless apart and there is no arrangement of one without
+    the other that is anything but a bug -- but only ONE of the two wrong arrangements announces
+    itself. Transform wired, wrapper missing: the transform's `quality` guard raises on the first
+    batch. Wrapper wired, transform missing: `quality` is injected, `RepackTransform` drops it
+    while rebuilding the dict, every prompt stays bare, nothing raises, and the arm trains as the
+    plain BC control under its own name. That is the failure this project has shipped three
+    times, and it is the arrangement a wiring task most easily produces, because the wrapper is
+    the conspicuous new object while the transform is one more entry in a list.
+
+    So the two are not offered separately to the wiring: this function takes the RAW dataset (the
+    concat, before `transform_dataset`) and the transform list the loader would have built, and
+    returns the composed dataset with `AxisQualityConditioning` at the HEAD -- ahead of
+    `RepackTransform`, while `prompt` and `quality` are both still present. `transforms` is the
+    full ordered list, exactly as `transform_dataset` assembles it.
+    """
+    # Imported here, not at module scope: `data_loader` is what wires this arm, so a top-level
+    # import would be a cycle.
+    from openpi.training.data_loader import TransformedDataset
+
+    return TransformedDataset(
+        QualityTaggedDataset(dataset, tags), [AxisQualityConditioning(), *transforms]
+    )

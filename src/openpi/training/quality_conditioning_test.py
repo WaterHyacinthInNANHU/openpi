@@ -16,12 +16,15 @@ import numpy as np
 import pytest
 import torch
 
+import openpi.transforms as _transforms
+from openpi.training.quality_conditioning import N_BINS
 from openpi.training.quality_conditioning import NO_TAG
 from openpi.training.quality_conditioning import NOT_TRAINABLE
 from openpi.training.quality_conditioning import QUALITY_KEY
 from openpi.training.quality_conditioning import AxisQualityConditioning
 from openpi.training.quality_conditioning import QualityTaggedDataset
 from openpi.training.quality_conditioning import QualityTags
+from openpi.training.quality_conditioning import wrap_and_transform
 
 
 class _Sub(torch.utils.data.Dataset):
@@ -53,7 +56,45 @@ def test_concat_dataset_index_is_not_the_concat_row():
     assert concat[5]["index"] == 0, "if this ever becomes 5, re-read the wrapper decision"
 
 
-def test_the_wrapper_uses_its_own_index_argument():
+def _write_artifact(tmp_path, tag, *, reward_id="v2", name=None, prompts=("pick up the bowl",),
+                    n_bins=N_BINS, meta_overrides=None, drop_meta_keys=()):
+    """Write an artifact shaped exactly as `build_quality_labels.quality_meta` writes one.
+
+    `bin_row_counts` is keyed "1".."n_bins" by the builder, and the reader reads the OFFLINE bin
+    count back out of those keys, so a test that omitted it would be testing a file the builder
+    never emits.
+    """
+    tag = np.asarray(tag, dtype=np.uint8)
+    p = tmp_path / (name or f"quality_{reward_id}.npz")
+    meta = {
+        "reward_id": reward_id,
+        "n_rows": int(len(tag)),
+        "bin_row_counts": {str(b): int((tag == b).sum()) for b in range(1, int(n_bins) + 1)},
+    }
+    meta.update(meta_overrides or {})
+    for k in drop_meta_keys:
+        meta.pop(k, None)
+    np.savez(
+        p,
+        tag=tag,
+        prompts=np.array([str(s) for s in prompts]),
+        meta=np.array(json.dumps(meta)),
+    )
+    return p
+
+
+def _tags(tmp_path, tag: np.ndarray, **kwargs) -> QualityTags:
+    """Build a QualityTags THROUGH ITS REAL CONSTRUCTOR.
+
+    This used to bypass `__init__` with `__new__` and hand-set the attributes, which meant the
+    headline wrapper tests -- the ones that matter most -- exercised none of the constructor's
+    guards. Every guard added there (the bin-count bind, the n_rows bind, the unconditional-branch
+    check) would have been invisible to exactly those tests. Cheap: one small .npz per call.
+    """
+    return QualityTags(_write_artifact(tmp_path, tag, **kwargs))
+
+
+def test_the_wrapper_uses_its_own_index_argument(tmp_path):
     """Catches: a wrapper that forwards `item["index"]` instead of the index it was called with.
     Row 5 must receive tag[5], not tag[0].
 
@@ -63,40 +104,19 @@ def test_the_wrapper_uses_its_own_index_argument():
     The assertion below pins the property so a future edit cannot quietly re-degenerate it.
     """
     concat = torch.utils.data.ConcatDataset([_Sub(5, "a"), _Sub(7, "b")])
-    tag = np.array([1, 2, 3, 4, 5, 5, 1, 4, 2, 3, 1, 5], dtype=np.uint8)
+    tag = np.array([1, 2, 3, 4, 5, 5, NO_TAG, 4, 2, 3, 1, 5], dtype=np.uint8)
     assert all(tag[i] != tag[i - 5] for i in range(5, 12)), "pattern is blind to the local-index bug"
-    tags = _tags(tag)
+    tags = _tags(tmp_path, tag)
     wrapped = QualityTaggedDataset(concat, tags)
     assert len(wrapped) == 12
     for i in range(12):
         assert wrapped[i][QUALITY_KEY] == int(tags.tag[i])
 
 
-def _tags(tag: np.ndarray, tmp_path=None, prompts=("pick up the bowl",), reward_id="v2"):
-    """Build a QualityTags without touching disk when the test does not need a file."""
-    obj = QualityTags.__new__(QualityTags)
-    obj.tag = np.asarray(tag, dtype=np.uint8)
-    obj.prompts = [str(p) for p in prompts]
-    obj.meta = {"reward_id": reward_id, "n_rows": int(len(tag))}
-    obj.path = tmp_path
-    return obj
-
-
-def _write_artifact(tmp_path, tag, *, reward_id="v2", name=None, prompts=("pick up the bowl",)):
-    p = tmp_path / (name or f"quality_{reward_id}.npz")
-    np.savez(
-        p,
-        tag=np.asarray(tag, dtype=np.uint8),
-        prompts=np.array([str(s) for s in prompts]),
-        meta=np.array(json.dumps({"reward_id": reward_id, "n_rows": int(len(tag))})),
-    )
-    return p
-
-
 def test_reading_a_not_trainable_row_raises(tmp_path):
     """Catches: the 0.0-default pattern. A sentinel that silently reads as NO_TAG turns a
     misaligned map into an untagged arm -- i.e. the control, under the arm's name."""
-    tags = QualityTags(_write_artifact(tmp_path, [1, NOT_TRAINABLE, 3]))
+    tags = QualityTags(_write_artifact(tmp_path, [1, NOT_TRAINABLE, NO_TAG]))
     assert tags.tag_for_row(0) == 1
     with pytest.raises(KeyError, match="not trainable"):
         tags.tag_for_row(1)
@@ -106,7 +126,7 @@ def test_a_tag_array_that_disagrees_with_the_dataset_raises(tmp_path):
     """Catches: a grown or shrunk corpus. Every index would still be in bounds and mean a
     different frame -- the case `ScheduleSampler.check_dataset_rows` exists to catch, repeated
     here because the tag artifact has the same exposure."""
-    tags = QualityTags(_write_artifact(tmp_path, [1, 2, 3]))
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 3]))
     tags.check_dataset_rows(3)
     with pytest.raises(ValueError, match="corpus mismatch") as excinfo:
         tags.check_dataset_rows(4, "roots_5000.json")
@@ -115,21 +135,32 @@ def test_a_tag_array_that_disagrees_with_the_dataset_raises(tmp_path):
 
 def test_a_filename_that_disagrees_with_the_reward_id_raises(tmp_path):
     """Catches: quality_phase.npz containing the v2 tags. Both arms share ONE config name."""
-    p = _write_artifact(tmp_path, [1, 2, 3], reward_id="v2", name="quality_phase.npz")
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="v2", name="quality_phase.npz")
     tags = QualityTags(p)
     with pytest.raises(ValueError, match="reward_id"):
         tags.check_reward_id(p)
 
 
+def test_the_filename_check_defaults_to_the_file_it_read(tmp_path):
+    """Catches: `check_reward_id(some_other_path)`. The argument used to be REQUIRED, so a caller
+    with two paths in scope could hand in the wrong one -- and a name that makes no claim is a
+    documented no-op, so the wrong path is a vacuous PASS on a mismatched artifact. The file this
+    object was read from is the only name it can speak to, so that is the default."""
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="v2", name="quality_phase.npz")
+    with pytest.raises(ValueError, match="reward_id"):
+        QualityTags(p).check_reward_id()
+    # ...and the vacuous pass the default exists to prevent, shown explicitly:
+    QualityTags(p).check_reward_id(tmp_path / "staging.npz")
+
+
 def test_filename_check_is_a_noop_on_a_name_that_makes_no_claim(tmp_path):
-    p = _write_artifact(tmp_path, [1, 2, 3], reward_id="v2", name="staging.npz")
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="v2", name="staging.npz")
     QualityTags(p).check_reward_id(p)
+    QualityTags(p).check_reward_id()
 
 
 def test_an_artifact_without_a_reward_id_raises(tmp_path):
-    p = tmp_path / "quality_v2.npz"
-    np.savez(p, tag=np.array([1], np.uint8), prompts=np.array(["x"]),
-             meta=np.array(json.dumps({"n_rows": 1})))
+    p = _write_artifact(tmp_path, [1, NO_TAG], drop_meta_keys=("reward_id",))
     with pytest.raises(ValueError, match="reward_id"):
         QualityTags(p)
 
@@ -165,11 +196,29 @@ def test_a_missing_quality_key_raises():
 
 
 def test_a_missing_prompt_raises():
-    """Catches: a repack order that puts this transform AFTER RepackTransform, which rebuilds the
-    dict and drops anything not in its map. Returning `data` unchanged there is the same silent
-    revert-to-control."""
+    """NOT the mis-ordered-repack catch it used to claim to be: after `RepackTransform` the
+    `quality` key is gone too (it is not in the repack map), so the guard above fires first and
+    this branch is unreachable for that fault. See
+    `test_a_mis_ordered_repack_is_caught_by_the_quality_guard`.
+
+    It is load-bearing for a different reason. A dataset configured with `prompt_from_task=False`
+    hands back samples that carry a tag and NO prompt; a `return data` fallback there would leave
+    every prompt untagged in exactly the config that has no prompt to tag, and the arm would be
+    the control."""
     with pytest.raises(KeyError, match="prompt"):
         AxisQualityConditioning()({QUALITY_KEY: 3})
+
+
+def test_a_mis_ordered_repack_is_caught_by_the_quality_guard():
+    """Pins WHICH guard catches the mis-ordered repack, since the docstring above used to credit
+    the wrong one. `RepackTransform` rebuilds the dict from its map, dropping `quality` along with
+    everything else, so a transform placed after it sees a prompt and no tag."""
+    repacked = _transforms.RepackTransform({"prompt": "prompt"})(
+        {"prompt": "p", QUALITY_KEY: 3, "index": 0}
+    )
+    assert QUALITY_KEY not in repacked
+    with pytest.raises(KeyError, match="quality"):
+        AxisQualityConditioning()(repacked)
 
 
 def test_the_transform_is_frozen():
@@ -191,8 +240,9 @@ def test_a_non_uint8_tag_array_is_rejected(tmp_path):
     a float 2.9 as 2 and a negative int as a bin, so the dtype IS the contract -- the same reason
     `ScheduleSampler` refuses a float rows array instead of casting it."""
     p = tmp_path / "quality_v2.npz"
-    np.savez(p, tag=np.array([1, 2, 3], np.int64), prompts=np.array(["x"]),
-             meta=np.array(json.dumps({"reward_id": "v2", "n_rows": 3})))
+    np.savez(p, tag=np.array([1, NO_TAG, 3], np.int64), prompts=np.array(["x"]),
+             meta=np.array(json.dumps({"reward_id": "v2", "n_rows": 3,
+                                       "bin_row_counts": {str(b): 1 for b in range(1, N_BINS + 1)}})))
     with pytest.raises(ValueError, match="uint8"):
         QualityTags(p)
 
@@ -203,7 +253,8 @@ def test_a_two_dimensional_tag_array_is_rejected(tmp_path):
     array by row would yield a whole ROW of tags, and `int()` of it raises far downstream."""
     p = tmp_path / "quality_v2.npz"
     np.savez(p, tag=np.zeros((3, 4), np.uint8), prompts=np.array(["x"]),
-             meta=np.array(json.dumps({"reward_id": "v2", "n_rows": 12})))
+             meta=np.array(json.dumps({"reward_id": "v2", "n_rows": 12,
+                                       "bin_row_counts": {str(b): 1 for b in range(1, N_BINS + 1)}})))
     with pytest.raises(ValueError, match="1-D"):
         QualityTags(p)
 
@@ -212,9 +263,7 @@ def test_an_artifact_without_prompts_is_rejected(tmp_path):
     """Catches: an artifact built before `corpus_prompts` existed. The token-budget guard
     tokenizes this list, so an empty one makes the guard pass vacuously -- the builder raises on
     it at write time and the reader must not accept what the builder refuses to emit."""
-    p = tmp_path / "quality_v2.npz"
-    np.savez(p, tag=np.array([1], np.uint8), prompts=np.array([], dtype="<U1"),
-             meta=np.array(json.dumps({"reward_id": "v2", "n_rows": 1})))
+    p = _write_artifact(tmp_path, [1, NO_TAG], prompts=())
     with pytest.raises(ValueError, match="prompt"):
         QualityTags(p)
 
@@ -223,39 +272,103 @@ def test_meta_row_count_disagreeing_with_the_tag_array_is_rejected(tmp_path):
     """Catches: a truncated or hand-edited artifact. `check_dataset_rows` compares the DATASET
     against `len(tag)`, so a meta that claims a different corpus size would go unnoticed while
     every provenance line printed from meta describes a corpus this file does not cover."""
-    p = tmp_path / "quality_v2.npz"
-    np.savez(p, tag=np.array([1, 2, 3], np.uint8), prompts=np.array(["x"]),
-             meta=np.array(json.dumps({"reward_id": "v2", "n_rows": 99})))
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], meta_overrides={"n_rows": 99})
+    with pytest.raises(ValueError, match="n_rows"):
+        QualityTags(p)
+
+
+def test_an_artifact_without_n_rows_is_rejected(tmp_path):
+    """`n_rows` used to be OPTIONAL here (`if declared is not None`) while the sibling reader
+    (`ScheduleSampler.check_dataset_rows`) REQUIRES it, with no reason given for the divergence.
+    The builder always writes it, so an artifact missing it predates the field or was hand-built
+    -- and accepting it makes the self-consistency check above pass vacuously on exactly the file
+    that needs it. Same contract as the sibling now."""
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], drop_meta_keys=("n_rows",))
     with pytest.raises(ValueError, match="n_rows"):
         QualityTags(p)
 
 
 def test_a_filename_that_agrees_with_the_reward_id_passes(tmp_path):
     """The happy path of the binding check: the convention must not be a tripwire on itself."""
-    p = _write_artifact(tmp_path, [1, 2, 3], reward_id="v2")
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="v2")
     tags = QualityTags(p)
     assert tags.reward_id == "v2"
     tags.check_reward_id(p)
+
+
+# --- the tier-boundary N_BINS bind (the range guard sees only half of a drift) ----------------
+
+
+def test_an_artifact_built_with_fewer_bins_is_rejected(tmp_path):
+    """THE SILENT HALF. If the offline N_BINS shrank 5 -> 3, every tag is still inside [1, 5], the
+    transform's range guard never fires, and the arm trains 3-bin conditioning while this file,
+    the config and the write-up all say 5. `bin_row_counts`' keys are the only record of the bin
+    count the artifact was BUILT with, and this is the only place the two tiers meet."""
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], n_bins=3)
+    with pytest.raises(ValueError, match="bin-count mismatch"):
+        QualityTags(p)
+
+
+def test_an_artifact_built_with_more_bins_is_rejected(tmp_path):
+    """The loud half, caught EARLIER. A grown offline N_BINS would eventually trip the transform's
+    range guard -- but only on the first row that actually drew a bin above 5, which may be
+    thousands of steps in. Reading it off the meta fails at load."""
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], n_bins=7)
+    with pytest.raises(ValueError, match="bin-count mismatch"):
+        QualityTags(p)
+
+
+def test_an_artifact_without_bin_row_counts_is_rejected(tmp_path):
+    """Catches: an artifact predating the field, which would make the bind above pass vacuously
+    -- the same class as an empty `prompts` making the token-budget guard vacuous."""
+    p = _write_artifact(tmp_path, [1, NO_TAG, 3], drop_meta_keys=("bin_row_counts",))
+    with pytest.raises(ValueError, match="bin_row_counts"):
+        QualityTags(p)
+
+
+def test_an_artifact_matching_this_tiers_bin_count_passes(tmp_path):
+    """The happy path: the bind must not be a tripwire on a correctly built file."""
+    QualityTags(_write_artifact(tmp_path, [1, NO_TAG, N_BINS]))
+
+
+# --- the unconditional branch CFG guides away from --------------------------------------------
+
+
+def test_an_artifact_with_no_unconditional_rows_is_rejected(tmp_path):
+    """Catches: an artifact built with DROP_WHOLE=0 (or a dropout that never fired). Every
+    trainable row carries a tag, the model never sees the bare prompt, p(a) is never learned, and
+    guidance at inference -- which subtracts an unconditional pass -- is undefined. Nothing online
+    notices: loss, throughput and every prompt look exactly right."""
+    p = _write_artifact(tmp_path, [1, 2, 3, 4, 5])
+    with pytest.raises(ValueError, match="unconditional"):
+        QualityTags(p)
+
+
+def test_a_single_unconditional_row_is_enough(tmp_path):
+    """The guard is on EXISTENCE, not on a rate: the realized fraction is a number read off the
+    meta, and re-deriving a threshold here would be a second, disagreeing opinion about it."""
+    QualityTags(_write_artifact(tmp_path, [1, 2, 3, 4, NO_TAG]))
 
 
 def test_a_negative_row_raises_rather_than_reading_from_the_tail(tmp_path):
     """Catches: `self.tag[index]` with no lower-bound check. Numpy indexes -1 as the LAST row, so
     a negative index silently returns a real, wrong tag instead of raising -- the same silent
     wrap `ScheduleSampler` refuses for negative schedule rows."""
-    tags = QualityTags(_write_artifact(tmp_path, [1, 2, 3]))
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 3]))
     with pytest.raises(IndexError, match="negative"):
         tags.tag_for_row(-1)
 
 
 def test_a_row_beyond_the_artifact_raises(tmp_path):
-    """Catches: a corpus larger than the artifact reaching the wrapper without
-    `check_dataset_rows` having been called (i.e. the wiring forgot the bind)."""
-    tags = QualityTags(_write_artifact(tmp_path, [1, 2, 3]))
-    with pytest.raises(IndexError):
+    """Catches: a corpus larger than the artifact reaching the reader. The `match=` is not
+    decoration -- a bare `pytest.raises(IndexError)` here passed on an IndexError from ANY cause,
+    including one raised while building the fixture, so it did not test what it named."""
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 3]))
+    with pytest.raises(IndexError, match="beyond quality artifact"):
         tags.tag_for_row(3)
 
 
-def test_the_wrapper_does_not_mutate_the_underlying_item():
+def test_the_wrapper_does_not_mutate_the_underlying_item(tmp_path):
     """Catches: `item = self._dataset[i]; item[QUALITY_KEY] = ...`. LeRobot hands back a fresh
     dict, but a wrapped dataset that caches (or a test double that does) would accumulate the
     tag of whichever row was read last."""
@@ -271,28 +384,53 @@ def test_the_wrapper_does_not_mutate_the_underlying_item():
             return self.item
 
     inner = _Cached()
-    wrapped = QualityTaggedDataset(inner, _tags(np.array([1, 2], np.uint8)))
+    wrapped = QualityTaggedDataset(inner, _tags(tmp_path, [1, NO_TAG]))
     assert wrapped[0][QUALITY_KEY] == 1
     assert QUALITY_KEY not in inner.item
 
 
-def test_the_wrapper_refuses_a_negative_index():
+def test_the_wrapper_refuses_a_negative_index(tmp_path):
     """Catches: a negative index reaching the pair. The inner dataset would return its LAST row
     while the tag lookup must not silently agree -- both would be 'valid', and wrong."""
     concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
-    wrapped = QualityTaggedDataset(concat, _tags(np.array([1, 2], np.uint8)))
+    wrapped = QualityTaggedDataset(concat, _tags(tmp_path, [1, NO_TAG]))
     with pytest.raises(IndexError, match="negative"):
         wrapped[-1]
 
 
-def test_the_wrapper_refuses_a_not_trainable_row():
+def test_the_wrapper_refuses_a_not_trainable_row(tmp_path):
     """Catches: a sampler whose row plan and the tag artifact disagree about which rows exist.
     The wrapper is where that surfaces, because it is the only place both are in hand."""
-    concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
-    wrapped = QualityTaggedDataset(concat, _tags(np.array([1, NOT_TRAINABLE], np.uint8)))
+    concat = torch.utils.data.ConcatDataset([_Sub(3, "a")])
+    wrapped = QualityTaggedDataset(concat, _tags(tmp_path, [1, NOT_TRAINABLE, NO_TAG]))
     assert wrapped[0][QUALITY_KEY] == 1
     with pytest.raises(KeyError, match="not trainable"):
         wrapped[1]
+
+
+# --- the wrapper binds itself to the dataset (I2) ---------------------------------------------
+
+
+def test_a_tag_array_longer_than_the_dataset_raises_at_construction(tmp_path):
+    """THE GROWN-ARTIFACT CASE, and the reason the bind cannot be left to the caller. When
+    len(tag) > len(dataset), EVERY index the sampler can draw is inside the tag array:
+    `tag_for_row`'s bounds check never fires, nothing raises, and the whole run trains on tags
+    read off a longer index space -- a right-looking tag on the wrong frame, for every frame.
+    `check_dataset_rows` used to be the caller's job to remember."""
+    concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
+    tags = _tags(tmp_path, [1, NO_TAG, 3, 4])
+    with pytest.raises(ValueError, match="corpus mismatch"):
+        QualityTaggedDataset(concat, tags)
+
+
+def test_a_tag_array_shorter_than_the_dataset_raises_at_construction(tmp_path):
+    """The other direction. This one would eventually raise from `tag_for_row` -- but only once
+    the sampler happened to draw a row past the end, which under a shuffled sampler is thousands
+    of steps of already-mistagged training later. It must fail at construction."""
+    concat = torch.utils.data.ConcatDataset([_Sub(4, "a")])
+    tags = _tags(tmp_path, [1, NO_TAG])
+    with pytest.raises(ValueError, match="corpus mismatch"):
+        QualityTaggedDataset(concat, tags)
 
 
 @pytest.mark.parametrize("q", [1, 2, 3, 4, 5])
@@ -329,20 +467,16 @@ def test_a_numpy_scalar_tag_is_accepted():
 
 
 def test_the_composition_the_loader_will_build_tags_the_right_rows(tmp_path):
-    """THE ARM, end to end at this tier: wrapper on the RAW concat dataset, transform at the head
-    of the transform list -- the exact order `create_torch_data_loader` must use.
+    """THE ARM, end to end at this tier, through the constructor the wiring will call.
 
     Catches: wrapping where the AWR wrapper sits (i.e. AFTER `transform_dataset`), which injects
     the tag once the prompt has already been rewritten and leaves every prompt bare. Also catches
     a tag/row misalignment across the ConcatDataset boundary, which no single-sub-dataset test
     can see.
     """
-    from openpi.training.data_loader import TransformedDataset
-
     concat = torch.utils.data.ConcatDataset([_Sub(2, "a"), _Sub(3, "b")])
     tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 5, 4, 3]))
-    tags.check_dataset_rows(len(concat))
-    dataset = TransformedDataset(QualityTaggedDataset(concat, tags), [AxisQualityConditioning()])
+    dataset = wrap_and_transform(concat, tags, [])
     assert [dataset[i]["prompt"] for i in range(5)] == [
         "a\nQuality: 1",
         "a",  # dropped out -> the bare control prompt
@@ -361,9 +495,76 @@ def test_wrapping_where_the_awr_wrapper_sits_raises_instead_of_training_the_cont
     from openpi.training.data_loader import TransformedDataset
 
     concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
-    tags = QualityTags(_write_artifact(tmp_path, [1, 2]))
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG]))
     wrong_order = QualityTaggedDataset(
         TransformedDataset(concat, [AxisQualityConditioning()]), tags
     )
     with pytest.raises(KeyError, match="quality"):
         wrong_order[0]
+
+
+# --- the complementary inert composition, and the constructor that forbids it (I1) ------------
+
+
+def _repack():
+    """The real `RepackTransform` the pretrain group runs: it rebuilds the dict from its map and
+    drops `quality` with everything else, which is what makes the omission below SILENT."""
+    return _transforms.RepackTransform({"prompt": "prompt"})
+
+
+def test_the_wrapper_without_the_transform_is_silently_the_baseline(tmp_path):
+    """THE REFUTATION, encoded. The previous implementation claimed the inert arm 'cannot be
+    assembled quietly at this tier'. It can: wire the wrapper, forget the transform, and the tag
+    is injected, dropped by `RepackTransform`, and every prompt comes out bare. No error, no log
+    line, an arm byte-identical to the plain BC control.
+
+    This test asserts the BROKEN behaviour on purpose, so the claim stays refuted and nobody
+    re-derives it. `wrap_and_transform` is the answer -- see the next test.
+    """
+    from openpi.training.data_loader import TransformedDataset
+
+    concat = torch.utils.data.ConcatDataset([_Sub(2, "a"), _Sub(3, "b")])
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 5, 4, 3]))
+    hand_wired = TransformedDataset(QualityTaggedDataset(concat, tags), [_repack()])
+    assert [hand_wired[i]["prompt"] for i in range(5)] == ["a", "a", "b", "b", "b"]
+    assert all(QUALITY_KEY not in hand_wired[i] for i in range(5))
+
+
+def test_wrap_and_transform_is_the_only_way_to_get_a_wrapped_dataset(tmp_path):
+    """Catches: the arrangement above reaching the wiring. The two objects are not offered
+    separately -- `wrap_and_transform` takes the raw dataset and the loader's transform list and
+    returns the composed dataset with `AxisQualityConditioning` already at the HEAD, so there is
+    no call site at which the transform can be omitted while the wrapper is kept.
+
+    Same inputs as the previous test, same repack, opposite outcome."""
+    concat = torch.utils.data.ConcatDataset([_Sub(2, "a"), _Sub(3, "b")])
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 5, 4, 3]))
+    dataset = wrap_and_transform(concat, tags, [_repack()])
+    assert [dataset[i]["prompt"] for i in range(5)] == [
+        "a\nQuality: 1",
+        "a",
+        "b\nQuality: 5",
+        "b\nQuality: 4",
+        "b\nQuality: 3",
+    ]
+
+
+def test_wrap_and_transform_puts_the_conditioning_ahead_of_the_given_transforms(tmp_path):
+    """Catches: appending instead of prepending. Order is the whole point -- a repack anywhere in
+    the caller's list drops `quality` before a trailing conditioning transform could read it, and
+    the result is the silent baseline again. Pinned positionally, not just behaviourally."""
+    concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG]))
+    repack = _repack()
+    given = [repack]
+    dataset = wrap_and_transform(concat, tags, given)
+    assert dataset[0]["prompt"] == "a\nQuality: 1"
+    assert given == [repack], "the caller's list must not be mutated in place"
+
+
+def test_wrap_and_transform_still_binds_the_artifact_to_the_corpus(tmp_path):
+    """The constructor must not become a way around the length bind it now owns."""
+    concat = torch.utils.data.ConcatDataset([_Sub(2, "a")])
+    tags = QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 3]))
+    with pytest.raises(ValueError, match="corpus mismatch"):
+        wrap_and_transform(concat, tags, [])
