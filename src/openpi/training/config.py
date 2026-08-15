@@ -1566,6 +1566,15 @@ _CONFIGS = [
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
                           name="pi05_axis_drop_top", schedule_required=True,
                           expected_mode="drop_top"),
+    # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
+    # measured against the full-data baseline it changes two things at once -- which rows, and how
+    # many. This arm keeps the SAME NUMBER of rows drawn uniformly at random, so the only remaining
+    # difference is the selection rule, i.e. whether the reward's ranking carries signal at all. If
+    # drop_top does not beat this, no weighting function built on that reward will help either, at
+    # any tau or delta -- which is the cheapest way to learn that.
+    _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
+                          name="pi05_axis_drop_random", schedule_required=True,
+                          expected_mode="drop_random"),
     #
     # ROUND-2 MECHANISM 3: pi0.7 quality conditioning. Same recipe and budget as the two arms
     # above (asserted against `pi05_axis_drop` itself in config_cfg_arm_test.py, so no
