@@ -121,13 +121,26 @@ def check_artifact_provenance(weights: dict, roots_index: str | pathlib.Path) ->
               f"stamp them.", flush=True)
         return
 
+    # A STAMP IS PRESENT, SO EVERY PATH OUT OF HERE MUST EITHER VERIFY IT OR RAISE.
+    # This used to `return` silently when the roots index was unreadable or carried no `base`,
+    # which contradicted this function's own docstring ("a stamp that is present and CONTRADICTORY
+    # is always fatal") and produced the worst possible outcome: a run that printed nothing and
+    # was never checked, while the stamp made everyone believe it had been.
     idx = pathlib.Path(roots_index)
     try:
         base = json.loads(idx.read_text()).get("base")
-    except Exception:  # noqa: BLE001 - the roots index is validated elsewhere
-        return
+    except Exception as exc:  # noqa: BLE001 - any unreadable index is fatal once a stamp exists
+        raise RuntimeError(
+            f"AWR weights carry a provenance stamp but the roots index {idx} cannot be read "
+            f"({type(exc).__name__}: {exc}), so the corpus they claim to describe cannot be "
+            f"located. Fix the index rather than training unverified."
+        ) from None
     if not base:
-        return
+        raise RuntimeError(
+            f"AWR weights carry a provenance stamp but {idx} has no 'base' key (a legacy v1 "
+            f"absolute-path index), so the corpus cannot be located. Re-index with "
+            f"axis.dataset.build_roots_index, which writes the v2 relative form."
+        )
     corpus = (idx.parent / base).resolve()
 
     # Plain import: every launcher puts the repo on PYTHONPATH (conf/experiments sets it), so this
@@ -135,7 +148,11 @@ def check_artifact_provenance(weights: dict, roots_index: str | pathlib.Path) ->
     # file resolved to a sibling checkout on a different branch instead -- an unchecked run that
     # printed a reassuring warning, which is worse than no check at all.
     try:
-        from axis.dataset.artifact_provenance import ProvenanceError, corpus_fingerprint
+        from axis.dataset.artifact_provenance import (
+            ProvenanceError,
+            corpus_fingerprint,
+            formula_fingerprint,
+        )
     except ImportError:
         raise RuntimeError(
             "cannot import axis.dataset.artifact_provenance, so the AWR weights cannot be shown "
@@ -150,6 +167,31 @@ def check_artifact_provenance(weights: dict, roots_index: str | pathlib.Path) ->
             f"AWR weights were built against a DIFFERENT corpus ({want} != {got} for {corpus}). "
             f"Episode identities or lengths changed, so these weights describe frames this corpus "
             f"does not have. Rebuild with axis.dataset.build_awr_weights."
+        )
+
+    # THE FORMULA HALF, which this function used to PRINT without checking. The stamp carries both a
+    # `formula_fingerprint` and the `reward_id`/`params` it was derived from, so the two must agree:
+    # recomputing from the stamp's own fields catches a stamp that was hand-edited, copied between
+    # artifacts, or written by a build whose formula changed without bumping the version -- all of
+    # which sailed through while only the corpus half was compared, and the printed
+    # "AWR provenance OK: ... formula ..." line made it look verified. Verified here, not narrated.
+    stamped_formula = prov.get("formula_fingerprint")
+    reward_id, params = prov.get("reward_id"), prov.get("params") or {}
+    if stamped_formula is None or reward_id is None:
+        raise ProvenanceError(
+            f"AWR weights have a corpus fingerprint but an INCOMPLETE formula stamp "
+            f"(reward_id={reward_id!r}, formula_fingerprint={stamped_formula!r}). A half-stamp "
+            f"cannot say which reward produced these weights. Rebuild with "
+            f"axis.dataset.build_awr_weights."
+        )
+    recomputed = formula_fingerprint(reward_id, **params)
+    if recomputed != stamped_formula:
+        raise ProvenanceError(
+            f"AWR weights' formula stamp is SELF-INCONSISTENT: fingerprint {stamped_formula} does "
+            f"not match {recomputed}, recomputed from the reward_id {reward_id!r} and params "
+            f"{params} the same stamp records. The stamp was edited, copied from another artifact, "
+            f"or written by a build whose formula changed without bumping FORMULA_VERSION -- in "
+            f"every case it cannot be trusted to identify the maths. Rebuild it."
         )
     print(f"AWR provenance OK: corpus {got}, formula {prov.get('reward_id')} "
           f"{prov.get('params')} v{prov.get('formula_version')}", flush=True)
