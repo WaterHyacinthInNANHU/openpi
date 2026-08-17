@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 
 import numpy as np
 
@@ -101,6 +102,59 @@ def _ordered_roots(roots_index: str | pathlib.Path) -> list[tuple[int, str]]:
     return sorted(out, key=lambda kv: kv[0])
 
 
+def check_artifact_provenance(weights: dict, roots_index: str | pathlib.Path) -> None:
+    """Refuse an AWR artifact built against a different corpus or a different formula.
+
+    The key-based join catches a MISSING episode; it cannot catch a corpus whose episodes were
+    re-rendered (same keys, different frames) or an artifact produced by different maths (same
+    path, same filename). Both complete normally and report under the arm's name, which is why
+    this refuses rather than warns.
+
+    An artifact with NO stamp is allowed through with a printed line: corpora predate stamping,
+    and refusing them outright would strand every existing arm. A stamp that is present and
+    CONTRADICTORY is always fatal -- that is the case where someone believed it had been checked.
+    """
+    prov = weights.get("provenance") if isinstance(weights, dict) else None
+    if not prov:
+        print(f"WARNING: AWR weights carry no provenance stamp; cannot verify they belong to "
+              f"this corpus or this formula. Rebuild with axis.dataset.build_awr_weights to "
+              f"stamp them.", flush=True)
+        return
+
+    idx = pathlib.Path(roots_index)
+    try:
+        base = json.loads(idx.read_text()).get("base")
+    except Exception:  # noqa: BLE001 - the roots index is validated elsewhere
+        return
+    if not base:
+        return
+    corpus = (idx.parent / base).resolve()
+
+    # Plain import: every launcher puts the repo on PYTHONPATH (conf/experiments sets it), so this
+    # resolves to the SAME checkout the artifacts were built from. Guessing a path relative to this
+    # file resolved to a sibling checkout on a different branch instead -- an unchecked run that
+    # printed a reassuring warning, which is worse than no check at all.
+    try:
+        from axis.dataset.artifact_provenance import ProvenanceError, corpus_fingerprint
+    except ImportError:
+        raise RuntimeError(
+            "cannot import axis.dataset.artifact_provenance, so the AWR weights cannot be shown "
+            "to belong to this corpus. Put the repo root on PYTHONPATH (the experiment launcher "
+            "does this) rather than running with the provenance check disabled."
+        ) from None
+
+    got = corpus_fingerprint(corpus)
+    want = prov.get("corpus_fingerprint")
+    if want != got:
+        raise ProvenanceError(
+            f"AWR weights were built against a DIFFERENT corpus ({want} != {got} for {corpus}). "
+            f"Episode identities or lengths changed, so these weights describe frames this corpus "
+            f"does not have. Rebuild with axis.dataset.build_awr_weights."
+        )
+    print(f"AWR provenance OK: corpus {got}, formula {prov.get('reward_id')} "
+          f"{prov.get('params')} v{prov.get('formula_version')}", flush=True)
+
+
 def plan_rows_and_weights_from_roots(
     roots_index: str | pathlib.Path,
     ranges_path: str | pathlib.Path,
@@ -127,6 +181,10 @@ def plan_rows_and_weights_from_roots(
     rows = plan_rows_from_roots(roots_index, ranges_path)
 
     payload = json.loads(pathlib.Path(weights_path).read_text())
+    # REFUSE weights that do not belong to this corpus. The key join below catches a MISSING
+    # episode; it cannot catch a re-rendered one (same key, different frames) or a different
+    # formula (same path, same file name). Both train to completion under the arm's name.
+    check_artifact_provenance(payload, roots_index)
     by_key = payload["weights"] if isinstance(payload, dict) and "weights" in payload else payload
 
     # Rebuild the same flat space the rows were planned in, then place each episode's weights.

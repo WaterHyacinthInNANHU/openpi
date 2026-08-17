@@ -86,7 +86,12 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, num_workers: int | None = None):
+    """`num_workers` overrides the config's, because norm stats are computed on whatever machine is
+    free and its memory ceiling is not the training node's. Each worker decodes video into its own
+    address space, so the config's training-sized default OOMs a 32 GB cgroup and the only symptom
+    is `DataLoader worker exited unexpectedly` -- which reads like a bug, not like a resource
+    limit."""
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -96,7 +101,8 @@ def main(config_name: str, max_frames: int | None = None):
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config, config.model.action_horizon, config.batch_size, config.model,
+            config.num_workers if num_workers is None else num_workers, max_frames
         )
 
     keys = ["state", "actions"]
