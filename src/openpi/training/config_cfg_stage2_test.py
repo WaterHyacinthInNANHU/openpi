@@ -115,14 +115,14 @@ def test_the_twin_heads_the_repack_group_with_the_conditioning():
     assert isinstance(inputs[0], LiberoQualityConditioning)
     assert isinstance(inputs[1], _transforms.RepackTransform)
     # Exactly ONE conditioning entry, still the claim this length check was protecting: two of
-    # them give `"...\nQuality: 5\nQuality: 5"`. Spelled by counting the conditioning rather than
-    # the group, because the group also carries `Rotate180Images` since 2026-08-14 -- an image
-    # transform that tags nothing (see openpi.training.libero_orientation).
+    # them give `"...\nQuality: 5\nQuality: 5"`. Spelled by COUNTING the conditioning rather than
+    # by the group's length, which is what let this survive the group gaining and then losing
+    # `Rotate180Images`: it was added 2026-08-14 for the box-local inverted build and dropped
+    # 2026-08-17 when stage 2 moved to PI's official UPRIGHT build, where no rotation is needed.
     assert sum(isinstance(t, LiberoQualityConditioning) for t in inputs) == 1
     assert [type(t).__name__ for t in inputs] == [
         "LiberoQualityConditioning",
         "RepackTransform",
-        "Rotate180Images",
     ]
 
 
@@ -147,18 +147,18 @@ def test_the_parent_repacks_exactly_what_it_repacked_before():
     exactly what `pi05_libero` repacks. Catches a transform that tags unconditionally, which would
     silently condition all five other arms too.
 
-    Since 2026-08-14 the parent's group also carries `Rotate180Images` -- both stage-2 legs read
-    the box-local LIBERO build, which stores frames 180 degrees from the eval client. That is an
-    image transform, not a conditioning one, and it is on BOTH legs, so the "conditioning is the
-    only difference" claim is unchanged; it is asserted below by comparing against upstream's
-    group PLUS the rotation rather than by a length.
+    From 2026-08-14 to 2026-08-17 the parent's group also carried `Rotate180Images`, because both
+    stage-2 legs read the box-local build, which stored frames 180 degrees from the eval client.
+    Stage 2 now reads PI's official UPRIGHT build, so `rotation_needed()` is False and the group is
+    upstream's again, exactly. The rotation was on BOTH legs while it existed and is on NEITHER
+    now, so the "conditioning is the only difference" claim never depended on it.
     """
     parent, upstream = _config.get_config(PARENT), _config.get_config("pi05_libero")
     inputs = _repack_inputs(parent)
     assert not any(isinstance(t, LiberoQualityConditioning) for t in inputs)
     assert isinstance(inputs[0], _transforms.RepackTransform)
     assert inputs[:1] == _repack_inputs(upstream), "the repack MAP drifted from upstream's"
-    assert [type(t).__name__ for t in inputs] == ["RepackTransform", "Rotate180Images"]
+    assert [type(t).__name__ for t in inputs] == ["RepackTransform"]
 
 
 def test_the_rest_of_the_pipeline_is_the_parents():

@@ -41,12 +41,15 @@ from openpi.training import libero_orientation as _orient
 # Physical Intelligence's official (already-upright) copy. Pinned here BY NAME so a future config
 # that reads a LIBERO dataset cannot join the registry without appearing in one of these lists --
 # `test_every_libero_config_declares_its_datasets_orientation` fails until it does.
-INVERTED_CONFIGS = (
+# EMPTY SINCE 2026-08-17, and deliberately kept rather than deleted: the three axisinit configs
+# moved to UPRIGHT_CONFIGS when stage 2 switched to PI's official 1,693-episode 256px build. A
+# future config reading an inverted build belongs here, and `test_an_inverted_declaration_still
+# _rotates_both_keys` keeps the mechanism covered meanwhile.
+INVERTED_CONFIGS: tuple[str, ...] = ()
+UPRIGHT_CONFIGS = (
     "pi05_libero_axisinit",
     "pi05_libero_axisinit_paper",
     "pi05_libero_axisinit_paper_cfg",
-)
-UPRIGHT_CONFIGS = (
     "pi0_libero",
     "pi0_libero_low_mem_finetune",
     "pi0_fast_libero",
@@ -106,7 +109,8 @@ def sample(base: np.ndarray, wrist: np.ndarray) -> dict:
     }
 
 
-def train_images(config_name: str, base: np.ndarray, wrist: np.ndarray) -> dict[str, np.ndarray]:
+def train_images(config_name: str, base: np.ndarray, wrist: np.ndarray, *,
+                 orientation: str | None = None) -> dict[str, np.ndarray]:
     """The model-facing images of a sample, through THE REAL training chain.
 
     `training_transforms` is the function `transform_dataset` -- and therefore
@@ -115,11 +119,28 @@ def train_images(config_name: str, base: np.ndarray, wrist: np.ndarray) -> dict[
     touch state/actions, never images.
     """
     cfg = _config.get_config(config_name)
-    data_config = cfg.data.create(cfg.assets_dirs, cfg.model)
+    data = cfg.data if orientation is None else dataclasses.replace(
+        cfg.data, dataset_image_orientation=orientation)
+    data_config = data.create(cfg.assets_dirs, cfg.model)
     data = sample(base, wrist)
     for transform in _data_loader.training_transforms(data_config, skip_norm_stats=True):
         data = transform(data)
     return {k: np.asarray(v) for k, v in data["image"].items()}
+
+
+def stored_frame(config_name: str, render: np.ndarray) -> np.ndarray:
+    """What the DATASET on disk holds for this MuJoCo render, per the config's DECLARED orientation.
+
+    The eval client flips the render because the simulator stores it 180 degrees from the model
+    convention. So a build declared UPRIGHT holds `render[::-1, ::-1]`, and one declared INVERTED
+    holds the render as-is. Deriving this from the declaration instead of hardcoding one of them is
+    what lets the parity test survive a change of build: swapping the dataset changes what is
+    stored, and the test follows, while still demanding EXACT equality down both paths.
+    """
+    orientation = _config.get_config(config_name).data.dataset_image_orientation
+    if orientation == _orient.UPRIGHT:
+        return np.ascontiguousarray(render[::-1, ::-1])
+    return render
 
 
 def eval_images(base: np.ndarray, wrist: np.ndarray) -> dict[str, np.ndarray]:
@@ -151,7 +172,7 @@ def eval_images(base: np.ndarray, wrist: np.ndarray) -> dict[str, np.ndarray]:
 # --- the pixel claim, both directions --------------------------------------------------------
 
 
-def test_stage2_images_are_the_raw_frames_rotated_180():
+def test_an_inverted_declaration_still_rotates_both_keys():
     """FLAG ON: what the model sees is exactly `raw[::-1, ::-1]`, on BOTH image keys.
 
     Both keys are asserted in one test on purpose. Rotating the base view and leaving the wrist
@@ -159,7 +180,10 @@ def test_stage2_images_are_the_raw_frames_rotated_180():
     can be compared is here.
     """
     base, wrist = chiral_frame(1), chiral_frame(2)
-    got = train_images(STAGE2, base, wrist)
+    # Forced, because no registered config declares `inverted` any more (stage 2 moved to PI's
+    # official upright build). The mechanism must stay covered regardless: a future inverted build
+    # would otherwise land with nothing asserting that its frames actually get rotated.
+    got = train_images(STAGE2, base, wrist, orientation=_orient.INVERTED)
     np.testing.assert_array_equal(
         got["base_0_rgb"], base[::-1, ::-1], err_msg="stage-2 base image is not the raw frame rotated 180"
     )
@@ -220,7 +244,7 @@ def test_training_and_eval_observations_agree_on_which_way_is_up():
     statistic would have to be argued about, an array comparison does not.
     """
     base, wrist = chiral_frame(5), chiral_frame(6)
-    train = train_images(STAGE2, base, wrist)
+    train = train_images(STAGE2, stored_frame(STAGE2, base), stored_frame(STAGE2, wrist))
     serve = eval_images(base, wrist)
     for key, side in (("base_0_rgb", "agentview"), ("left_wrist_0_rgb", "wrist")):
         if not np.array_equal(train[key], serve[key]):
@@ -249,7 +273,7 @@ def test_the_parity_check_fires_when_one_side_is_flipped():
     sensitivity is asserted only by argument.
     """
     base, wrist = chiral_frame(7), chiral_frame(8)
-    train = train_images(STAGE2, base, wrist)
+    train = train_images(STAGE2, stored_frame(STAGE2, base), stored_frame(STAGE2, wrist))
     serve = eval_images(base, wrist)
     flipped = {k: v[::-1, ::-1] for k, v in serve.items()}
     assert np.array_equal(train["base_0_rgb"], serve["base_0_rgb"])

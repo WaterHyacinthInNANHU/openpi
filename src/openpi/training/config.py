@@ -1816,13 +1816,14 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            # Reads the box-local re-conversion (HF_LEROBOT_HOME=/data/lerobot_hdf5), which stores
-            # frames 180 degrees from the eval client and from the AXIS stage-1 corpus. See
-            # `LeRobotLiberoDataConfig.dataset_image_orientation`. The run this config already
-            # produced trained upside-down and is retracted; this is not a schedule change, it is
-            # a statement of what the data on disk is, so it is corrected in place rather than
-            # forked into a twin.
-            dataset_image_orientation="inverted",
+            # 2026-08-17: now PI's OFFICIAL build (1,693 eps, 256x256, stored UPRIGHT), so no
+            # rotation is needed and Rotate180Images drops out. Still a statement about the bytes
+            # on disk rather than a recipe change -- what changed is which bytes. The box-local
+            # 128px re-conversion this used to read is retired: the model input is 224x224, so
+            # every one of its frames was UPSCALED 1.75x, and no transform recovers detail that
+            # upscaling never added. The guard checks the declaration against total_episodes and
+            # image shape, so a stale "inverted" here would refuse at loader construction.
+            dataset_image_orientation="upright",
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1886,12 +1887,15 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             # NOT a recipe change and NOT a deviation from Table 11 -- a statement about the bytes
-            # on disk. This arm reads the box-local re-conversion at /data/lerobot_hdf5, which
-            # stores frames 180 degrees from PI's official copy, so the pipeline rotates them back
-            # to the UPRIGHT convention that stage 1 and the eval client already use. The three
-            # stage-2 runs made before this field existed trained upside-down (0/12 through the
-            # client's rotation, 11/12 with the client's rotation removed) and are retracted.
-            dataset_image_orientation="inverted",
+            # on disk, and as of 2026-08-17 those bytes are PI's OFFICIAL build: 1,693 episodes,
+            # 256x256, stored UPRIGHT, which is already the convention stage 1 and the eval client
+            # use, so nothing rotates. It replaces the 128px re-conversion because the model input
+            # is 224x224 and that build was therefore upscaled 1.75x on every frame.
+            # CONSEQUENCE, stated rather than hidden: the training set goes 2,000 -> 1,693
+            # episodes, so stage-2 numbers on this build are NOT comparable with the round-1
+            # result (base_ctrl 86.1 > awr_v2 80.4 > bc 77.5), which used 128px/2,000 -- including
+            # its control. Re-run the control here or report the two rounds separately.
+            dataset_image_orientation="upright",
         ),
         batch_size=64,
         # Byte-identical to upstream `pi05_libero`'s schedule; see the note above.
@@ -1940,10 +1944,11 @@ _CONFIGS = [
             # two equal so this literal cannot drift away from what inference asks for.
             quality_tag=5,
             # NOT a treatment difference either: the same statement about the same bytes on disk
-            # as the parent's. If these two ever disagree the CFG arm would be the only stage-2
-            # leg trained at a different orientation, which config_cfg_stage2_test.py's field-by-
-            # field diff would call a second treatment. See the parent for the measurement.
-            dataset_image_orientation="inverted",
+            # as the parent's, and it moves WITH the parent to PI's official upright build. If
+            # these two ever disagree the CFG arm would be the only stage-2 leg trained at a
+            # different orientation, which config_cfg_stage2_test.py's field-by-field diff would
+            # call a second treatment. See the parent for the measurement.
+            dataset_image_orientation="upright",
             # NOT a treatment difference -- the opposite. This is what makes the twin READ the
             # parent's norm stats instead of resolving to its own (nonexistent) assets dir, so
             # the two stage-2 legs are normalised identically. See the field's own comment.
