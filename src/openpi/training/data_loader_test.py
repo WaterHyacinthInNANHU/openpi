@@ -331,12 +331,18 @@ def test_pytorch_framework_without_quality_conditioning_does_not_raise():
 
 @pytest.mark.parametrize(
     ("stem", "mode", "reward_id"),
-    [("drop_v2", "drop", "v2"), ("drop_phase", "drop", "phase"),
-     ("anneal_v2", "anneal", "v2"), ("anneal_phase", "anneal", "phase")],
+    # THE NAMES ON DISK, verified against the artifacts directory -- `schedule_<mode>_<reward>`.
+    # This list used to read ("drop_v2", …), a convention the builder has never written, so the test
+    # passed while the guard it covers was a no-op for every real file: the check keyed on the
+    # stem's first token being a mode, and the real first token is "schedule". A test that pins the
+    # wrong filenames is worse than no test, because it reports the guard as covered.
+    [("schedule_drop_v2", "drop", "v2"), ("schedule_drop_phase", "drop", "phase"),
+     ("schedule_anneal_v2", "anneal", "v2"), ("schedule_anneal_phase", "anneal", "phase"),
+     # the bare form remains accepted, so a hand-named copy is not suddenly rejected
+     ("drop_v2", "drop", "v2"), ("anneal_phase", "anneal", "phase")],
 )
 def test_the_four_shipped_artifact_names_match_their_own_meta(stem, mode, reward_id):
-    """The names and pairings the round-2 arms actually launch with (see
-    reports/round2_schedule_artifacts.md); the check must accept every one of them."""
+    """The names and pairings the round-2 arms actually launch with; the check must accept each."""
     _data_loader._check_schedule_reward_id(
         f"/some/scratch/schedules/{stem}.npz", {"mode": mode, "reward_id": reward_id}
     )  # must not raise
@@ -361,3 +367,29 @@ def test_a_name_that_makes_no_claim_is_left_alone(path):
     """A name outside the `<mode>_<reward_id>` convention claims nothing, so there is nothing to
     contradict: the guard must not turn a convention into a requirement."""
     _data_loader._check_schedule_reward_id(path, {"mode": "drop", "reward_id": "v2"})
+
+
+def test_the_reward_id_guard_fires_for_the_filenames_the_builder_actually_writes():
+    """REGRESSION. The guard keyed on the stem's first token being a mode, so it was a no-op for
+    every artifact that exists: the builder writes `schedule_<mode>_<reward>.npz`, whose first token
+    is "schedule". A review found the one check standing between `drop_v2` and a file rebuilt from
+    phase weights had therefore never run on real data -- the exact silent-relabel failure its own
+    docstring describes. The unconstrained-name no-op is deliberate and must survive the fix.
+    """
+    from openpi.training.data_loader import _check_schedule_reward_id as check
+
+    ok, wrong = {"mode": "drop", "reward_id": "v2"}, {"mode": "drop", "reward_id": "phase"}
+
+    # the shipped shape, both ways round
+    check("schedule_drop_v2.npz", ok)
+    with pytest.raises(ValueError, match="reward_id"):
+        check("schedule_drop_v2.npz", wrong)
+
+    # the bare shape the guard was originally written for still works
+    check("drop_v2.npz", ok)
+    with pytest.raises(ValueError, match="reward_id"):
+        check("drop_v2.npz", wrong)
+
+    # a name that claims nothing constrains nothing -- otherwise a staging path becomes a failure
+    check("staging_copy.npz", wrong)
+    check("schedule.npz", wrong)

@@ -577,6 +577,13 @@ def _check_schedule_reward_id(schedule_path: str, sampler_meta: dict) -> None:
     must not turn a naming convention into a requirement.
     """
     stem = pathlib.Path(schedule_path).stem
+    # EVERY PUBLISHED ARTIFACT IS `schedule_<mode>_<reward>.npz`, so keying on the first token made
+    # this a no-op exactly where it was needed: "schedule" is not a mode, the function returned, and
+    # the one check standing between `drop_v2` and a file rebuilt from phase weights never ran. The
+    # docstring described `<mode>_<reward>` while the builder wrote `schedule_<mode>_<reward>`, and
+    # nothing compared the two. Strip the prefix the builder actually uses, then apply the same rule.
+    if stem.startswith("schedule_"):
+        stem = stem[len("schedule_"):]
     if stem.split("_", 1)[0] not in _SCHEDULE_MODES:
         return
     mode, reward_id = sampler_meta.get("mode"), sampler_meta.get("reward_id")
