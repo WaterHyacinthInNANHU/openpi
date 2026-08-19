@@ -52,6 +52,30 @@ from openpi.policies.eef_math import (  # noqa: E402
 )
 
 
+def _center_crop_square(arr: np.ndarray) -> np.ndarray:
+    """Crop the WIDER axis to the shorter one, centred. A no-op on an already-square frame.
+
+    The 5k `camera_fixed` render stores 640x360 (16:9) for BOTH cameras. The model input is
+    224x224, so a straight resize would squash 16:9 into 1:1 and distort every frame. LIBERO
+    renders square, so cropping to square matches the benchmark's framing rather than
+    letterboxing ours into it.
+
+    CROPPING IS DECLARED, NEVER INFERRED -- the caller passes `center_crop`, this function does
+    not sniff the aspect ratio and decide. The corpora disagree (v3 is 126x224, randcam 224x224,
+    the 5k 640x360) and a transform that silently activates on shape would change what an old
+    corpus means without anything in the config recording it. That is the same failure as the
+    180-degree orientation incident, which cost three trained models.
+    """
+    if arr.ndim < 2:
+        return arr
+    h, w = arr.shape[:2]
+    if h == w:
+        return arr
+    side = min(h, w)
+    top, left = (h - side) // 2, (w - side) // 2
+    return arr[top:top + side, left:left + side]
+
+
 @dataclasses.dataclass(frozen=True)
 class AxisFrankaInputs(_transforms.DataTransformFn):
     """Repack AXIS-Franka rows into the pi0.5 input layout.
@@ -59,6 +83,11 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
     Deliberately does NOT pad state/actions to the model action dim -- see the module
     docstring. `PadStatesAndActions` in `model_transforms` does that, after `Normalize`.
     """
+
+    # Crop both cameras to square before the downstream resize to 224. Needed for the 5k
+    # `camera_fixed` corpus (640x360); a no-op on the square randcam frames, and DELIBERATELY
+    # off by default so no existing config changes meaning.
+    center_crop: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Pass 8-D state through unpadded: Normalize runs next, and padding here would
@@ -68,6 +97,11 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
         raw_wrist = data.get("left_wrist_0_rgb")
         has_wrist = raw_wrist is not None
         wrist = _to_hwc_uint8(raw_wrist) if has_wrist else np.zeros_like(base)
+        if self.center_crop:
+            # BOTH cameras, identically. The wrist is 16:9 too, and cropping only one would
+            # give the two views different effective fields of view.
+            base = _center_crop_square(base)
+            wrist = _center_crop_square(wrist)
         # openpi wants separate `image` / `image_mask` dicts with the model's 3 camera
         # slots; pad the unused right wrist with zeros (masked off for the pi0.5 flow).
         out = {

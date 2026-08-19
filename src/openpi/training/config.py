@@ -648,6 +648,10 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
 
     roots_index: str | None = None
     ranges_path: str | None = None
+    # Crop both cameras to square before the 224 resize. The 5k `camera_fixed` render stores
+    # 640x360; without this a straight resize squashes 16:9 into 1:1. DECLARED per config, not
+    # sniffed from the frame shape -- see `_center_crop_square`.
+    image_center_crop: bool = False
     # Path to the AWR weights artifact, or None for uniform unweighted pretraining. This is the
     # ONLY field that differs between the plain-BC baseline and either supervision arm, which is
     # what makes the three runs a controlled comparison rather than three separate experiments.
@@ -789,7 +793,7 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[axis_franka_policy.AxisFrankaInputs()],
+            inputs=[axis_franka_policy.AxisFrankaInputs(center_crop=self.image_center_crop)],
             outputs=[
                 axis_franka_policy.AxisFrankaEEFOutputs()
                 if self.eef_action
@@ -1271,7 +1275,7 @@ def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
     eef: bool = False, paper: bool = False, name: str | None = None,
     schedule_required: bool = False, expected_mode: str | None = None,
-    quality_required: bool = False,
+    quality_required: bool = False, center_crop: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1386,6 +1390,9 @@ def _axis_pretrain_config(
             norm_stats_from=_AXIS_ROUND1_NAME if name else None,
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
+            # 640x360 corpora only; a no-op on square frames. Declared per config so a corpus
+            # swap cannot change what an existing config means -- see _center_crop_square.
+            image_center_crop=center_crop,
             # Schedule arms (name given) never take AWR weights from the environment; see the
             # docstring's `name` paragraph.
             awr_weights=None if name else os.environ.get("AXIS_PRETRAIN_AWR_WEIGHTS"),
@@ -1467,6 +1474,9 @@ def _axis_eef_libero_serve_config() -> TrainConfig:
                 }
             ),
             axis_franka_policy.LiberoStateToAxisEEF(),
+            # NO center_crop here: this is a FREE function, so `self` does not exist (it
+            # raised NameError at serve time), and the LIBERO client already sends square
+            # pad-224 frames, so a crop would be a no-op regardless.
             axis_franka_policy.AxisFrankaInputs(),
         ],
         outputs=[axis_franka_policy.AxisFrankaEEFLiberoOutputs()],
@@ -1527,6 +1537,16 @@ _CONFIGS = [
     # The CFG path is still unbuilt: both factories still build their repack from a bare
     # RepackTransform, so no conditioning tag reaches the prompt.
     _axis_pretrain_config(eef=True, paper=True, batch_size=8, num_train_steps=100_000),
+    # ---- the 5k `camera_fixed` corpus -------------------------------------------------------
+    # Same recipe as the round-1 paper arm, one field different: the frames are 640x360 (16:9)
+    # instead of square, so both cameras are centre-cropped to 360x360 before the 224 resize.
+    # Without it a straight resize squashes every frame; with it the framing matches LIBERO's
+    # square render. A SEPARATE config rather than a flag on the existing one, because the
+    # existing one reads its corpus from the environment and the old corpora are NOT 16:9 --
+    # v3 is 126x224, randcam 224x224 -- so cropping there would change what those runs meant
+    # without anything recording it.
+    _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_pretrain_eef_paper_5k"),
     #
     # ROUND-2 INDEX-SCHEDULE ARMS. Both carry round 1's model, optimiser and budget (20,605 steps
     # = one epoch of the rung-5000 corpus, at GLOBAL batch 64) and differ from the `bc` control,
@@ -1549,9 +1569,9 @@ _CONFIGS = [
     # the control they are compared against; a config-level default cannot enforce that, because
     # CLI overrides bypass it silently. See conf/experiments/onelayer_v3_stage1_arms.toml.
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
-                          name="pi05_axis_drop", schedule_required=True, expected_mode="drop"),
+                          center_crop=True, name="pi05_axis_drop", schedule_required=True, expected_mode="drop"),
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
-                          name="pi05_axis_anneal", schedule_required=True, expected_mode="anneal"),
+                          center_crop=True, name="pi05_axis_anneal", schedule_required=True, expected_mode="anneal"),
     # The SELECTIVE Filtered-BC cut. `pi05_axis_drop` above is WVM Eq E.6 at kappa = 0.0 (keep
     # Delta >= 0); this is the percentile variant of the same equation. It needs its own name and
     # its own `expected_mode` precisely because the two are the same MECHANISM at different
@@ -1561,10 +1581,13 @@ _CONFIGS = [
     # WHY THIS ARM EXISTS AT ALL: on this corpus 75.7% of rows are already advantaged, so
     # `pi05_axis_drop` shifts only ~1.32x of the gradient budget onto advantaged rows even as a
     # hard filter, and WVM's own top-70% would be nearly indistinguishable from it. The artifact
-    # this name expects is built at `--keep-top-frac 0.30` (see index_schedule.DEFAULT_KEEP_TOP_FRAC
-    # for why 0.30, and why nothing below ~0.136 is constructible from the weights).
+    # this name expects is built at `--keep-top-frac 0.50` (0.30 until 2026-08-18; see
+    # index_schedule.DEFAULT_KEEP_TOP_FRAC for why 0.50, and why nothing below ~0.136 is
+    # constructible from the weights). NOTHING VALIDATES THE FRACTION AT LOAD TIME, so an artifact
+    # built at one value runs silently under a name documented at another -- state it in the arm's
+    # spec rather than trusting this comment.
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
-                          name="pi05_axis_drop_top", schedule_required=True,
+                          center_crop=True, name="pi05_axis_drop_top", schedule_required=True,
                           expected_mode="drop_top"),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
     # measured against the full-data baseline it changes two things at once -- which rows, and how
@@ -1573,7 +1596,7 @@ _CONFIGS = [
     # drop_top does not beat this, no weighting function built on that reward will help either, at
     # any tau or delta -- which is the cheapest way to learn that.
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
-                          name="pi05_axis_drop_random", schedule_required=True,
+                          center_crop=True, name="pi05_axis_drop_random", schedule_required=True,
                           expected_mode="drop_random"),
     #
     # ROUND-2 MECHANISM 3: pi0.7 quality conditioning. Same recipe and budget as the two arms
@@ -1596,7 +1619,7 @@ _CONFIGS = [
     # WARMUP IS NOT ROUND 1's HERE either -- see the schedule arms above; the arm TOML must carry
     # the same `lr_schedule.*` overrides.
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
-                          name="pi05_axis_cfg", quality_required=True),
+                          center_crop=True, name="pi05_axis_cfg", quality_required=True),
     # INFERENCE-ONLY: serve the pi05_axis_pretrain_eef checkpoint to the LIBERO-Plus client.
     _axis_eef_libero_serve_config(),
     #
