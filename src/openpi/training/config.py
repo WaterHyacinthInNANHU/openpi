@@ -1969,6 +1969,12 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             dataset_image_orientation="inverted",
+            # SHARE the _paper config's stats directory. `assets_dirs` is
+            # `assets_base_dir / name`, so this config's NEW name would otherwise send it
+            # looking in `assets/pi05_libero_axisinit_paper_r1data/...`, which nothing
+            # provisions -- `conf/provision.toml` mirrors these to the `_paper` directory.
+            # A NAME rather than a path so it follows an --assets-base-dir override.
+            norm_stats_from="pi05_libero_axisinit_paper",
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
