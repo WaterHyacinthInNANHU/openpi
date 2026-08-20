@@ -1936,6 +1936,55 @@ _CONFIGS = [
         num_train_steps=30_000,
         fsdp_devices=8,
     ),
+    # STAGE 2 ON ROUND 1's BUILD. A verbatim copy of `pi05_libero_axisinit_paper` differing in
+    # exactly two fields: `name`, and the orientation this dataset stores.
+    #
+    # WHY IT EXISTS. The `_paper` config above reads PI's official build (1,693 eps, 256px,
+    # UPRIGHT). Round 1's numbers -- base_ctrl 86.1 > awr_v2 80.4 > bc 77.5 -- were measured on a
+    # DIFFERENT build: 2,000 episodes at 128px, stored INVERTED. Swapping build cost 24.9 points
+    # on the control alone (61.2 vs 86.1), which is larger than every supervision effect we are
+    # trying to measure, so round 3 returns to round 1's build to recover the headroom. Decision
+    # taken 2026-08-19; the two builds' stage-2 numbers are NOT comparable with each other.
+    #
+    # THE POLICY STILL SEES UPRIGHT, which is the only thing that matters and the thing that was
+    # got wrong once. `dataset_image_orientation` names what the BYTES ON DISK are, and the
+    # rotation is DERIVED from it: `rotation_needed("inverted")` is True, so `Rotate180Images`
+    # enters `repack_transforms` -- the one group inference never runs -- and the model is fed
+    # upright frames, matching stage 1 and matching the eval client, which turns MuJoCo's
+    # bottom-up render right-side-up itself. Declaring "upright" here instead would train this
+    # 180 degrees to eval, converge beautifully, pass every guard, and score ~0.
+    # `check_dataset_build` refuses at loader construction if the declaration disagrees with the
+    # resolved dataset, keyed on (total_episodes, image_hw) rather than the repo id.
+    #
+    # THE COST, stated rather than hidden: the model input is 224x224, so every 128px frame is
+    # UPSCALED 1.75x. That is exactly what the `_paper` config moved away from. We are taking it
+    # back deliberately -- the leading explanation for round 1's higher scores is that this
+    # upscale acted as accidental low-pass augmentation (measured 2.6-2.9x blurrier by Laplacian
+    # variance), and round 3 is the run that tests whether the headroom comes back with it.
+    TrainConfig(
+        name="pi05_libero_axisinit_paper_r1data",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            dataset_image_orientation="inverted",
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "AXIS_EEF_PAPER_INIT_CKPT",
+                "/unset/set-AXIS_EEF_PAPER_INIT_CKPT-to-a-pi05_axis_pretrain_eef_paper-step/params",
+            )
+        ),
+        num_train_steps=30_000,
+        fsdp_devices=8,
+    ),
     # STAGE 2 FOR THE CFG ARMS ONLY, and the ONE place round 2 breaks the "stage 2 is identical
     # across arms" rule that `conf/experiments/onelayer_v3_stage2_libero.toml` states.
     #
