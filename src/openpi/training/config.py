@@ -1182,6 +1182,117 @@ def _axis_slb_config(
     )
 
 
+# The held-out 20 benchmark. Baked in as a literal rather than read from the benchmark JSON,
+# because a config module must import on a machine that has none of our artifacts -- a registry
+# that silently shrinks to zero arms on a fresh box is the failure this avoids.
+# Selection and rationale: docs/heldout_20_benchmark_spec.md. 813 is excluded (unevaluable).
+HELDOUT_20_TASK_IDS = (
+    809, 810, 811, 815, 866, 868, 929, 945, 953, 966,
+    970, 1046, 1252, 1426, 1427, 1458, 1459, 1746, 1889, 1891,
+)
+
+# Frames in each task's 20-demo ADAPTATION split, measured from the built index
+# (`axis.dataset.build_heldout_index`, camera_fixed). Baked in for the same reason as the task
+# list: the budget must be identical on every machine and must not depend on an artifact being
+# present. Note the 7x spread -- 3,222 frames for task 811 against 23,484 for 1459 -- which is
+# exactly why the budget is expressed in epochs rather than steps.
+HELDOUT_20_ADAPT_FRAMES = {
+    809: 4917, 810: 7146, 811: 3222, 815: 9687, 866: 6189,
+    868: 4398, 929: 5013, 945: 11364, 953: 7356, 966: 6678,
+    970: 6489, 1046: 6768, 1252: 6828, 1426: 15459, 1427: 11751,
+    1458: 16719, 1459: 23484, 1746: 5433, 1889: 5233, 1891: 5916,
+}
+
+HELDOUT_GATE_EPOCHS = 50
+HELDOUT_GATE_BATCH = 32
+
+
+def heldout_gate_steps(task_id: int, *, epochs: int = HELDOUT_GATE_EPOCHS,
+                       batch_size: int = HELDOUT_GATE_BATCH) -> int:
+    """Steps for a fixed number of EPOCHS over this task's own 20-demo set.
+
+    Raises on an unknown task rather than defaulting: a silent fallback budget would train one arm
+    of a 20-arm gate differently from the rest, and the gate would then report a task as
+    unlearnable when it was merely undertrained.
+    """
+    if task_id not in HELDOUT_20_ADAPT_FRAMES:
+        raise KeyError(
+            f"task {task_id} is not in the held-out 20; no measured frame count exists for it, "
+            f"so its epoch budget cannot be derived. Known: {sorted(HELDOUT_20_ADAPT_FRAMES)}"
+        )
+    return max(100, round(HELDOUT_20_ADAPT_FRAMES[task_id] * epochs / batch_size))
+
+
+def _axis_heldout_gate_config(task_id: int, *, num_train_steps: int) -> TrainConfig:
+    """The LEARNABILITY GATE arm for one held-out benchmark task.
+
+    WHAT THE GATE IS FOR. The benchmark's quality filters say the DEMONSTRATIONS succeed. They say
+    nothing about whether a policy can learn the task from 20 of them, and the previous 10-task
+    version floored: 4 of 6 evaluated tasks scored 0/10. A benchmark whose tasks are all
+    unlearnable ranks nothing. So every candidate task is adapted here and evaluated, and kept only
+    if `0.20 <= success <= 0.80` -- two-sided, because a task the reference already solves leaves
+    no headroom to show improvement.
+
+    WHY pi05_base AND NOT pi05_droid. The gate policy must share no pretraining with the arms under
+    test, or the gate would select tasks that flatter them. `pi05_droid` was also rejected on
+    evidence: it scored 0/50 on the current held-out set, so it would reject nearly every candidate
+    for a reason that is about the policy rather than the task.
+
+    THE RECIPE IS THE FROZEN SLB LoRA RECIPE, deliberately unchanged except for the init, so the
+    gate measures the task rather than a new set of hyperparameters. Vision stays UNFROZEN: the
+    measured result on this render domain is that freezing SigLIP makes grasp success worse in
+    every condition (see `_axis_slb_config`), which is the opposite of the usual low-data recipe.
+
+    NORM STATS ARE PER-TASK, computed on the 20-demo adaptation set itself. Reusing pretraining
+    stats is the defect that produced two significant-but-wrong conclusions here before, both
+    withdrawn; `AssetsConfig()` keeps compute and load resolving to the same per-config path.
+    `compute_norm_stats` MUST run before training.
+
+    THE BUDGET IS EPOCHS, NOT STEPS. The 20-demo sets differ 7x in length (3,222 frames for task
+    811 against 23,484 for 1459), so a fixed step count would give tasks wildly unequal exposure
+    and confound "unlearnable" with "undertrained". The caller passes a per-task step count derived
+    from that task's own frame count.
+    """
+    lr = _optimizer.CosineDecaySchedule(
+        warmup_steps=max(100, num_train_steps // 10),
+        peak_lr=2.5e-5,
+        decay_steps=num_train_steps,
+        decay_lr=2.5e-6,
+    )
+    return TrainConfig(
+        name=f"pi05_axis_heldout_gate_{task_id}",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=AxisFrankaSlbDataConfig(
+            repo_id="Devon018/Franka-Datasets-v2",
+            variant="vanilla",
+            task_id=task_id,
+            # sidecar_root DELIBERATELY UNSET. The SLB variant sampler engages only when a sidecar
+            # root is present (data_loader.py: `if getattr(data_config, "slb_sidecar_root", None)`),
+            # so leaving it None gives plain full-shuffle over the 20 demos -- which is what a
+            # few-shot adaptation is. Setting it would silently apply a WVM variant's row filter.
+            sidecar_root=None,
+            dataset_root=os.environ.get(f"HELDOUT_DATASET_ROOT_{task_id}"),
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=num_train_steps,
+        lr_schedule=lr,
+        ema_decay=None,          # off for LoRA, per openpi's own LoRA examples
+        keep_period=None,        # only the final checkpoint is ever evaluated
+        num_workers=8,           # LeRobot v3.0 decodes video per item; 2 starves the loader
+        freeze_filter=_slb_freeze_filter(freeze_vision=False),
+    )
+
+
 def _slb_available_task_ids() -> tuple[int, ...]:
     """SLB task_ids that have BOTH a manifest entry and converted LeRobot data on disk.
 
@@ -2032,6 +2143,16 @@ _CONFIGS = [
         for task_id in _slb_available_task_ids()
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
+    ],
+    #
+    # HELD-OUT 20 LEARNABILITY GATE (pi0.5 LoRA from pi05_base, 20 demos per task).
+    # Not an experimental arm: this decides which candidate tasks are ADMITTED to the benchmark.
+    # Kept if 0.20 <= dual-sim success <= 0.80. See docs/heldout_20_benchmark_spec.md.
+    # Budget is 50 epochs over each task's own 20-demo set, so no task is judged unlearnable on a
+    # shorter effective exposure than another.
+    *[
+        _axis_heldout_gate_config(task_id, num_train_steps=heldout_gate_steps(task_id))
+        for task_id in HELDOUT_20_TASK_IDS
     ],
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
     # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen
