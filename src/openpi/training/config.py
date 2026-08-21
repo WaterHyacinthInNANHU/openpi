@@ -1191,12 +1191,25 @@ HELDOUT_20_TASK_IDS = (
     970, 1046, 1252, 1426, 1427, 1458, 1459, 1746, 1889, 1891,
 )
 
-# Frames in each task's 20-demo ADAPTATION split, measured from the built index
-# (`axis.dataset.build_heldout_index`, camera_fixed). Baked in for the same reason as the task
-# list: the budget must be identical on every machine and must not depend on an artifact being
-# present. Note the 7x spread -- 3,222 frames for task 811 against 23,484 for 1459 -- which is
-# exactly why the budget is expressed in epochs rather than steps.
-HELDOUT_20_ADAPT_FRAMES = {
+# TRAINABLE SAMPLES in each task's 20-demo adaptation split -- the idle-FILTERED window total,
+# not the raw episode length. This distinction is the whole budget.
+#
+# The loader restricts rows to the non-idle ranges, so raw frames are NOT what gets trained on, and
+# retention is neither constant nor close to it: measured over these 20 tasks it runs from 35.7%
+# (815) to 88.0% (1427), pooled 64.8%. Deriving the budget from raw frames -- which an earlier
+# version of this table did -- would have handed task 1427 roughly 2.4x the real exposure of task
+# 815 while both were labelled "50 epochs", and the gate would then have reported the difference as
+# a difference in LEARNABILITY. That is precisely the confound an epoch budget exists to remove.
+#
+# Raw frame totals are kept alongside only so the retention is auditable; nothing derives from them.
+HELDOUT_20_ADAPT_SAMPLES = {
+    809: 4007, 810: 5937, 811: 1871, 815: 3462, 866: 4128,
+    868: 3084, 929: 3925, 945: 9138, 953: 5577, 966: 5247,
+    970: 4518, 1046: 4415, 1252: 2786, 1426: 13236, 1427: 10346,
+    1458: 8365, 1459: 10575, 1746: 4512, 1889: 2365, 1891: 2698,
+}
+
+HELDOUT_20_ADAPT_RAW_FRAMES = {
     809: 4917, 810: 7146, 811: 3222, 815: 9687, 866: 6189,
     868: 4398, 929: 5013, 945: 11364, 953: 7356, 966: 6678,
     970: 6489, 1046: 6768, 1252: 6828, 1426: 15459, 1427: 11751,
@@ -1209,18 +1222,21 @@ HELDOUT_GATE_BATCH = 32
 
 def heldout_gate_steps(task_id: int, *, epochs: int = HELDOUT_GATE_EPOCHS,
                        batch_size: int = HELDOUT_GATE_BATCH) -> int:
-    """Steps for a fixed number of EPOCHS over this task's own 20-demo set.
+    """Steps for a fixed number of EPOCHS over this task's own TRAINABLE samples.
+
+    Epochs are counted over idle-filtered windows, which is what the loader actually draws, and
+    NOT over raw frames -- see HELDOUT_20_ADAPT_SAMPLES for why the difference is load-bearing.
 
     Raises on an unknown task rather than defaulting: a silent fallback budget would train one arm
     of a 20-arm gate differently from the rest, and the gate would then report a task as
     unlearnable when it was merely undertrained.
     """
-    if task_id not in HELDOUT_20_ADAPT_FRAMES:
+    if task_id not in HELDOUT_20_ADAPT_SAMPLES:
         raise KeyError(
-            f"task {task_id} is not in the held-out 20; no measured frame count exists for it, "
-            f"so its epoch budget cannot be derived. Known: {sorted(HELDOUT_20_ADAPT_FRAMES)}"
+            f"task {task_id} is not in the held-out 20; no measured sample count exists for it, "
+            f"so its epoch budget cannot be derived. Known: {sorted(HELDOUT_20_ADAPT_SAMPLES)}"
         )
-    return max(100, round(HELDOUT_20_ADAPT_FRAMES[task_id] * epochs / batch_size))
+    return max(100, round(HELDOUT_20_ADAPT_SAMPLES[task_id] * epochs / batch_size))
 
 
 def _axis_heldout_gate_config(task_id: int, *, num_train_steps: int) -> TrainConfig:
@@ -1268,16 +1284,16 @@ def _axis_heldout_gate_config(task_id: int, *, num_train_steps: int) -> TrainCon
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
-        data=AxisFrankaSlbDataConfig(
-            repo_id="Devon018/Franka-Datasets-v2",
-            variant="vanilla",
-            task_id=task_id,
-            # sidecar_root DELIBERATELY UNSET. The SLB variant sampler engages only when a sidecar
-            # root is present (data_loader.py: `if getattr(data_config, "slb_sidecar_root", None)`),
-            # so leaving it None gives plain full-shuffle over the 20 demos -- which is what a
-            # few-shot adaptation is. Setting it would silently apply a WVM variant's row filter.
-            sidecar_root=None,
-            dataset_root=os.environ.get(f"HELDOUT_DATASET_ROOT_{task_id}"),
+        # THE ROOTS-INDEX PATH, not the single-dataset SLB one. The completed few-shot held-out
+        # experiment expressed its 20-demo split as a one-task roots index plus a ranges file
+        # (`axis.dataset.build_fewshot_splits`), and reusing that path is what makes this stage
+        # inherit the IDLE-FRAME FILTERING and loader behaviour every prior run was measured
+        # under. Pointing at a raw dataset root instead would silently train on the dwell frames
+        # all of them excluded -- a recipe change invisible in a success rate afterwards.
+        data=AxisFrankaPretrainDataConfig(
+            repo_id=_AXIS_PRETRAIN_REPO_ID,
+            roots_index=os.environ.get(f"HELDOUT_ROOTS_{task_id}"),
+            ranges_path=os.environ.get(f"HELDOUT_RANGES_{task_id}"),
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(),
         ),
