@@ -1202,12 +1202,20 @@ HELDOUT_20_TASK_IDS = (
 # a difference in LEARNABILITY. That is precisely the confound an epoch budget exists to remove.
 #
 # Raw frame totals are kept alongside only so the retention is auditable; nothing derives from them.
+#   * The four measured on the BUILT corpus (811/866/953/1889) are authoritative: they come from
+#     the idle-filtered ranges the loader will actually draw, over the quality-ranked demos.
+#   * The rest are still estimates from the pre-quality-ranking selection and MUST be re-measured
+#     from each task's built ranges before its arm is launched -- ranking changed which demos are
+#     selected, and 811 moved 1871 -> 1728 on that change alone.
 HELDOUT_20_ADAPT_SAMPLES = {
-    809: 4007, 810: 5937, 811: 1871, 815: 3462, 866: 4128,
-    868: 3084, 929: 3925, 945: 9138, 953: 5577, 966: 5247,
+    809: 4007, 810: 5937, 811: 1728, 815: 3462, 866: 5197,
+    868: 3084, 929: 3925, 945: 9138, 953: 5475, 966: 5247,
     970: 4518, 1046: 4415, 1252: 2786, 1426: 13236, 1427: 10346,
-    1458: 8365, 1459: 10575, 1746: 4512, 1889: 2365, 1891: 2698,
+    1458: 8365, 1459: 10575, 1746: 4512, 1889: 4368, 1891: 2698,
 }
+
+# Measured on the BUILT corpus rather than estimated. Only these are trustworthy today.
+HELDOUT_SAMPLES_MEASURED = frozenset({811, 866, 953, 1889})
 
 HELDOUT_20_ADAPT_RAW_FRAMES = {
     809: 4917, 810: 7146, 811: 3222, 815: 9687, 866: 6189,
