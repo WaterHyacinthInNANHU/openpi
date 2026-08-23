@@ -695,6 +695,9 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # `action_eef`(7, robosuite OSC_POSE delta) columns and slice the output to 7. Default False
     # keeps the DROID-8D joint-velocity layout (for a future real-world checkpoint).
     eef_action: bool = False
+    # Emit 9-D joint-position actions (7 joint targets + 2 finger widths) instead of the 8-D DROID
+    # velocity slice. Must match the action space the eval controller is run in.
+    joint9_action: bool = False
 
     @override
     def norm_stats_dir(self, assets_dirs: pathlib.Path) -> epath.Path | None:
@@ -797,7 +800,11 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             outputs=[
                 axis_franka_policy.AxisFrankaEEFOutputs()
                 if self.eef_action
-                else axis_franka_policy.AxisFrankaOutputs()
+                else (
+                    axis_franka_policy.AxisFrankaJoint9Outputs()
+                    if self.joint9_action
+                    else axis_franka_policy.AxisFrankaOutputs()
+                )
             ],
         )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
@@ -1183,6 +1190,249 @@ def _axis_slb_config(
         num_workers=8,
         freeze_filter=_slb_freeze_filter(freeze_vision),
         ema_decay=None,
+    )
+
+
+# The held-out 20 benchmark. Baked in as a literal rather than read from the benchmark JSON,
+# because a config module must import on a machine that has none of our artifacts -- a registry
+# that silently shrinks to zero arms on a fresh box is the failure this avoids.
+# Selection and rationale: docs/heldout_20_benchmark_spec.md. 813 is excluded (unevaluable).
+HELDOUT_20_TASK_IDS = (
+    809, 810, 811, 815, 866, 868, 929, 945, 953, 966,
+    970, 1046, 1252, 1426, 1427, 1458, 1459, 1746, 1889, 1891,
+)
+
+# TRAINABLE SAMPLES in each task's 20-demo adaptation split -- the idle-FILTERED window total,
+# not the raw episode length. This distinction is the whole budget.
+#
+# The loader restricts rows to the non-idle ranges, so raw frames are NOT what gets trained on, and
+# retention is neither constant nor close to it: measured over these 20 tasks it runs from 35.7%
+# (815) to 88.0% (1427), pooled 64.8%. Deriving the budget from raw frames -- which an earlier
+# version of this table did -- would have handed task 1427 roughly 2.4x the real exposure of task
+# 815 while both were labelled "50 epochs", and the gate would then have reported the difference as
+# a difference in LEARNABILITY. That is precisely the confound an epoch budget exists to remove.
+#
+# Raw frame totals are kept alongside only so the retention is auditable; nothing derives from them.
+#   * The four measured on the BUILT corpus (811/866/953/1889) are authoritative: they come from
+#     the idle-filtered ranges the loader will actually draw, over the quality-ranked demos.
+#   * The rest are still estimates from the pre-quality-ranking selection and MUST be re-measured
+#     from each task's built ranges before its arm is launched -- ranking changed which demos are
+#     selected, and 811 moved 1871 -> 1728 on that change alone.
+HELDOUT_20_ADAPT_SAMPLES = {
+    809: 6297, 810: 6395, 811: 1719, 815: 4066, 866: 5189,
+    868: 2673, 929: 5490, 945: 8635, 953: 5486, 966: 5041,
+    970: 4935, 1046: 5393, 1252: 4349, 1426: 10362, 1427: 9546,
+    1458: 7291, 1459: 7395, 1746: 5097, 1889: 4750, 1891: 2832,
+}
+
+# Measured on the BUILT corpus rather than estimated. Only these are trustworthy today.
+HELDOUT_SAMPLES_MEASURED = frozenset({809, 811, 866, 868, 945, 953, 966, 1426, 1459, 1889})
+
+HELDOUT_20_ADAPT_RAW_FRAMES = {
+    809: 8316, 810: 7593, 811: 2304, 815: 6291, 866: 7437,
+    868: 3270, 929: 7533, 945: 11376, 953: 7530, 966: 6177,
+    970: 7422, 1046: 9288, 1252: 6843, 1426: 12282, 1427: 10089,
+    1458: 10836, 1459: 18294, 1746: 5670, 1889: 5949, 1891: 3447,
+}
+
+HELDOUT_GATE_EPOCHS = 50
+HELDOUT_GATE_BATCH = 32
+# Merged idle-filtered sample count over all 20 tasks (measured on the re-render).
+# TASK 811's trainable-window count, and ONLY task 811's. Kept for the runs already reported
+# against it; `heldout_epoch_steps` is what new runs should use.
+HELDOUT_MULTITASK_SAMPLES = 1_597
+
+def heldout_multitask_steps(epochs: int, batch_size: int = HELDOUT_GATE_BATCH) -> int:
+    """DEPRECATED: `epochs` here means epochs OVER TASK 811, whatever data the run actually loads.
+
+    `HELDOUT_MULTITASK_SAMPLES` is hardcoded to 811's 1,597 idle-filtered windows, so this returns a
+    budget that is correct for 811 and wrong for everything else, silently:
+
+        task 811   1,597 rows -> 998 steps -> 20.0 epochs   (eef7 scored 86%)
+        task 1889  3,804 rows -> 998 steps ->  8.4 epochs   (eef7 scored 0/50)
+        20 tasks  98,113 rows -> 998 steps ->  0.3 epochs
+
+    A longer task silently receives proportionally less exposure, so per-task numbers produced with
+    this helper are NOT like-for-like and cross-task comparisons using it are invalid.
+    """
+    return max(100, round(HELDOUT_MULTITASK_SAMPLES * epochs / batch_size))
+
+
+def heldout_epoch_steps(epochs: int, ranges_path: str | None = None,
+                        batch_size: int = HELDOUT_GATE_BATCH) -> int:
+    """Steps for `epochs` passes over the samples THIS run will actually draw.
+
+    Counts the idle-filtered windows in the run's own ranges index -- the same quantity the loader
+    draws from, and the same convention `heldout_gate_steps` already uses per task. Falls back to
+    HELDOUT_RANGES_ALL, which is what the heldout configs read.
+
+    Raises rather than defaulting when the index cannot be read: a silent fallback budget is exactly
+    how one arm of a comparison ends up trained differently from the rest, and the eval then reports
+    a task as unlearnable when it was merely undertrained.
+    """
+    import json
+    import os
+
+    path = ranges_path or os.environ.get("HELDOUT_RANGES_ALL")
+    if not path:
+        raise ValueError(
+            "heldout_epoch_steps needs a ranges index (arg or HELDOUT_RANGES_ALL); refusing to "
+            "guess a budget, because guessing is how a task gets silently undertrained"
+        )
+    with open(path) as fh:
+        ranges = json.load(fh)
+    samples = sum(hi - lo for windows in ranges.values() for lo, hi in windows)
+    if samples <= 0:
+        raise ValueError(f"ranges index {path} declares no trainable windows")
+    return max(100, round(samples * epochs / batch_size))
+
+
+
+def heldout_gate_steps(task_id: int, *, epochs: int = HELDOUT_GATE_EPOCHS,
+                       batch_size: int = HELDOUT_GATE_BATCH) -> int:
+    """Steps for a fixed number of EPOCHS over this task's own TRAINABLE samples.
+
+    Epochs are counted over idle-filtered windows, which is what the loader actually draws, and
+    NOT over raw frames -- see HELDOUT_20_ADAPT_SAMPLES for why the difference is load-bearing.
+
+    Raises on an unknown task rather than defaulting: a silent fallback budget would train one arm
+    of a 20-arm gate differently from the rest, and the gate would then report a task as
+    unlearnable when it was merely undertrained.
+    """
+    if task_id not in HELDOUT_20_ADAPT_SAMPLES:
+        raise KeyError(
+            f"task {task_id} is not in the held-out 20; no measured sample count exists for it, "
+            f"so its epoch budget cannot be derived. Known: {sorted(HELDOUT_20_ADAPT_SAMPLES)}"
+        )
+    return max(100, round(HELDOUT_20_ADAPT_SAMPLES[task_id] * epochs / batch_size))
+
+
+
+def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | None = None,
+                                   name: str = "pi05_axis_heldout_multitask",
+                                   eef_action: bool = True) -> TrainConfig:
+    """One policy over all 20 held-out tasks -- the LIBERO-Plus-style protocol this suite replaces.
+
+    Same recipe as `_axis_heldout_gate_config` (pi05_base init, LoRA, vision unfrozen, constant LR,
+    own norm stats) but a single roots index spanning every task, so the model is fine-tuned once on
+    all 400 demonstrations and then scored per task at eval. Reading the index from
+    HELDOUT_ROOTS_ALL / HELDOUT_RANGES_ALL keeps the idle-frame filtering the gate inherits.
+    """
+    lr = _optimizer.CosineDecaySchedule(
+        warmup_steps=100,
+        peak_lr=2.5e-5,
+        decay_steps=num_train_steps,
+        decay_lr=2.5e-5,   # == peak_lr -> flat after warmup (openpi has no constant schedule)
+    )
+    return TrainConfig(
+        name=name,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=AxisFrankaPretrainDataConfig(
+            repo_id=_AXIS_PRETRAIN_REPO_ID,
+            roots_index=os.environ.get("HELDOUT_ROOTS_ALL"),
+            ranges_path=os.environ.get("HELDOUT_RANGES_ALL"),
+            # stage-1 speaks 7-D relative EEF (state_eef 8-D / action_eef 7-D). Fine-tuning in any
+            # other space forces the model to re-learn the action space and discards part of the
+            # pretraining this benchmark exists to measure. The eval MUST run with
+            # AXIS_EVAL_ACTION_SPACE=eef7; mismatched spaces score 0 on every task.
+            eef_action=eef_action,
+            # IMAGE GEOMETRY MUST MATCH STAGE-1, which passes center_crop=True. The default here
+            # aspect-preserves and letterboxes: MEASURED 43.8% of every 224x224 tensor is black
+            # padding, in the same place in every frame. A model pretrained on centre-cropped
+            # frames and fine-tuned on letterboxed ones eats a constant full-width domain shift,
+            # which costs precisely the pretraining this benchmark exists to measure -- and the
+            # eval inherits the same transform, so both halves stay self-consistent and no guard
+            # fires.
+            image_center_crop=True,
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            init_path or "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        batch_size=HELDOUT_GATE_BATCH,
+        num_train_steps=num_train_steps,
+        lr_schedule=lr,
+        ema_decay=None,
+        keep_period=None,
+        num_workers=8,
+        freeze_filter=_slb_freeze_filter(freeze_vision=False),
+    )
+
+
+def _axis_heldout_gate_config(task_id: int, *, num_train_steps: int) -> TrainConfig:
+    """The LEARNABILITY GATE arm for one held-out benchmark task.
+
+    WHAT THE GATE IS FOR. The benchmark's quality filters say the DEMONSTRATIONS succeed. They say
+    nothing about whether a policy can learn the task from 20 of them, and the previous 10-task
+    version floored: 4 of 6 evaluated tasks scored 0/10. A benchmark whose tasks are all
+    unlearnable ranks nothing. So every candidate task is adapted here and evaluated, and kept only
+    if `0.20 <= success <= 0.80` -- two-sided, because a task the reference already solves leaves
+    no headroom to show improvement.
+
+    WHY pi05_base AND NOT pi05_droid. The gate policy must share no pretraining with the arms under
+    test, or the gate would select tasks that flatter them. `pi05_droid` was also rejected on
+    evidence: it scored 0/50 on the current held-out set, so it would reject nearly every candidate
+    for a reason that is about the policy rather than the task.
+
+    THE RECIPE IS THE FROZEN SLB LoRA RECIPE, deliberately unchanged except for the init, so the
+    gate measures the task rather than a new set of hyperparameters. Vision stays UNFROZEN: the
+    measured result on this render domain is that freezing SigLIP makes grasp success worse in
+    every condition (see `_axis_slb_config`), which is the opposite of the usual low-data recipe.
+
+    NORM STATS ARE PER-TASK, computed on the 20-demo adaptation set itself. Reusing pretraining
+    stats is the defect that produced two significant-but-wrong conclusions here before, both
+    withdrawn; `AssetsConfig()` keeps compute and load resolving to the same per-config path.
+    `compute_norm_stats` MUST run before training.
+
+    THE BUDGET IS EPOCHS, NOT STEPS. The 20-demo sets differ 7x in length (3,222 frames for task
+    811 against 23,484 for 1459), so a fixed step count would give tasks wildly unequal exposure
+    and confound "unlearnable" with "undertrained". The caller passes a per-task step count derived
+    from that task's own frame count.
+    """
+    lr = _optimizer.CosineDecaySchedule(
+        warmup_steps=max(100, num_train_steps // 10),
+        peak_lr=2.5e-5,
+        decay_steps=num_train_steps,
+        decay_lr=2.5e-6,
+    )
+    return TrainConfig(
+        name=f"pi05_axis_heldout_gate_{task_id}",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        # THE ROOTS-INDEX PATH, not the single-dataset SLB one. The completed few-shot held-out
+        # experiment expressed its 20-demo split as a one-task roots index plus a ranges file
+        # (`axis.dataset.build_fewshot_splits`), and reusing that path is what makes this stage
+        # inherit the IDLE-FRAME FILTERING and loader behaviour every prior run was measured
+        # under. Pointing at a raw dataset root instead would silently train on the dwell frames
+        # all of them excluded -- a recipe change invisible in a success rate afterwards.
+        data=AxisFrankaPretrainDataConfig(
+            repo_id=_AXIS_PRETRAIN_REPO_ID,
+            roots_index=os.environ.get(f"HELDOUT_ROOTS_{task_id}"),
+            ranges_path=os.environ.get(f"HELDOUT_RANGES_{task_id}"),
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=num_train_steps,
+        lr_schedule=lr,
+        ema_decay=None,          # off for LoRA, per openpi's own LoRA examples
+        keep_period=None,        # only the final checkpoint is ever evaluated
+        num_workers=8,           # LeRobot v3.0 decodes video per item; 2 starves the loader
+        freeze_filter=_slb_freeze_filter(freeze_vision=False),
     )
 
 
@@ -2111,6 +2361,43 @@ _CONFIGS = [
         for variant in ("vanilla", "filt_bin", "top70", "awr", "cfg")
         for ki in (False, True)
     ],
+    #
+    # HELD-OUT 20 LEARNABILITY GATE (pi0.5 LoRA from pi05_base, 20 demos per task).
+    # Not an experimental arm: this decides which candidate tasks are ADMITTED to the benchmark.
+    # Kept if 0.20 <= dual-sim success <= 0.80. See docs/heldout_20_benchmark_spec.md.
+    # Budget is 50 epochs over each task's own 20-demo set, so no task is judged unlearnable on a
+    # shorter effective exposure than another.
+    *[
+        _axis_heldout_gate_config(task_id, num_train_steps=heldout_gate_steps(task_id))
+        for task_id in HELDOUT_20_TASK_IDS
+    ],
+    _axis_heldout_multitask_config(num_train_steps=heldout_multitask_steps(5)),
+    # AXIS stage-1 BC init. Same everything else, so a difference in score is the pretraining.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_multitask_steps(5),
+        init_path="/disk/axis/stage1_ckpts/pi05_axis_pretrain_eef_paper_5k/libero5k_bc/20604/params",
+        name="pi05_axis_heldout_multitask_bc",
+    ),
+    # ACTION-SPACE A/B. Identical data, demos, recipe and pi05_base init to
+    # `pi05_axis_heldout_multitask`; only the action space differs (droid8 instead of eef7).
+    # The eef7 pilot scored 1/50 on task 811 while the droid8 trust gate scored 49/50 on the
+    # SAME task through the SAME harness, so this isolates the action space from the data.
+    # Eval MUST run with AXIS_EVAL_ACTION_SPACE=droid8.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_multitask_steps(5),
+        name="pi05_axis_heldout_multitask_d8",
+        eef_action=False,
+    ),
+    # droid8 + AXIS stage-1 init. The joint-velocity BACKUP arm for Table 1: eef7 scores 0/50 on
+    # every place-relative task while droid8 reaches 44% on 1889 from the same demonstrations.
+    # NOTE the init is an eef7-pretrained checkpoint, so what transfers here is the vision/language
+    # stack, not the action space -- see the module note where this arm is used.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_multitask_steps(5),
+        init_path="/disk/axis/stage1_ckpts/pi05_axis_pretrain_eef_paper_5k/libero5k_bc/20604/params",
+        name="pi05_axis_heldout_multitask_d8_bc",
+        eef_action=False,
+    ),
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
     # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen
     # image tower. If this lifts success well above 2/20, vision-tower overfitting on the

@@ -43,6 +43,28 @@ def _quat_conj(q: np.ndarray) -> np.ndarray:
     return np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float64)
 
 
+def hemisphere_align(quats_xyzw) -> np.ndarray:
+    """Put a SEQUENCE of xyzw quaternions in one continuous hemisphere.
+
+    `canonical_xyzw` picks the sign per frame (w>=0). At a top-down gripper the rotation is ~180 deg
+    and w sits at ~0, so that per-frame rule flips arbitrarily between the +v and -v representations
+    of the SAME orientation -- and the axis-angle it feeds the policy jumps by 2*pi.
+
+    MEASURED on the held-out corpus: `state_eef[3]` swings the full -pi..+pi with std 2.979 (task
+    1889) and shows 6.28 rad single-step jumps on 0.8-3.8% of frames in EVERY task. LIBERO's own
+    state, by contrast, sits in a narrow band -- std 0.354, q01..q99 = 1.53..3.26. Aligning each
+    frame to the previous one's hemisphere reproduces that: std 2.979 -> 0.278, range 2.01..3.22.
+
+    The DELTA path does not need this: `eef_pose_to_delta_actions` applies shortest-arc to
+    `q_rel`, so a source sign flip cancels there. This is a STATE defect only.
+    """
+    q = np.asarray(quats_xyzw, dtype=np.float64).copy()
+    for i in range(1, len(q)):
+        if float(np.dot(q[i], q[i - 1])) < 0.0:
+            q[i] = -q[i]
+    return q
+
+
 def canonical_xyzw(q) -> np.ndarray:
     """Sign-canonicalise a unit xyzw quaternion to w>=0 (robosuite mat2quat / LIBERO
     convention), so its axis-angle norm stays <= pi. MuJoCo does NOT canonicalise sign, so
@@ -52,14 +74,18 @@ def canonical_xyzw(q) -> np.ndarray:
     return -q if q[3] < 0 else q
 
 
-def episode_eef_columns(eef_pose_wxyz, gripper, episode_index, frame_index):
+def episode_eef_columns(eef_pose_wxyz, gripper, episode_index, frame_index,
+                        *, continuous_rotation: bool = False):
     """Per-frame relative-EEF `action_eef`(N,7) + `state_eef`(N,8) from an absolute MuJoCo
     **wxyz** eef_pose sequence, grouped by episode and ordered by frame_index within each.
 
       action_eef = [Δpos(world), Δaxis-angle(world), gripper_next]; the LAST frame of each
         episode holds still (zero delta) but KEEPS its own gripper (not 0) so end-of-episode
         chunk padding never teaches "open at the end".
-      state_eef  = [pos(3), canonical-axis-angle(3, w>=0), gripper, gripper] (8-D, LIBERO-shaped).
+      state_eef  = [pos(3), axis-angle(3), gripper, gripper] (8-D, LIBERO-shaped).
+        `continuous_rotation=True` aligns each episode's quaternions to one hemisphere
+        (see `hemisphere_align`) instead of the per-frame w>=0 rule, which flips by 2*pi
+        at a top-down gripper. Default False so existing corpora rebuild byte-identical.
 
     Pure numpy; testable without parquet. Row order of the outputs matches the input rows.
     """
@@ -78,7 +104,9 @@ def episode_eef_columns(eef_pose_wxyz, gripper, episode_index, frame_index):
         if len(idx) > 1:
             act[idx[:-1]] = eef_pose_to_delta_actions(p, g)
         act[idx[-1]] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, g[-1]]  # hold still, keep gripper
-        aa = np.stack([quat_xyzw_to_axisangle(canonical_xyzw(q)) for q in p[:, 3:7]])
+        q_seq = hemisphere_align(p[:, 3:7]) if continuous_rotation else p[:, 3:7]
+        aa = np.stack([quat_xyzw_to_axisangle(q if continuous_rotation else canonical_xyzw(q))
+                       for q in q_seq])
         ste[idx] = np.concatenate([p[:, :3], aa, g[:, None], g[:, None]], axis=1).astype(np.float32)
     return act, ste
 
