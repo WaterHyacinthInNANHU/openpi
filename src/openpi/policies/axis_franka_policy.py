@@ -133,6 +133,19 @@ class AxisFrankaOutputs(_transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class AxisFrankaJoint9Outputs(_transforms.DataTransformFn):
+    """Joint-POSITION variant: slice the padded 32-D output back to 9 = 7 joint targets + 2 finger
+    widths, the space the stage-1 corpus and the held-out render store.
+
+    The 8-D slice above is for the DROID velocity space; applying it to a 9-D policy drops the last
+    finger width and shifts the first one into the closedness slot the eval reads.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"])[:, :9]}
+
+
+@dataclasses.dataclass(frozen=True)
 class AxisFrankaEEFOutputs(_transforms.DataTransformFn):
     """Relative-EEF action variant: slice the model's padded 32-D output back to the 7-D
     LIBERO/robosuite OSC_POSE action [Δpos(3), Δaxis-angle(3), gripper]. Inputs are shared
