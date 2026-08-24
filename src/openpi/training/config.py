@@ -1310,7 +1310,10 @@ def heldout_gate_steps(task_id: int, *, epochs: int = HELDOUT_GATE_EPOCHS,
 
 def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | None = None,
                                    name: str = "pi05_axis_heldout_multitask",
-                                   eef_action: bool = True) -> TrainConfig:
+                                   eef_action: bool = True,
+                                   freeze_vision: bool = False,
+                                   roots_index: str | None = None,
+                                   ranges_path: str | None = None) -> TrainConfig:
     """One policy over all 20 held-out tasks -- the LIBERO-Plus-style protocol this suite replaces.
 
     Same recipe as `_axis_heldout_gate_config` (pi05_base init, LoRA, vision unfrozen, constant LR,
@@ -1329,14 +1332,28 @@ def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | Non
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=16,
+            # 10, NOT openpi's default 16. The paper states action_horizon 10, and BOTH
+            # stage-1 arms (pi05_axis_pretrain_{eef,d8}_paper_5k) and upstream pi05_libero use 10.
+            # A finetune at 16 makes the pretrained action expert emit a chunk length it never
+            # trained on, which costs exactly the transfer this benchmark measures -- and it biases
+            # AGAINST the pretrained arm, so it would show up as "pretraining hurts" rather than as
+            # a defect. 16 was inherited as a default here, never chosen.
+            action_horizon=10,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
         data=AxisFrankaPretrainDataConfig(
             repo_id=_AXIS_PRETRAIN_REPO_ID,
-            roots_index=os.environ.get("HELDOUT_ROOTS_ALL"),
-            ranges_path=os.environ.get("HELDOUT_RANGES_ALL"),
+            # A DECLARED index beats an env var, and not only for reproducibility:
+            # `compute_norm_stats.py` takes ONLY --config-name and builds its loader from
+            # this DataConfig, so whatever is named here is the population the statistics
+            # are fitted on. Round 1 left this to HELDOUT_ROOTS_ALL, which a sibling driver
+            # had set to the 20-task index -- so it trained on 10 tasks and normalised with
+            # statistics from 20, including the 10 that are in stage-1 and the ~40% of
+            # frames the idle filter drops. Same file train and serve, so nothing was
+            # mismatched; it was simply the wrong population.
+            roots_index=roots_index or os.environ.get("HELDOUT_ROOTS_ALL"),
+            ranges_path=ranges_path or os.environ.get("HELDOUT_RANGES_ALL"),
             # stage-1 speaks 7-D relative EEF (state_eef 8-D / action_eef 7-D). Fine-tuning in any
             # other space forces the model to re-learn the action space and discards part of the
             # pretraining this benchmark exists to measure. The eval MUST run with
@@ -1362,7 +1379,14 @@ def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | Non
         ema_decay=None,
         keep_period=None,
         num_workers=8,
-        freeze_filter=_slb_freeze_filter(freeze_vision=False),
+        # freeze_vision=True is the ALREADY-DIAGNOSED fix for this exact symptom. The base
+        # LoRA recipe freezes LLM non-LoRA weights but leaves the ~400M SigLIP tower fully
+        # trainable, and `_slb_freeze_filter`'s own docstring records that this 'overfits/
+        # corrupts the pretrained visual grounding -- diagnosed as the cause of uniform
+        # ~0-20% success with all-timeout failures'. Round 1 of this benchmark reproduced
+        # that signature precisely: floors at 0-8%, every non-success a timeout, on 49,801
+        # frames from a SINGLE fixed viewpoint (camera pose ptp = 0 across all 200 episodes).
+        freeze_filter=_slb_freeze_filter(freeze_vision=freeze_vision),
     )
 
 
@@ -1407,7 +1431,13 @@ def _axis_heldout_gate_config(task_id: int, *, num_train_steps: int) -> TrainCon
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=16,
+            # 10, NOT openpi's default 16. The paper states action_horizon 10, and BOTH
+            # stage-1 arms (pi05_axis_pretrain_{eef,d8}_paper_5k) and upstream pi05_libero use 10.
+            # A finetune at 16 makes the pretrained action expert emit a chunk length it never
+            # trained on, which costs exactly the transfer this benchmark measures -- and it biases
+            # AGAINST the pretrained arm, so it would show up as "pretraining hurts" rather than as
+            # a defect. 16 was inherited as a default here, never chosen.
+            action_horizon=10,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
@@ -1637,7 +1667,14 @@ def _axis_pretrain_config(
             # round 1's NAME, resolved against whatever `assets_base_dir` this run uses -- a
             # literal `./assets/<round1>` would silently stop following round 1 the moment
             # `--assets-base-dir` was passed. See `AxisFrankaPretrainDataConfig.norm_stats_from`.
-            norm_stats_from=_AXIS_ROUND1_NAME if name else None,
+            # ... and ONLY when this arm is in round 1's action space. Round 1's stats were
+            # computed over state_eef/action_eef -- EEF positions, axis-angles, OSC deltas. A
+            # droid8 arm's columns are joint ANGLES (+-2.4 rad) and joint VELOCITIES (p95 0.39
+            # rad/s); normalising the latter by the former is silent, converges, and scales the
+            # policy wrong. Every named config today passes eef=True, so this changes nothing
+            # that exists -- it only stops a droid8 arm from inheriting statistics for columns
+            # it does not have.
+            norm_stats_from=_AXIS_ROUND1_NAME if (name and eef) else None,
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             # 640x360 corpora only; a no-op on square frames. Declared per config so a corpus
@@ -1797,6 +1834,27 @@ _CONFIGS = [
     # without anything recording it.
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
                           center_crop=True, name="pi05_axis_pretrain_eef_paper_5k"),
+    #
+    # THE SAME 5k CORPUS IN THE DROID-8D ACTION SPACE.
+    # `eef=False` selects observation.state/action, which must be the CONVERTED corpus
+    # (corpus_d8, roots_libero_5k_v2_d8.json): 8-D state [7 joint angles, gripper closedness]
+    # and 8-D action [7 joint velocities rad/s, gripper closedness] at 15 fps. Pointing it at
+    # the raw corpus is refused by the width guard in AxisFrankaInputs -- the raw columns are
+    # 9-D (7 joints + 2 finger widths) and would train on absolute positions.
+    #
+    # WHY THIS ARM EXISTS. The AXIS-sim rollout harness applies 8-D joint velocity
+    # (`q_cmd += a[:7]*dt`) and has no OSC path, so an eef7 checkpoint cannot be driven through
+    # it at all. Measured by the held-out work: eef7 scored 1/50 on task 811 where droid8 scored
+    # 49/50 through the SAME harness on the SAME demonstrations. The held-out stage-2 finetune
+    # also runs discrete_state_input=True, so a droid8 stage-1 arm matches its successor in BOTH
+    # action space and state convention -- unlike the LIBERO path, where stage 2 drops state
+    # entirely and the pretrained state conditioning has nothing to attach to.
+    #
+    # Budget is unchanged at 20,605 steps: the conversion preserves row count exactly (asserted
+    # per task at build time), so this is still 1.00 epoch over the same 1,319,784 rows, and the
+    # row-indexed AWR / schedule / quality artifacts remain valid against it.
+    _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_pretrain_d8_paper_5k"),
     #
     # ROUND-2 INDEX-SCHEDULE ARMS. Both carry round 1's model, optimiser and budget (20,605 steps
     # = one epoch of the rung-5000 corpus, at GLOBAL batch 64) and differ from the `bc` control,
@@ -2397,6 +2455,42 @@ _CONFIGS = [
         init_path="/disk/axis/stage1_ckpts/pi05_axis_pretrain_eef_paper_5k/libero5k_bc/20604/params",
         name="pi05_axis_heldout_multitask_d8_bc",
         eef_action=False,
+    ),
+    # ROUND 2. Two defects from round 1, both fixed here, both declared rather than passed in:
+    #   * VISION IS NOW FROZEN. Round 1's "LoRA" trained the 411M SigLIP tower (13.7% of params
+    #     trainable, 88% of that vision) on a single-viewpoint corpus. See the freeze_filter note.
+    #   * NORM STATS ARE FITTED ON THE DATA IT TRAINS ON. The index is declared here, so
+    #     `compute_norm_stats --config-name pi05_axis_heldout_multitask_d8_r2` uses it. Its assets
+    #     dir is keyed on this config name, so it cannot clobber round 1's statistics.
+    # Recompute stats BEFORE training this arm; it does not inherit round 1's.
+    _axis_heldout_multitask_config(
+        # Same 20-epoch budget as round 1, but computed from the CLEAN index this arm
+        # actually trains on rather than the 20-task one.
+        num_train_steps=heldout_epoch_steps(
+            20, "/disk/axis/render/splits_eef/clean10.ranges.json", HELDOUT_GATE_BATCH),
+        name="pi05_axis_heldout_multitask_d8_r2",
+        eef_action=False,
+        freeze_vision=True,
+        roots_index="/disk/axis/render/splits_eef/clean10.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/clean10.ranges.json",
+    ),
+    # ROUND 2, AXIS-PRETRAINED ARM. Identical to the base arm above except `init_path`, so a
+    # difference in score is the pretraining and nothing else -- the horizon confound that
+    # invalidated the earlier 86%-vs-58% comparison is gone (both stages are at 10 now).
+    #
+    # CAVEAT THAT MUST TRAVEL WITH ANY NUMBER FROM THIS ARM: stage-1 here speaks EEF7, while this
+    # finetune trains droid8. The vision/language stack transfers; the ACTION HEAD RELEARNS the
+    # space. Report it as "AXIS pretraining, different action space", never as action-space
+    # transfer. Re-run against the droid8 stage-1 when it exists.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            20, "/disk/axis/render/splits_eef/clean10.ranges.json", HELDOUT_GATE_BATCH),
+        name="pi05_axis_heldout_multitask_d8_r2_bc",
+        init_path="/disk/axis/stage1_ckpts/pi05_axis_pretrain_eef_paper_5k/libero5k_bc/20604/params",
+        eef_action=False,
+        freeze_vision=True,
+        roots_index="/disk/axis/render/splits_eef/clean10.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/clean10.ranges.json",
     ),
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
     # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen
