@@ -1,6 +1,7 @@
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
+import operator
 import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
@@ -127,6 +128,57 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class SubsetDataset(Dataset[T_co]):
+    """Restrict a dataset to a subset of indices (order preserved).
+
+    Used to apply openpi's DROID-style idle filter to the LeRobot data path.
+    The RLDS path already honours `filter_dict_path`; the LeRobot path did not,
+    so the same filter dict is applied here as an index subset. Frames are NOT
+    deleted from the dataset -- only the set of samplable indices shrinks, so an
+    action chunk is never spliced across a filtered-out gap.
+    """
+
+    def __init__(self, dataset: Dataset, indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = list(indices)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._indices[operator.index(index)]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
+def _nonidle_indices(dataset_meta, filter_dict_path: str) -> list[int]:
+    """Map {episode_index: [[start, end), ...]} to global frame indices."""
+    import json as _json
+    import pathlib as _pathlib
+
+    import openpi.shared.download as _download
+
+    path = _download.maybe_download(filter_dict_path)
+    with _pathlib.Path(path).open("r") as f:
+        keep_ranges = _json.load(f)
+
+    # Episode -> global start offset, from the episode lengths in metadata.
+    offsets: dict[int, int] = {}
+    running = 0
+    for ep_idx in range(dataset_meta.total_episodes):
+        offsets[ep_idx] = running
+        running += dataset_meta.episodes[ep_idx]["length"]
+
+    indices: list[int] = []
+    for ep_key, ranges in keep_ranges.items():
+        ep_idx = int(ep_key)
+        if ep_idx not in offsets:
+            continue
+        base = offsets[ep_idx]
+        for start, end in ranges:
+            indices.extend(range(base + int(start), base + int(end)))
+    indices.sort()
+    return indices
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -144,6 +196,14 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+
+    if data_config.filter_dict_path is not None:
+        keep = _nonidle_indices(dataset_meta, data_config.filter_dict_path)
+        logging.info(
+            f"Idle filter: keeping {len(keep)}/{dataset_meta.total_frames} frames "
+            f"({len(keep) / dataset_meta.total_frames * 100:.1f}%) from {data_config.filter_dict_path}"
+        )
+        dataset = SubsetDataset(dataset, keep)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

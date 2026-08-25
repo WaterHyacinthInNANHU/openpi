@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.rlinf_franka_droid as rlinf_franka_droid
+import openpi.policies.rlinf_franka_pbc as rlinf_franka_pbc
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -480,6 +481,50 @@ class LeRobotRLinfDROIDDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRLinfPbcDataConfig(DataConfigFactory):
+    """PBC variant of LeRobotRLinfDROIDDataConfig (see openpi/policies/rlinf_franka_pbc.py).
+
+    Identical repack / DroidInputs / DroidOutputs, plus `PbcCenterCropImages` inserted right after
+    DroidInputs and therefore BEFORE the model transforms' `ResizeImages(224, 224)`.  Because the
+    crop sits in `data_transforms`, it is applied at train time and at serve time alike; a square
+    input (the `*_pbc` dataset frames) is a no-op, a live 1280x720 ZED frame becomes 720x720.
+
+    Use this ONLY with the PBC base (`axis_pi05_droid_plainbc_v1`) and a `*_pbc` dataset.  Pointing
+    it at the letterboxed `tasl_fr3_10task_250ep` would crop a 224x224 letterbox (no-op) and train
+    a centre-crop model on padded frames -- a silent geometry mismatch.
+    """
+
+    # Set False only for A/B tests against the letterbox geometry.
+    center_crop: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(inputs=[rlinf_franka_droid.RLinfFrankaDroidRepack()])
+        inputs: list[_transforms.DataTransformFn] = [droid_policy.DroidInputs(model_type=model_config.model_type)]
+        if self.center_crop:
+            inputs.append(rlinf_franka_pbc.PbcCenterCropImages())
+        # Joint *velocity* actions (DROID-native, same as the PBC pretrain): no delta transform.
+        data_transforms = _transforms.Group(inputs=inputs, outputs=[droid_policy.DroidOutputs()])
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+# The in-house PBC base checkpoint (pi0.5, AXIS sim + real DROID co-train, EMA weights) and the
+# norm stats it was trained with.  Kept as module constants so every *_pbc config points at the
+# same step and the same stats -- change them here, not per config.
+PBC_BASE_STEP_DIR = "/data1/Franka_RealRobot/checkpoints/axis_pi05_droid_plainbc_v1/199999"
+PBC_BASE_PARAMS = f"{PBC_BASE_STEP_DIR}/params"
+PBC_BASE_ASSETS_DIR = f"{PBC_BASE_STEP_DIR}/assets"
+PBC_BASE_ASSET_ID = "Devon018/Franka-Datasets-v2"  # <assets>/<asset_id>/norm_stats.json
 
 
 @dataclasses.dataclass(frozen=True)
@@ -985,6 +1030,295 @@ _CONFIGS = [
         # The repo lives on /data1; keep checkpoints there too (not /data3).
         checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
         save_interval=2_000,
+        keep_period=5_000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        # v2 (2026-08-06): 5k steps, checkpoint every 1k, on DROID idle-frame
+        # filtered data (franka/test_finetune_idlefiltered, 4262 -> 4067
+        # frames). DROID norm-stats reused; all other settings identical to
+        # pi05_droid_franka_lora (v0).
+        name="pi05_droid_franka_lora_5k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 is trained with 32-dim actions
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="franka/test_finetune_idlefiltered",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                # Same DROID norm-stats as v0 (preflight validated fit).
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=5_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA fine-tuning.
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,  # effectively constant LR after warmup
+        ),
+        checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
+        save_interval=1_000,
+        keep_period=1_000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        # v3 (2026-08-09): 5k steps, checkpoint every 1k, on the Calibra
+        # keep-0.5 coreset of the idle-filtered data (8 episodes, 2121
+        # frames, franka/test_finetune_idlefiltered_calibra50). All other
+        # settings identical to pi05_droid_franka_lora_5k (v2).
+        name="pi05_droid_franka_lora_5k_calibra50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 is trained with 32-dim actions
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="franka/test_finetune_idlefiltered_calibra50",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                # Same DROID norm-stats as v2 (preflight validated fit).
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=5_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA fine-tuning.
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,  # effectively constant LR after warmup
+        ),
+        checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
+        save_interval=1_000,
+        keep_period=1_000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        # v4 (2026-08-21): 10 个 task 合并数据集(T1-a/b … T5-a/b,每个 task 25 条,
+        # 共 250 条 / 66463 帧)。prompt 已逐个对照实际画面重写。
+        # 20k 步 ≈ 9.6 epoch(此前 5k 步在 4067 帧上是 39 epoch)。
+        # 其余超参与 pi05_droid_franka_lora_5k 完全一致。
+        name="pi05_droid_franka_lora_10task",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="franka/tasl_fr3_10task_250ep",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=50_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
+        save_interval=4_000,
+        keep_period=2_000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        # v5 (2026-08-24): 与 pi05_droid_franka_lora_10task 完全相同,唯一区别是
+        # 启用了 openpi 官方的静止帧过滤(idle filter)。
+        #
+        # 过滤判据和常量逐行照搬 openpi 的
+        #   examples/droid/compute_droid_nonidle_ranges.py
+        #     idle = all(|joint_vel[t+1] - joint_vel[t]| < 1e-3)
+        #     min_idle_len=7, min_non_idle_len=16, filter_last_n_in_ranges=10
+        # ranges.json 由 openpi 自己的 examples/droid/compute_droid_nonidle_ranges.py
+        # 加 --source lerobot 生成(该脚本已扩展支持 LeRobot 数据源,备份 .bak-20260824)。
+        # 效果:66463 -> 63909 帧(保留 96.2%)。
+        #
+        # 注意:官方的 filter_dict_path 原本只在 RLDS 数据路径生效;我们给 LeRobot
+        # 路径打了补丁(data_loader.py 的 SubsetDataset / _nonidle_indices,
+        # 备份 data_loader.py.bak-20260824)。帧不从数据集里删除,只是缩小可采样
+        # 索引集合,所以 action chunk 不会跨越被过滤的缺口。
+        name="pi05_droid_franka_lora_10task_filtered",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="franka/tasl_fr3_10task_250ep",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                filter_dict_path="/data1/Franka_RealRobot/lerobot_home/franka/tasl_fr3_10task_250ep/meta/nonidle_ranges.json",
+            ),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
+        save_interval=2_000,
+        keep_period=2_000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        # 10task_v2 (2026-08-25): 数据 = tasl_fr3_10task_v2 (10task 按 v2 判据物理删掉 dummy 静止段, 每段一条 episode,
+        # 392 ep / 62680 帧) + 官方 ranges 模式的尾砍: 每条末尾 10 帧不做 chunk 起点 (nonidle_ranges_tail10.json), 58760 起点。
+        # 判据/导出/验证见 data_pipeline/HOW_TO_ENABLE_IDLE_FILTER.md "v2"。30k 步, warmup 10%, 官方 cosine lr, LoRA, DROID stats。
+        # 换新 pretrain ckpt 时只改 weight_loader。
+        name="pi05_droid_franka_lora_10task_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="franka/tasl_fr3_10task_v2",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                filter_dict_path="/data1/Franka_RealRobot/filters/tasl_fr3_10task_v2/nonidle_ranges_tail10.json",
+            ),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
+        save_interval=5_000,
+        keep_period=5_000,
+        log_interval=100,
+    ),
+    #
+    # PBC (in-house pi0.5 base `axis_pi05_droid_plainbc_v1`, centre-crop image geometry, PBC norm stats).
+    # Never mix with the `pi05_droid_franka_*` (letterbox, DROID stats) family. Pipeline: data_pipeline/on_labserver/pbc/.
+    #
+    TrainConfig(
+        # pbc_10task_v2 (2026-08-25): 配方 = pi05_droid_franka_lora_10task_v2 (30k 步, warmup 3k, cosine 2.5e-5→2.5e-6, LoRA, 无 EMA, 每 5k 存),
+        # 只换三样: 底座 = PBC 199999 (EMA 权重), norm stats = PBC 自带 (Devon018/Franka-Datasets-v2), 图像 = centre-crop 几何
+        # (数据 tasl_fr3_10task_v2_pbc, 由 make_pbc_dataset.py 从 tasl_fr3_10task_v2 生成, 帧索引不变, 尾 10 帧 json 直接复用)。
+        # action_horizon=15 跟 PBC 预训练一致 (droid_lora 家族是 16)。
+        name="pi05_pbc_franka_lora_10task_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfPbcDataConfig(
+            repo_id="franka/tasl_fr3_10task_v2_pbc",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                filter_dict_path="/data1/Franka_RealRobot/filters/tasl_fr3_10task_v2/nonidle_ranges_tail10.json",
+            ),
+            assets=AssetsConfig(assets_dir=PBC_BASE_ASSETS_DIR, asset_id=PBC_BASE_ASSET_ID),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(PBC_BASE_PARAMS),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
+        save_interval=5_000,
         keep_period=5_000,
         log_interval=100,
     ),
