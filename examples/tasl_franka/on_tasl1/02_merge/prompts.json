@@ -1,0 +1,44 @@
+{
+  "_comment": "10 个 task 的最终 prompt。我逐个看了数据集里的实际画面(外部视角+腕部视角各取 3-6 帧)后重写的。",
+  "tasks": [
+    {"id": "T1-a", "dirs": ["T1-a"], "old": "pick blue cup and put into red cup",
+     "new": "pick up the blue cup and place it into the red cup",
+     "scene": "白桌上一个红色塑料杯和一个蓝色塑料杯"},
+
+    {"id": "T1-b", "dirs": ["T1-b"], "old": "Stack one block on the top of another / T1-b-2",
+     "new": "stack the red block on top of the blue block",
+     "scene": "一个蓝色长方块 + 一个红色长方块;tix0 和 tix1 是同一个任务的两批采集,已合并为一个 prompt"},
+
+    {"id": "T2-a", "dirs": ["T2-a-10ep", "T2-a-15ep"], "old": "push the blue button",
+     "new": "press the blue button",
+     "scene": "桌上三个圆形按钮:蓝、白、黄;机器人按蓝色那个"},
+
+    {"id": "T2-b", "dirs": ["T2-b"], "old": "Close the box",
+     "new": "close the lid of the wooden shape sorter box",
+     "scene": "浅色木质形状分类玩具盒(盒面有三角/十字/圆等镂空),盖子敞开,机器人把盖子合上"},
+
+    {"id": "T3-a", "dirs": ["T3-a-25ep"], "old": "Align the block orientations",
+     "new": "align the three colored blocks to the same orientation",
+     "scene": "红、蓝、绿三个小方块并排;机器人把朝向不一致的那个转正(不同 episode 转的块不同)"},
+
+    {"id": "T3-b", "dirs": ["T3-b"], "old": "Rotate the red block to make it vertical to the blue block",
+     "new": "rotate the red block so that it is perpendicular to the blue block",
+     "scene": "一个蓝色立方块和一个红色立方块竖立在桌上;原文 vertical to 是中式英文,改为 perpendicular to"},
+
+    {"id": "T4-a", "dirs": ["T4-a-25ep"], "old": "Insert the green block into the toy box",
+     "new": "insert the orange block into the wooden shape sorter box",
+     "scene": "★颜色写错了★ 实物是橙色小方块,不是绿色。目标是 T2-b 那个同款木质形状分类盒的镂空孔"},
+
+    {"id": "T4-b", "dirs": ["T4-b"], "old": "T4-b (占位符)",
+     "new": "insert the book into the black book stand",
+     "scene": "黑色 L 形书立里已有一本封面彩色的书,机器人把另一本浅色的书插进去"},
+
+    {"id": "T5-a", "dirs": ["T5-a-25ep"], "old": "Pull the smaller book out of the shelf",
+     "new": "pull the smaller book out of the black book stand",
+     "scene": "与 T4-b 同一套书立,反向操作:把书抽出来。原文 shelf 不准确,实物是书立"},
+
+    {"id": "T5-b", "dirs": ["T5-b"], "old": "pull out the block",
+     "new": "pull the small block out from under the large block",
+     "scene": "一大一小两个橙色方块,小的压在大的下面/前面,机器人把小的抽出来"}
+  ]
+}

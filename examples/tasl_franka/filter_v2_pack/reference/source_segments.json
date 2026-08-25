@@ -1,0 +1,1971 @@
+{
+ "source": "/data1/Franka_RealRobot/lerobot_home/franka/tasl_fr3_10task_250ep",
+ "criterion": "compute_droid_nonidle_ranges: vel_source=state, grip_guard=5, grip_delta=0.02, filter_last_n_in_ranges=0",
+ "constants": {
+  "min_idle_len": 7,
+  "min_non_idle_len": 16,
+  "idle_threshold": 0.001
+ },
+ "episodes": {
+  "0": {
+   "src_episode": 0,
+   "start": 0,
+   "end": 130
+  },
+  "1": {
+   "src_episode": 0,
+   "start": 144,
+   "end": 282
+  },
+  "2": {
+   "src_episode": 1,
+   "start": 0,
+   "end": 339
+  },
+  "3": {
+   "src_episode": 2,
+   "start": 17,
+   "end": 255
+  },
+  "4": {
+   "src_episode": 3,
+   "start": 21,
+   "end": 271
+  },
+  "5": {
+   "src_episode": 4,
+   "start": 0,
+   "end": 241
+  },
+  "6": {
+   "src_episode": 5,
+   "start": 0,
+   "end": 264
+  },
+  "7": {
+   "src_episode": 6,
+   "start": 0,
+   "end": 234
+  },
+  "8": {
+   "src_episode": 7,
+   "start": 20,
+   "end": 178
+  },
+  "9": {
+   "src_episode": 7,
+   "start": 193,
+   "end": 330
+  },
+  "10": {
+   "src_episode": 8,
+   "start": 25,
+   "end": 283
+  },
+  "11": {
+   "src_episode": 9,
+   "start": 0,
+   "end": 241
+  },
+  "12": {
+   "src_episode": 10,
+   "start": 9,
+   "end": 74
+  },
+  "13": {
+   "src_episode": 10,
+   "start": 87,
+   "end": 241
+  },
+  "14": {
+   "src_episode": 11,
+   "start": 12,
+   "end": 214
+  },
+  "15": {
+   "src_episode": 12,
+   "start": 0,
+   "end": 66
+  },
+  "16": {
+   "src_episode": 12,
+   "start": 79,
+   "end": 245
+  },
+  "17": {
+   "src_episode": 13,
+   "start": 19,
+   "end": 164
+  },
+  "18": {
+   "src_episode": 13,
+   "start": 178,
+   "end": 282
+  },
+  "19": {
+   "src_episode": 14,
+   "start": 0,
+   "end": 111
+  },
+  "20": {
+   "src_episode": 14,
+   "start": 126,
+   "end": 197
+  },
+  "21": {
+   "src_episode": 14,
+   "start": 210,
+   "end": 294
+  },
+  "22": {
+   "src_episode": 15,
+   "start": 22,
+   "end": 235
+  },
+  "23": {
+   "src_episode": 16,
+   "start": 0,
+   "end": 257
+  },
+  "24": {
+   "src_episode": 17,
+   "start": 0,
+   "end": 283
+  },
+  "25": {
+   "src_episode": 18,
+   "start": 0,
+   "end": 339
+  },
+  "26": {
+   "src_episode": 19,
+   "start": 0,
+   "end": 156
+  },
+  "27": {
+   "src_episode": 19,
+   "start": 169,
+   "end": 186
+  },
+  "28": {
+   "src_episode": 20,
+   "start": 0,
+   "end": 138
+  },
+  "29": {
+   "src_episode": 20,
+   "start": 151,
+   "end": 285
+  },
+  "30": {
+   "src_episode": 21,
+   "start": 0,
+   "end": 104
+  },
+  "31": {
+   "src_episode": 21,
+   "start": 117,
+   "end": 152
+  },
+  "32": {
+   "src_episode": 21,
+   "start": 165,
+   "end": 193
+  },
+  "33": {
+   "src_episode": 21,
+   "start": 209,
+   "end": 234
+  },
+  "34": {
+   "src_episode": 21,
+   "start": 247,
+   "end": 347
+  },
+  "35": {
+   "src_episode": 22,
+   "start": 0,
+   "end": 104
+  },
+  "36": {
+   "src_episode": 22,
+   "start": 118,
+   "end": 180
+  },
+  "37": {
+   "src_episode": 22,
+   "start": 194,
+   "end": 256
+  },
+  "38": {
+   "src_episode": 23,
+   "start": 22,
+   "end": 110
+  },
+  "39": {
+   "src_episode": 23,
+   "start": 142,
+   "end": 183
+  },
+  "40": {
+   "src_episode": 23,
+   "start": 217,
+   "end": 317
+  },
+  "41": {
+   "src_episode": 24,
+   "start": 0,
+   "end": 231
+  },
+  "42": {
+   "src_episode": 25,
+   "start": 0,
+   "end": 243
+  },
+  "43": {
+   "src_episode": 25,
+   "start": 257,
+   "end": 278
+  },
+  "44": {
+   "src_episode": 26,
+   "start": 30,
+   "end": 75
+  },
+  "45": {
+   "src_episode": 26,
+   "start": 88,
+   "end": 429
+  },
+  "46": {
+   "src_episode": 27,
+   "start": 8,
+   "end": 314
+  },
+  "47": {
+   "src_episode": 28,
+   "start": 0,
+   "end": 309
+  },
+  "48": {
+   "src_episode": 28,
+   "start": 325,
+   "end": 353
+  },
+  "49": {
+   "src_episode": 29,
+   "start": 0,
+   "end": 108
+  },
+  "50": {
+   "src_episode": 29,
+   "start": 149,
+   "end": 307
+  },
+  "51": {
+   "src_episode": 30,
+   "start": 0,
+   "end": 302
+  },
+  "52": {
+   "src_episode": 31,
+   "start": 0,
+   "end": 385
+  },
+  "53": {
+   "src_episode": 32,
+   "start": 0,
+   "end": 229
+  },
+  "54": {
+   "src_episode": 33,
+   "start": 0,
+   "end": 278
+  },
+  "55": {
+   "src_episode": 34,
+   "start": 0,
+   "end": 169
+  },
+  "56": {
+   "src_episode": 34,
+   "start": 182,
+   "end": 229
+  },
+  "57": {
+   "src_episode": 34,
+   "start": 242,
+   "end": 280
+  },
+  "58": {
+   "src_episode": 34,
+   "start": 293,
+   "end": 359
+  },
+  "59": {
+   "src_episode": 35,
+   "start": 0,
+   "end": 20
+  },
+  "60": {
+   "src_episode": 35,
+   "start": 33,
+   "end": 258
+  },
+  "61": {
+   "src_episode": 36,
+   "start": 19,
+   "end": 38
+  },
+  "62": {
+   "src_episode": 36,
+   "start": 52,
+   "end": 277
+  },
+  "63": {
+   "src_episode": 37,
+   "start": 0,
+   "end": 298
+  },
+  "64": {
+   "src_episode": 38,
+   "start": 0,
+   "end": 363
+  },
+  "65": {
+   "src_episode": 39,
+   "start": 0,
+   "end": 236
+  },
+  "66": {
+   "src_episode": 40,
+   "start": 0,
+   "end": 391
+  },
+  "67": {
+   "src_episode": 41,
+   "start": 0,
+   "end": 236
+  },
+  "68": {
+   "src_episode": 42,
+   "start": 34,
+   "end": 492
+  },
+  "69": {
+   "src_episode": 43,
+   "start": 21,
+   "end": 195
+  },
+  "70": {
+   "src_episode": 43,
+   "start": 203,
+   "end": 245
+  },
+  "71": {
+   "src_episode": 43,
+   "start": 253,
+   "end": 580
+  },
+  "72": {
+   "src_episode": 43,
+   "start": 587,
+   "end": 613
+  },
+  "73": {
+   "src_episode": 44,
+   "start": 0,
+   "end": 213
+  },
+  "74": {
+   "src_episode": 44,
+   "start": 225,
+   "end": 353
+  },
+  "75": {
+   "src_episode": 44,
+   "start": 366,
+   "end": 546
+  },
+  "76": {
+   "src_episode": 45,
+   "start": 0,
+   "end": 569
+  },
+  "77": {
+   "src_episode": 46,
+   "start": 35,
+   "end": 971
+  },
+  "78": {
+   "src_episode": 47,
+   "start": 0,
+   "end": 20
+  },
+  "79": {
+   "src_episode": 47,
+   "start": 30,
+   "end": 176
+  },
+  "80": {
+   "src_episode": 47,
+   "start": 189,
+   "end": 779
+  },
+  "81": {
+   "src_episode": 48,
+   "start": 0,
+   "end": 257
+  },
+  "82": {
+   "src_episode": 49,
+   "start": 0,
+   "end": 71
+  },
+  "83": {
+   "src_episode": 49,
+   "start": 78,
+   "end": 509
+  },
+  "84": {
+   "src_episode": 50,
+   "start": 14,
+   "end": 33
+  },
+  "85": {
+   "src_episode": 50,
+   "start": 47,
+   "end": 83
+  },
+  "86": {
+   "src_episode": 50,
+   "start": 97,
+   "end": 113
+  },
+  "87": {
+   "src_episode": 50,
+   "start": 150,
+   "end": 268
+  },
+  "88": {
+   "src_episode": 51,
+   "start": 13,
+   "end": 169
+  },
+  "89": {
+   "src_episode": 52,
+   "start": 31,
+   "end": 175
+  },
+  "90": {
+   "src_episode": 53,
+   "start": 9,
+   "end": 164
+  },
+  "91": {
+   "src_episode": 54,
+   "start": 0,
+   "end": 81
+  },
+  "92": {
+   "src_episode": 54,
+   "start": 94,
+   "end": 169
+  },
+  "93": {
+   "src_episode": 55,
+   "start": 48,
+   "end": 74
+  },
+  "94": {
+   "src_episode": 55,
+   "start": 113,
+   "end": 141
+  },
+  "95": {
+   "src_episode": 55,
+   "start": 157,
+   "end": 295
+  },
+  "96": {
+   "src_episode": 56,
+   "start": 0,
+   "end": 120
+  },
+  "97": {
+   "src_episode": 57,
+   "start": 0,
+   "end": 87
+  },
+  "98": {
+   "src_episode": 57,
+   "start": 100,
+   "end": 149
+  },
+  "99": {
+   "src_episode": 58,
+   "start": 0,
+   "end": 129
+  },
+  "100": {
+   "src_episode": 59,
+   "start": 0,
+   "end": 43
+  },
+  "101": {
+   "src_episode": 59,
+   "start": 55,
+   "end": 188
+  },
+  "102": {
+   "src_episode": 60,
+   "start": 10,
+   "end": 149
+  },
+  "103": {
+   "src_episode": 60,
+   "start": 159,
+   "end": 237
+  },
+  "104": {
+   "src_episode": 61,
+   "start": 16,
+   "end": 181
+  },
+  "105": {
+   "src_episode": 62,
+   "start": 26,
+   "end": 187
+  },
+  "106": {
+   "src_episode": 63,
+   "start": 10,
+   "end": 208
+  },
+  "107": {
+   "src_episode": 64,
+   "start": 0,
+   "end": 179
+  },
+  "108": {
+   "src_episode": 65,
+   "start": 23,
+   "end": 171
+  },
+  "109": {
+   "src_episode": 66,
+   "start": 21,
+   "end": 165
+  },
+  "110": {
+   "src_episode": 67,
+   "start": 8,
+   "end": 153
+  },
+  "111": {
+   "src_episode": 67,
+   "start": 166,
+   "end": 227
+  },
+  "112": {
+   "src_episode": 68,
+   "start": 8,
+   "end": 168
+  },
+  "113": {
+   "src_episode": 69,
+   "start": 43,
+   "end": 140
+  },
+  "114": {
+   "src_episode": 69,
+   "start": 149,
+   "end": 252
+  },
+  "115": {
+   "src_episode": 70,
+   "start": 18,
+   "end": 171
+  },
+  "116": {
+   "src_episode": 71,
+   "start": 0,
+   "end": 153
+  },
+  "117": {
+   "src_episode": 72,
+   "start": 25,
+   "end": 186
+  },
+  "118": {
+   "src_episode": 73,
+   "start": 13,
+   "end": 150
+  },
+  "119": {
+   "src_episode": 74,
+   "start": 0,
+   "end": 26
+  },
+  "120": {
+   "src_episode": 74,
+   "start": 40,
+   "end": 206
+  },
+  "121": {
+   "src_episode": 75,
+   "start": 22,
+   "end": 208
+  },
+  "122": {
+   "src_episode": 76,
+   "start": 0,
+   "end": 181
+  },
+  "123": {
+   "src_episode": 77,
+   "start": 0,
+   "end": 102
+  },
+  "124": {
+   "src_episode": 77,
+   "start": 115,
+   "end": 301
+  },
+  "125": {
+   "src_episode": 78,
+   "start": 0,
+   "end": 197
+  },
+  "126": {
+   "src_episode": 79,
+   "start": 0,
+   "end": 219
+  },
+  "127": {
+   "src_episode": 80,
+   "start": 0,
+   "end": 220
+  },
+  "128": {
+   "src_episode": 81,
+   "start": 0,
+   "end": 191
+  },
+  "129": {
+   "src_episode": 82,
+   "start": 0,
+   "end": 207
+  },
+  "130": {
+   "src_episode": 83,
+   "start": 0,
+   "end": 365
+  },
+  "131": {
+   "src_episode": 84,
+   "start": 30,
+   "end": 158
+  },
+  "132": {
+   "src_episode": 85,
+   "start": 0,
+   "end": 124
+  },
+  "133": {
+   "src_episode": 86,
+   "start": 28,
+   "end": 68
+  },
+  "134": {
+   "src_episode": 86,
+   "start": 82,
+   "end": 110
+  },
+  "135": {
+   "src_episode": 86,
+   "start": 124,
+   "end": 220
+  },
+  "136": {
+   "src_episode": 87,
+   "start": 0,
+   "end": 206
+  },
+  "137": {
+   "src_episode": 88,
+   "start": 0,
+   "end": 49
+  },
+  "138": {
+   "src_episode": 88,
+   "start": 63,
+   "end": 234
+  },
+  "139": {
+   "src_episode": 89,
+   "start": 0,
+   "end": 188
+  },
+  "140": {
+   "src_episode": 90,
+   "start": 0,
+   "end": 235
+  },
+  "141": {
+   "src_episode": 91,
+   "start": 0,
+   "end": 196
+  },
+  "142": {
+   "src_episode": 92,
+   "start": 0,
+   "end": 90
+  },
+  "143": {
+   "src_episode": 92,
+   "start": 100,
+   "end": 193
+  },
+  "144": {
+   "src_episode": 93,
+   "start": 0,
+   "end": 197
+  },
+  "145": {
+   "src_episode": 94,
+   "start": 0,
+   "end": 185
+  },
+  "146": {
+   "src_episode": 95,
+   "start": 12,
+   "end": 142
+  },
+  "147": {
+   "src_episode": 96,
+   "start": 0,
+   "end": 160
+  },
+  "148": {
+   "src_episode": 97,
+   "start": 0,
+   "end": 336
+  },
+  "149": {
+   "src_episode": 98,
+   "start": 0,
+   "end": 518
+  },
+  "150": {
+   "src_episode": 99,
+   "start": 16,
+   "end": 375
+  },
+  "151": {
+   "src_episode": 99,
+   "start": 387,
+   "end": 427
+  },
+  "152": {
+   "src_episode": 100,
+   "start": 0,
+   "end": 164
+  },
+  "153": {
+   "src_episode": 100,
+   "start": 177,
+   "end": 274
+  },
+  "154": {
+   "src_episode": 101,
+   "start": 21,
+   "end": 193
+  },
+  "155": {
+   "src_episode": 102,
+   "start": 0,
+   "end": 139
+  },
+  "156": {
+   "src_episode": 102,
+   "start": 152,
+   "end": 225
+  },
+  "157": {
+   "src_episode": 103,
+   "start": 0,
+   "end": 202
+  },
+  "158": {
+   "src_episode": 104,
+   "start": 0,
+   "end": 233
+  },
+  "159": {
+   "src_episode": 105,
+   "start": 0,
+   "end": 213
+  },
+  "160": {
+   "src_episode": 106,
+   "start": 0,
+   "end": 166
+  },
+  "161": {
+   "src_episode": 107,
+   "start": 0,
+   "end": 171
+  },
+  "162": {
+   "src_episode": 108,
+   "start": 0,
+   "end": 158
+  },
+  "163": {
+   "src_episode": 109,
+   "start": 8,
+   "end": 287
+  },
+  "164": {
+   "src_episode": 110,
+   "start": 8,
+   "end": 203
+  },
+  "165": {
+   "src_episode": 111,
+   "start": 0,
+   "end": 165
+  },
+  "166": {
+   "src_episode": 112,
+   "start": 0,
+   "end": 177
+  },
+  "167": {
+   "src_episode": 113,
+   "start": 10,
+   "end": 267
+  },
+  "168": {
+   "src_episode": 114,
+   "start": 0,
+   "end": 229
+  },
+  "169": {
+   "src_episode": 115,
+   "start": 19,
+   "end": 107
+  },
+  "170": {
+   "src_episode": 115,
+   "start": 120,
+   "end": 188
+  },
+  "171": {
+   "src_episode": 116,
+   "start": 20,
+   "end": 181
+  },
+  "172": {
+   "src_episode": 117,
+   "start": 10,
+   "end": 182
+  },
+  "173": {
+   "src_episode": 118,
+   "start": 0,
+   "end": 167
+  },
+  "174": {
+   "src_episode": 119,
+   "start": 0,
+   "end": 153
+  },
+  "175": {
+   "src_episode": 120,
+   "start": 9,
+   "end": 128
+  },
+  "176": {
+   "src_episode": 121,
+   "start": 0,
+   "end": 17
+  },
+  "177": {
+   "src_episode": 121,
+   "start": 26,
+   "end": 172
+  },
+  "178": {
+   "src_episode": 122,
+   "start": 0,
+   "end": 128
+  },
+  "179": {
+   "src_episode": 122,
+   "start": 141,
+   "end": 257
+  },
+  "180": {
+   "src_episode": 123,
+   "start": 15,
+   "end": 201
+  },
+  "181": {
+   "src_episode": 124,
+   "start": 0,
+   "end": 214
+  },
+  "182": {
+   "src_episode": 125,
+   "start": 0,
+   "end": 165
+  },
+  "183": {
+   "src_episode": 125,
+   "start": 179,
+   "end": 449
+  },
+  "184": {
+   "src_episode": 126,
+   "start": 0,
+   "end": 346
+  },
+  "185": {
+   "src_episode": 127,
+   "start": 22,
+   "end": 41
+  },
+  "186": {
+   "src_episode": 127,
+   "start": 54,
+   "end": 135
+  },
+  "187": {
+   "src_episode": 127,
+   "start": 148,
+   "end": 177
+  },
+  "188": {
+   "src_episode": 127,
+   "start": 190,
+   "end": 268
+  },
+  "189": {
+   "src_episode": 127,
+   "start": 280,
+   "end": 406
+  },
+  "190": {
+   "src_episode": 128,
+   "start": 18,
+   "end": 306
+  },
+  "191": {
+   "src_episode": 129,
+   "start": 9,
+   "end": 247
+  },
+  "192": {
+   "src_episode": 130,
+   "start": 0,
+   "end": 287
+  },
+  "193": {
+   "src_episode": 131,
+   "start": 0,
+   "end": 113
+  },
+  "194": {
+   "src_episode": 131,
+   "start": 126,
+   "end": 324
+  },
+  "195": {
+   "src_episode": 132,
+   "start": 0,
+   "end": 105
+  },
+  "196": {
+   "src_episode": 132,
+   "start": 118,
+   "end": 199
+  },
+  "197": {
+   "src_episode": 132,
+   "start": 212,
+   "end": 340
+  },
+  "198": {
+   "src_episode": 133,
+   "start": 0,
+   "end": 21
+  },
+  "199": {
+   "src_episode": 133,
+   "start": 34,
+   "end": 308
+  },
+  "200": {
+   "src_episode": 134,
+   "start": 16,
+   "end": 185
+  },
+  "201": {
+   "src_episode": 135,
+   "start": 0,
+   "end": 218
+  },
+  "202": {
+   "src_episode": 136,
+   "start": 0,
+   "end": 46
+  },
+  "203": {
+   "src_episode": 136,
+   "start": 59,
+   "end": 163
+  },
+  "204": {
+   "src_episode": 136,
+   "start": 176,
+   "end": 262
+  },
+  "205": {
+   "src_episode": 137,
+   "start": 0,
+   "end": 243
+  },
+  "206": {
+   "src_episode": 138,
+   "start": 0,
+   "end": 22
+  },
+  "207": {
+   "src_episode": 138,
+   "start": 37,
+   "end": 203
+  },
+  "208": {
+   "src_episode": 139,
+   "start": 0,
+   "end": 163
+  },
+  "209": {
+   "src_episode": 139,
+   "start": 176,
+   "end": 204
+  },
+  "210": {
+   "src_episode": 139,
+   "start": 217,
+   "end": 241
+  },
+  "211": {
+   "src_episode": 139,
+   "start": 254,
+   "end": 291
+  },
+  "212": {
+   "src_episode": 139,
+   "start": 304,
+   "end": 353
+  },
+  "213": {
+   "src_episode": 139,
+   "start": 366,
+   "end": 429
+  },
+  "214": {
+   "src_episode": 140,
+   "start": 15,
+   "end": 75
+  },
+  "215": {
+   "src_episode": 140,
+   "start": 89,
+   "end": 321
+  },
+  "216": {
+   "src_episode": 141,
+   "start": 0,
+   "end": 70
+  },
+  "217": {
+   "src_episode": 141,
+   "start": 84,
+   "end": 108
+  },
+  "218": {
+   "src_episode": 141,
+   "start": 121,
+   "end": 243
+  },
+  "219": {
+   "src_episode": 141,
+   "start": 256,
+   "end": 494
+  },
+  "220": {
+   "src_episode": 142,
+   "start": 27,
+   "end": 79
+  },
+  "221": {
+   "src_episode": 142,
+   "start": 93,
+   "end": 164
+  },
+  "222": {
+   "src_episode": 142,
+   "start": 177,
+   "end": 319
+  },
+  "223": {
+   "src_episode": 143,
+   "start": 0,
+   "end": 232
+  },
+  "224": {
+   "src_episode": 144,
+   "start": 0,
+   "end": 26
+  },
+  "225": {
+   "src_episode": 144,
+   "start": 42,
+   "end": 204
+  },
+  "226": {
+   "src_episode": 145,
+   "start": 0,
+   "end": 145
+  },
+  "227": {
+   "src_episode": 146,
+   "start": 0,
+   "end": 133
+  },
+  "228": {
+   "src_episode": 147,
+   "start": 21,
+   "end": 245
+  },
+  "229": {
+   "src_episode": 148,
+   "start": 0,
+   "end": 68
+  },
+  "230": {
+   "src_episode": 148,
+   "start": 84,
+   "end": 227
+  },
+  "231": {
+   "src_episode": 149,
+   "start": 0,
+   "end": 252
+  },
+  "232": {
+   "src_episode": 150,
+   "start": 8,
+   "end": 216
+  },
+  "233": {
+   "src_episode": 151,
+   "start": 0,
+   "end": 243
+  },
+  "234": {
+   "src_episode": 152,
+   "start": 0,
+   "end": 121
+  },
+  "235": {
+   "src_episode": 152,
+   "start": 135,
+   "end": 290
+  },
+  "236": {
+   "src_episode": 153,
+   "start": 0,
+   "end": 248
+  },
+  "237": {
+   "src_episode": 154,
+   "start": 0,
+   "end": 228
+  },
+  "238": {
+   "src_episode": 155,
+   "start": 0,
+   "end": 20
+  },
+  "239": {
+   "src_episode": 155,
+   "start": 27,
+   "end": 310
+  },
+  "240": {
+   "src_episode": 156,
+   "start": 0,
+   "end": 156
+  },
+  "241": {
+   "src_episode": 156,
+   "start": 172,
+   "end": 278
+  },
+  "242": {
+   "src_episode": 157,
+   "start": 0,
+   "end": 17
+  },
+  "243": {
+   "src_episode": 157,
+   "start": 30,
+   "end": 259
+  },
+  "244": {
+   "src_episode": 158,
+   "start": 0,
+   "end": 236
+  },
+  "245": {
+   "src_episode": 159,
+   "start": 0,
+   "end": 106
+  },
+  "246": {
+   "src_episode": 159,
+   "start": 121,
+   "end": 139
+  },
+  "247": {
+   "src_episode": 159,
+   "start": 170,
+   "end": 211
+  },
+  "248": {
+   "src_episode": 159,
+   "start": 224,
+   "end": 249
+  },
+  "249": {
+   "src_episode": 159,
+   "start": 279,
+   "end": 363
+  },
+  "250": {
+   "src_episode": 160,
+   "start": 0,
+   "end": 250
+  },
+  "251": {
+   "src_episode": 161,
+   "start": 0,
+   "end": 272
+  },
+  "252": {
+   "src_episode": 162,
+   "start": 0,
+   "end": 125
+  },
+  "253": {
+   "src_episode": 162,
+   "start": 141,
+   "end": 215
+  },
+  "254": {
+   "src_episode": 162,
+   "start": 223,
+   "end": 296
+  },
+  "255": {
+   "src_episode": 163,
+   "start": 0,
+   "end": 216
+  },
+  "256": {
+   "src_episode": 163,
+   "start": 254,
+   "end": 302
+  },
+  "257": {
+   "src_episode": 164,
+   "start": 17,
+   "end": 219
+  },
+  "258": {
+   "src_episode": 164,
+   "start": 233,
+   "end": 287
+  },
+  "259": {
+   "src_episode": 165,
+   "start": 0,
+   "end": 149
+  },
+  "260": {
+   "src_episode": 165,
+   "start": 165,
+   "end": 203
+  },
+  "261": {
+   "src_episode": 165,
+   "start": 216,
+   "end": 280
+  },
+  "262": {
+   "src_episode": 166,
+   "start": 0,
+   "end": 230
+  },
+  "263": {
+   "src_episode": 166,
+   "start": 237,
+   "end": 272
+  },
+  "264": {
+   "src_episode": 167,
+   "start": 15,
+   "end": 258
+  },
+  "265": {
+   "src_episode": 168,
+   "start": 9,
+   "end": 277
+  },
+  "266": {
+   "src_episode": 169,
+   "start": 0,
+   "end": 193
+  },
+  "267": {
+   "src_episode": 170,
+   "start": 0,
+   "end": 249
+  },
+  "268": {
+   "src_episode": 171,
+   "start": 0,
+   "end": 231
+  },
+  "269": {
+   "src_episode": 173,
+   "start": 0,
+   "end": 209
+  },
+  "270": {
+   "src_episode": 174,
+   "start": 0,
+   "end": 244
+  },
+  "271": {
+   "src_episode": 175,
+   "start": 8,
+   "end": 196
+  },
+  "272": {
+   "src_episode": 176,
+   "start": 0,
+   "end": 16
+  },
+  "273": {
+   "src_episode": 176,
+   "start": 29,
+   "end": 54
+  },
+  "274": {
+   "src_episode": 176,
+   "start": 67,
+   "end": 256
+  },
+  "275": {
+   "src_episode": 177,
+   "start": 0,
+   "end": 206
+  },
+  "276": {
+   "src_episode": 178,
+   "start": 0,
+   "end": 214
+  },
+  "277": {
+   "src_episode": 178,
+   "start": 227,
+   "end": 259
+  },
+  "278": {
+   "src_episode": 179,
+   "start": 0,
+   "end": 292
+  },
+  "279": {
+   "src_episode": 180,
+   "start": 0,
+   "end": 140
+  },
+  "280": {
+   "src_episode": 180,
+   "start": 150,
+   "end": 244
+  },
+  "281": {
+   "src_episode": 181,
+   "start": 0,
+   "end": 256
+  },
+  "282": {
+   "src_episode": 182,
+   "start": 0,
+   "end": 131
+  },
+  "283": {
+   "src_episode": 182,
+   "start": 139,
+   "end": 249
+  },
+  "284": {
+   "src_episode": 183,
+   "start": 0,
+   "end": 229
+  },
+  "285": {
+   "src_episode": 184,
+   "start": 0,
+   "end": 194
+  },
+  "286": {
+   "src_episode": 185,
+   "start": 0,
+   "end": 91
+  },
+  "287": {
+   "src_episode": 185,
+   "start": 106,
+   "end": 264
+  },
+  "288": {
+   "src_episode": 186,
+   "start": 0,
+   "end": 50
+  },
+  "289": {
+   "src_episode": 186,
+   "start": 63,
+   "end": 101
+  },
+  "290": {
+   "src_episode": 186,
+   "start": 114,
+   "end": 167
+  },
+  "291": {
+   "src_episode": 186,
+   "start": 174,
+   "end": 422
+  },
+  "292": {
+   "src_episode": 187,
+   "start": 11,
+   "end": 340
+  },
+  "293": {
+   "src_episode": 188,
+   "start": 0,
+   "end": 233
+  },
+  "294": {
+   "src_episode": 189,
+   "start": 0,
+   "end": 265
+  },
+  "295": {
+   "src_episode": 190,
+   "start": 0,
+   "end": 276
+  },
+  "296": {
+   "src_episode": 191,
+   "start": 0,
+   "end": 224
+  },
+  "297": {
+   "src_episode": 192,
+   "start": 0,
+   "end": 193
+  },
+  "298": {
+   "src_episode": 193,
+   "start": 30,
+   "end": 219
+  },
+  "299": {
+   "src_episode": 193,
+   "start": 235,
+   "end": 512
+  },
+  "300": {
+   "src_episode": 194,
+   "start": 0,
+   "end": 123
+  },
+  "301": {
+   "src_episode": 194,
+   "start": 137,
+   "end": 445
+  },
+  "302": {
+   "src_episode": 195,
+   "start": 0,
+   "end": 42
+  },
+  "303": {
+   "src_episode": 195,
+   "start": 82,
+   "end": 373
+  },
+  "304": {
+   "src_episode": 196,
+   "start": 9,
+   "end": 430
+  },
+  "305": {
+   "src_episode": 197,
+   "start": 0,
+   "end": 320
+  },
+  "306": {
+   "src_episode": 198,
+   "start": 38,
+   "end": 89
+  },
+  "307": {
+   "src_episode": 198,
+   "start": 104,
+   "end": 223
+  },
+  "308": {
+   "src_episode": 198,
+   "start": 230,
+   "end": 378
+  },
+  "309": {
+   "src_episode": 198,
+   "start": 412,
+   "end": 671
+  },
+  "310": {
+   "src_episode": 199,
+   "start": 0,
+   "end": 253
+  },
+  "311": {
+   "src_episode": 200,
+   "start": 29,
+   "end": 188
+  },
+  "312": {
+   "src_episode": 201,
+   "start": 0,
+   "end": 163
+  },
+  "313": {
+   "src_episode": 202,
+   "start": 0,
+   "end": 325
+  },
+  "314": {
+   "src_episode": 203,
+   "start": 0,
+   "end": 265
+  },
+  "315": {
+   "src_episode": 204,
+   "start": 25,
+   "end": 225
+  },
+  "316": {
+   "src_episode": 205,
+   "start": 0,
+   "end": 183
+  },
+  "317": {
+   "src_episode": 206,
+   "start": 39,
+   "end": 204
+  },
+  "318": {
+   "src_episode": 207,
+   "start": 0,
+   "end": 47
+  },
+  "319": {
+   "src_episode": 207,
+   "start": 62,
+   "end": 110
+  },
+  "320": {
+   "src_episode": 207,
+   "start": 125,
+   "end": 205
+  },
+  "321": {
+   "src_episode": 208,
+   "start": 0,
+   "end": 151
+  },
+  "322": {
+   "src_episode": 209,
+   "start": 0,
+   "end": 169
+  },
+  "323": {
+   "src_episode": 210,
+   "start": 0,
+   "end": 127
+  },
+  "324": {
+   "src_episode": 210,
+   "start": 142,
+   "end": 182
+  },
+  "325": {
+   "src_episode": 211,
+   "start": 9,
+   "end": 34
+  },
+  "326": {
+   "src_episode": 211,
+   "start": 47,
+   "end": 108
+  },
+  "327": {
+   "src_episode": 211,
+   "start": 116,
+   "end": 245
+  },
+  "328": {
+   "src_episode": 212,
+   "start": 0,
+   "end": 201
+  },
+  "329": {
+   "src_episode": 213,
+   "start": 0,
+   "end": 125
+  },
+  "330": {
+   "src_episode": 214,
+   "start": 0,
+   "end": 189
+  },
+  "331": {
+   "src_episode": 215,
+   "start": 0,
+   "end": 169
+  },
+  "332": {
+   "src_episode": 216,
+   "start": 0,
+   "end": 186
+  },
+  "333": {
+   "src_episode": 217,
+   "start": 0,
+   "end": 188
+  },
+  "334": {
+   "src_episode": 218,
+   "start": 0,
+   "end": 170
+  },
+  "335": {
+   "src_episode": 219,
+   "start": 0,
+   "end": 107
+  },
+  "336": {
+   "src_episode": 219,
+   "start": 120,
+   "end": 184
+  },
+  "337": {
+   "src_episode": 220,
+   "start": 11,
+   "end": 214
+  },
+  "338": {
+   "src_episode": 221,
+   "start": 0,
+   "end": 204
+  },
+  "339": {
+   "src_episode": 222,
+   "start": 0,
+   "end": 158
+  },
+  "340": {
+   "src_episode": 223,
+   "start": 0,
+   "end": 129
+  },
+  "341": {
+   "src_episode": 224,
+   "start": 49,
+   "end": 191
+  },
+  "342": {
+   "src_episode": 225,
+   "start": 0,
+   "end": 191
+  },
+  "343": {
+   "src_episode": 226,
+   "start": 0,
+   "end": 95
+  },
+  "344": {
+   "src_episode": 226,
+   "start": 110,
+   "end": 251
+  },
+  "345": {
+   "src_episode": 227,
+   "start": 0,
+   "end": 298
+  },
+  "346": {
+   "src_episode": 228,
+   "start": 19,
+   "end": 186
+  },
+  "347": {
+   "src_episode": 228,
+   "start": 197,
+   "end": 245
+  },
+  "348": {
+   "src_episode": 228,
+   "start": 258,
+   "end": 334
+  },
+  "349": {
+   "src_episode": 229,
+   "start": 0,
+   "end": 63
+  },
+  "350": {
+   "src_episode": 229,
+   "start": 76,
+   "end": 400
+  },
+  "351": {
+   "src_episode": 230,
+   "start": 0,
+   "end": 412
+  },
+  "352": {
+   "src_episode": 231,
+   "start": 0,
+   "end": 191
+  },
+  "353": {
+   "src_episode": 231,
+   "start": 204,
+   "end": 263
+  },
+  "354": {
+   "src_episode": 232,
+   "start": 0,
+   "end": 185
+  },
+  "355": {
+   "src_episode": 232,
+   "start": 192,
+   "end": 239
+  },
+  "356": {
+   "src_episode": 232,
+   "start": 246,
+   "end": 277
+  },
+  "357": {
+   "src_episode": 233,
+   "start": 12,
+   "end": 145
+  },
+  "358": {
+   "src_episode": 233,
+   "start": 158,
+   "end": 202
+  },
+  "359": {
+   "src_episode": 233,
+   "start": 215,
+   "end": 299
+  },
+  "360": {
+   "src_episode": 233,
+   "start": 312,
+   "end": 339
+  },
+  "361": {
+   "src_episode": 234,
+   "start": 0,
+   "end": 407
+  },
+  "362": {
+   "src_episode": 235,
+   "start": 0,
+   "end": 58
+  },
+  "363": {
+   "src_episode": 235,
+   "start": 71,
+   "end": 106
+  },
+  "364": {
+   "src_episode": 235,
+   "start": 119,
+   "end": 374
+  },
+  "365": {
+   "src_episode": 236,
+   "start": 0,
+   "end": 35
+  },
+  "366": {
+   "src_episode": 236,
+   "start": 52,
+   "end": 342
+  },
+  "367": {
+   "src_episode": 236,
+   "start": 349,
+   "end": 378
+  },
+  "368": {
+   "src_episode": 236,
+   "start": 391,
+   "end": 430
+  },
+  "369": {
+   "src_episode": 236,
+   "start": 443,
+   "end": 491
+  },
+  "370": {
+   "src_episode": 236,
+   "start": 498,
+   "end": 537
+  },
+  "371": {
+   "src_episode": 237,
+   "start": 0,
+   "end": 140
+  },
+  "372": {
+   "src_episode": 237,
+   "start": 150,
+   "end": 284
+  },
+  "373": {
+   "src_episode": 238,
+   "start": 0,
+   "end": 236
+  },
+  "374": {
+   "src_episode": 239,
+   "start": 0,
+   "end": 50
+  },
+  "375": {
+   "src_episode": 239,
+   "start": 63,
+   "end": 109
+  },
+  "376": {
+   "src_episode": 239,
+   "start": 123,
+   "end": 317
+  },
+  "377": {
+   "src_episode": 240,
+   "start": 0,
+   "end": 358
+  },
+  "378": {
+   "src_episode": 241,
+   "start": 0,
+   "end": 249
+  },
+  "379": {
+   "src_episode": 242,
+   "start": 9,
+   "end": 191
+  },
+  "380": {
+   "src_episode": 242,
+   "start": 198,
+   "end": 284
+  },
+  "381": {
+   "src_episode": 243,
+   "start": 11,
+   "end": 259
+  },
+  "382": {
+   "src_episode": 244,
+   "start": 0,
+   "end": 90
+  },
+  "383": {
+   "src_episode": 244,
+   "start": 132,
+   "end": 341
+  },
+  "384": {
+   "src_episode": 245,
+   "start": 0,
+   "end": 346
+  },
+  "385": {
+   "src_episode": 246,
+   "start": 0,
+   "end": 72
+  },
+  "386": {
+   "src_episode": 246,
+   "start": 88,
+   "end": 118
+  },
+  "387": {
+   "src_episode": 246,
+   "start": 131,
+   "end": 367
+  },
+  "388": {
+   "src_episode": 247,
+   "start": 0,
+   "end": 310
+  },
+  "389": {
+   "src_episode": 248,
+   "start": 0,
+   "end": 192
+  },
+  "390": {
+   "src_episode": 248,
+   "start": 199,
+   "end": 320
+  },
+  "391": {
+   "src_episode": 249,
+   "start": 0,
+   "end": 259
+  }
+ }
+}
