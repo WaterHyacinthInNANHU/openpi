@@ -665,6 +665,9 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # fails loudly instead of quietly training the plain control under the arm's name (the only
     # symptom would otherwise be the ABSENCE of the "index schedule" log line).
     schedule_required: bool = False
+    # Same idiom for the weights artifact: a phase-reward arm that forgets --data.awr_weights
+    # trains the plain-BC co-train under the phase arm's name, silently. Fail at create() instead.
+    awr_required: bool = False
     # "drop" / "anneal" for a named schedule arm, or None otherwise. Reaches DataConfig as
     # `pretrain_expected_mode` and is checked against the artifact's own `meta["mode"]` in
     # data_loader.py -- binds the config NAME to the artifact's actual content, since nothing
@@ -732,11 +735,24 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
                 "concatenated pretrain dataset, so it is meaningless without one "
                 "(set $AXIS_PRETRAIN_ROOTS_INDEX)."
             )
-        if self.schedule_path and self.awr_weights:
+        if self.schedule_path and self.awr_weights and self.expected_mode != "cotrain":
+            # For drop/anneal the schedule IS the supervision, so weights on top are two arms at
+            # once and stay refused. A COTRAIN schedule encodes the sim/real MIXTURE -- the
+            # control's own sampler, shared by both arms -- and the weights are the treatment.
+            # The loader still binds expected_mode to the artifact's own meta["mode"], so a
+            # drop artifact under this config, or weights under a drop config, both refuse.
             raise ValueError(
                 "schedule_path and awr_weights are both set. The schedule already encodes the "
                 "supervision (which rows, in what order); combining it with loss reweighting "
-                "would make this run two arms at once."
+                "would make this run two arms at once. (A cotrain-mode schedule is the one "
+                "exception: there the schedule encodes the mixture, not the supervision.)"
+            )
+        if self.awr_required and not self.awr_weights:
+            raise ValueError(
+                "this is a named loss-reweighting arm but awr_weights is not set. Pass "
+                "--data.awr_weights=<artifact path> at launch (built by "
+                "scripts/build_cotrain_phase_weights.py); otherwise this run trains the plain "
+                "BC co-train under the phase arm's name."
             )
         if self.quality_required and not self.quality_path:
             # A launch that omits --data.quality_path trains the plain BC control under this arm's
@@ -1285,6 +1301,7 @@ def _axis_pretrain_config(
     schedule_required: bool = False, expected_mode: str | None = None,
     quality_required: bool = False, center_crop: bool = False,
     action_horizon: int | None = None, own_norm_stats: bool = False,
+    awr_required: bool = False, norm_stats_from_name: str | None = None,
     save_interval: int | None = None, keep_period: int | None = None,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
@@ -1408,7 +1425,12 @@ def _axis_pretrain_config(
             # mixture is 25% simulated, and round 1's stats are the EEF space's 7-D ones, so
             # inheriting them fails as a broadcast error against 8-D actions rather than as
             # anything that names the cause.
-            norm_stats_from=None if own_norm_stats else (_AXIS_ROUND1_NAME if name else None),
+            # An explicit source arm wins: the phase co-train arm shares the BC co-train's
+            # stats for the same reason the round-2 arms share round 1's -- reweighting the loss
+            # does not change the input distribution, and separate stats would be a second
+            # uncontrolled difference between the arms.
+            norm_stats_from=(norm_stats_from_name if norm_stats_from_name
+                             else (None if own_norm_stats else (_AXIS_ROUND1_NAME if name else None))),
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             # 640x360 corpora only; a no-op on square frames. Declared per config so a corpus
@@ -1430,6 +1452,7 @@ def _axis_pretrain_config(
             # (quality_conditioning.QualityTags.check_reward_id) is what separates `cfg_v2` from
             # `cfg_phase`, which share this one config name.
             quality_required=quality_required,
+            awr_required=awr_required,
             # NB: for every arm but the round-2 schedule ones the `assets` above is the empty
             # default -> own norm stats (compute_norm_stats), NOT pi05_droid's. See the class
             # docstring / reports/pretrain_dataloader_design.md.
@@ -1683,6 +1706,84 @@ _CONFIGS = [
         # only the inference params out), so a resume continues the optimiser instead of restarting
         # Adam's moments from zero. Gradients themselves are not state and are not saved -- they are
         # recomputed from the batch at every step.
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # ================= AXIS x DROID CO-TRAIN, LOSS-REWEIGHTING (AWR) ARM =================
+    #
+    # The plain-BC co-train with ONE change: an AWR-style per-frame loss weight on the AXIS
+    # half, the neutral 1.0 on every DROID frame. ONE config name for BOTH rewards -- the
+    # repo-wide rule: the config names the MECHANISM, the artifact names the reward
+    # (`awr_weights_cotrain_v2.json` / `awr_weights_cotrain_phase.json`), and the loader binds
+    # filename to the artifact's own reward_id at launch, so a v2 file cannot train under a
+    # phase name or vice versa. Everything else is inherited BY CONSTRUCTION, not convention:
+    #
+    #   same schedule artifact  -> byte-identical batches to the BC arm at every step
+    #   same init (pi05_droid), same horizon 15, same budget 200k x 64
+    #   same norm stats         -> norm_stats_from_name pins the BC arm's assets dir
+    #
+    # So `phase - bc` is attributable to the weighting and to nothing else. This is the round-1
+    # awr mechanism (loss reweighting, coverage- and order-neutral), not the round-2 one (row
+    # selection): the schedule already owns the rows, and the weights ride to the batch under
+    # their own key exactly as in the round-1 `elif weights_path` path.
+    #
+    # THE WEIGHTS ARTIFACT IS THE ARM. Built by scripts/build_cotrain_phase_weights.py, which
+    # (a) computes phase weights over the AXIS half, (b) assigns 1.0 to every DROID episode,
+    # (c) scales the sim half so its mean over the schedule's OWN drawn rows is exactly 1.0 --
+    # without (c), reweighting would also change the 25/75 effective gradient mixture, two
+    # treatments under one name. `awr_required=True` makes a launch that forgets the flag fail
+    # instead of training the BC control under this arm's name.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_awr", schedule_required=True, expected_mode="cotrain",
+        awr_required=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain",
+        action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # ---- the remaining co-train mechanisms. All four share the BC arm's init, horizon,
+    # budget and norm stats; each is identified by its artifact, bound by expected_mode and by
+    # the `schedule_cotrain_<variant>_<reward>` filename check in data_loader. The schedule
+    # artifacts come from scripts/build_cotrain_schedule_v2.py, which REPLAYS the BC mixture
+    # and re-decides only the sim slots -- the DROID half is asserted bit-identical at build.
+    #
+    # drop_top: sub-epoch budget makes this CLEANER than LIBERO's drop -- 16x200k draws fit in
+    # a single pass of both the full and the kept pool, so every drawn row appears at most once
+    # in BOTH arms and the comparison is pure selection, with no epoch-count confound.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_drop", schedule_required=True,
+        expected_mode="cotrain_drop_top",
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # drop_random: drop_top's control -- same cardinality, uniformly random keep. If drop_top
+    # does not beat this, the reward's ranking carries no signal at this keep fraction.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_drop_random", schedule_required=True,
+        expected_mode="cotrain_drop_random",
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # anneal: coverage-neutral -- same sim pool as BC, draw ORDER ramped toward high-weight
+    # rows late (index_schedule.lambda_at; ramp over the last 15% of 200k steps).
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_anneal", schedule_required=True,
+        expected_mode="cotrain_anneal",
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # cfg: the BC arm's OWN mix schedule (expected_mode "cotrain", byte-identical batches) plus
+    # a quality tag on sim prompts only; every DROID row is NO_TAG by the tag builder's
+    # construction. quality_required makes a launch that forgets the tags artifact fail rather
+    # than training the BC control under this name; the guard opening in create() admits the
+    # schedule+quality pair for expected_mode "cotrain" only.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_cfg", schedule_required=True, expected_mode="cotrain",
+        quality_required=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
         save_interval=10_000, keep_period=50_000,
     ),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so

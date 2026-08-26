@@ -585,6 +585,28 @@ def _check_schedule_reward_id(schedule_path: str, sampler_meta: dict) -> None:
     if stem.startswith("schedule_"):
         stem = stem[len("schedule_"):]
     if stem.split("_", 1)[0] not in _SCHEDULE_MODES:
+        # Co-train variants carry mode="cotrain_<variant>" and are published as
+        # `schedule_cotrain_<variant>_<reward>.npz`; bind that name the same way. The plain mix
+        # artifact (mode == "cotrain", e.g. schedule_cotrain_sim25.npz) makes no reward claim
+        # and stays a no-op -- keying on the "cotrain_" prefix of the META mode, not the
+        # filename, so the finished BC artifact is untouched.
+        meta_mode = sampler_meta.get("mode") or ""
+        if stem.startswith("cotrain_") and meta_mode.startswith("cotrain_"):
+            reward_id = sampler_meta.get("reward_id")
+            if reward_id is None:
+                raise ValueError(
+                    f"schedule {schedule_path} carries co-train variant mode {meta_mode!r} but "
+                    f"no 'reward_id' in its meta; rebuild it with "
+                    f"scripts/build_cotrain_schedule_v2.py, which stamps the ranking reward."
+                )
+            expected = f"{meta_mode}_{reward_id}"
+            if stem != expected:
+                raise ValueError(
+                    f"schedule {schedule_path} is named {stem!r} but its own meta reports "
+                    f"mode={meta_mode!r} and reward_id={reward_id!r}, i.e. {expected!r}. The "
+                    f"filename is the only thing separating the two rewards within one arm, so "
+                    f"this run would record itself as {stem!r} while training {expected!r}."
+                )
         return
     mode, reward_id = sampler_meta.get("mode"), sampler_meta.get("reward_id")
     if reward_id is None:
@@ -812,11 +834,66 @@ def create_torch_data_loader(
                 from openpi.training.schedule_sampler import ScheduleSampler
 
                 if weights_path:
-                    raise ValueError(
-                        f"both an index schedule ({schedule_path}) and AWR weights "
-                        f"({weights_path}) are configured; the schedule already encodes the "
-                        f"supervision, so this run would be two arms at once"
+                    # Allowed for a COTRAIN schedule only: there the schedule encodes the
+                    # sim/real mixture (the control's own sampler, shared by both arms) and the
+                    # weights are the treatment. For drop/anneal the schedule IS the supervision
+                    # and the refusal below stands. The mode read here is the artifact's OWN
+                    # meta -- not the config's claim -- so a drop artifact cannot smuggle
+                    # weights in under a cotrain config name or vice versa.
+                    from openpi.training.schedule_sampler import ScheduleSampler as _SS
+
+                    _mode = _SS(schedule_path).meta.get("mode")
+                    if _mode != "cotrain":
+                        raise ValueError(
+                            f"both an index schedule ({schedule_path}, mode={_mode!r}) and AWR "
+                            f"weights ({weights_path}) are configured; the schedule already "
+                            f"encodes the supervision, so this run would be two arms at once"
+                        )
+                    # Bind the FILENAME to the artifact's own reward and role, mirroring the
+                    # schedule check: `awr_weights_cotrain_<reward>.json` is the only thing
+                    # separating the v2 and phase arms under this one config name, and the RAW
+                    # `*_rank` twin (ranking input for the other builders) must never reach the
+                    # loss. Names making no claim (a staging path) are not checked.
+                    import json as _json
+                    import pathlib as _pathlib
+
+                    _wp = _json.loads(_pathlib.Path(weights_path).read_text())
+                    _prov = _wp.get("provenance") or {}
+                    _role = (_prov.get("cotrain") or {}).get("role")
+                    if _role and _role != "loss_weights_normalised":
+                        raise ValueError(
+                            f"AWR weights {weights_path} carry role={_role!r}; the arm must "
+                            f"train on the sim-mean-NORMALISED artifact, not the ranking twin. "
+                            f"Pass the file without the _rank suffix."
+                        )
+                    _stem = _pathlib.Path(weights_path).stem
+                    _rid = _prov.get("reward_id")
+                    if _stem.startswith("awr_weights_cotrain_") and _rid is not None:
+                        _claim = _stem[len("awr_weights_cotrain_"):]
+                        if _claim != str(_rid):
+                            raise ValueError(
+                                f"AWR weights {weights_path} are named for reward {_claim!r} "
+                                f"but were built from reward_id={_rid!r}. The filename is the "
+                                f"only thing separating the v2 and phase arms under one config "
+                                f"name; this run would record itself as {_claim!r} while "
+                                f"training {_rid!r}."
+                            )
+                    _rows_w, _weights_w = pretrain_dataset.plan_rows_and_weights_from_roots(
+                        data_config.pretrain_roots_index,
+                        data_config.pretrain_ranges_path,
+                        weights_path,
                     )
+                    # Dense over the WHOLE flat space; NaN where the schedule never goes, so a
+                    # row outside the planned pool raises rather than training unweighted --
+                    # the same strictness as the round-1 AWR path.
+                    _dense = np.full(len(dataset), np.nan, dtype=np.float32)
+                    _dense[_rows_w] = _weights_w
+                    logging.info(
+                        "cotrain phase weights from %s: n_rows=%d mean=%.4f at_one=%.1f%%",
+                        weights_path, len(_weights_w), float(_weights_w.mean()),
+                        100.0 * float(np.mean(_weights_w == 1.0)),
+                    )
+                    dataset = slb_variant_sampler.StrictWeightedRowDataset(dataset, _dense)
                 # openpi checkpoints no loader position (checkpoints.restore_state drops its
                 # data_loader argument), so a resume at step k would replay the schedule from
                 # row 0 while the optimiser continues from k -- see `_check_schedule_resume`.
