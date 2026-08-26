@@ -757,13 +757,21 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
                 "(set $AXIS_PRETRAIN_ROOTS_INDEX)."
             )
         if self.quality_path and self.schedule_path:
-            raise ValueError(
-                "quality_path and schedule_path are both set. CFG's distinguishing property is "
-                "coverage neutrality -- it draws exactly the rows the round-1 control draws, in "
-                "the same order -- and a schedule replaces that draw entirely. Combining them "
-                "would silently give up the one thing that makes this arm comparable to the "
-                "control, and would make the run two arms at once."
-            )
+            # ... unless this is the CO-TRAIN cfg arm. There the mix schedule IS the
+            # control's draw -- the BC baseline replays the same artifact -- so carrying it
+            # PRESERVES the coverage-neutrality this guard protects rather than giving it up:
+            # batches stay byte-identical to the control and the prompt tag is the entire
+            # treatment. The loader still binds expected_mode to the artifact's own meta, so a
+            # drop/anneal artifact under this config refuses as before.
+            if self.expected_mode != "cotrain":
+                raise ValueError(
+                    "quality_path and schedule_path are both set. CFG's distinguishing property "
+                    "is coverage neutrality -- it draws exactly the rows the round-1 control "
+                    "draws, in the same order -- and a schedule replaces that draw entirely. "
+                    "Combining them would silently give up the one thing that makes this arm "
+                    "comparable to the control, and would make the run two arms at once. (The "
+                    "co-train cfg arm is the exception: its schedule IS the control's draw.)"
+                )
         if self.quality_path and self.awr_weights:
             raise ValueError(
                 "quality_path and awr_weights are both set; conditioning and loss reweighting "
@@ -1276,6 +1284,8 @@ def _axis_pretrain_config(
     eef: bool = False, paper: bool = False, name: str | None = None,
     schedule_required: bool = False, expected_mode: str | None = None,
     quality_required: bool = False, center_crop: bool = False,
+    action_horizon: int | None = None, own_norm_stats: bool = False,
+    save_interval: int | None = None, keep_period: int | None = None,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1375,7 +1385,12 @@ def _axis_pretrain_config(
         ),
         # Full weight: default (non-lora) gemma variants, no freeze_filter.
         model=pi0_config.Pi0Config(
-            pi05=True, action_dim=32, action_horizon=10 if paper else 16,
+            # `action_horizon` overrides the recipe default. The co-train arm sets 15 to match
+            # pi05_droid, the checkpoint it initialises FROM: training a horizon the init was not
+            # produced at is a silent recipe change, not an error. Left None everywhere else, so
+            # the paper arms keep Appendix F Table 10's literal 10.
+            pi05=True, action_dim=32,
+            action_horizon=action_horizon if action_horizon is not None else (10 if paper else 16),
             **(_KI_MODEL_KWARGS if knowledge_insulation else {}),
         ),
         data=AxisFrankaPretrainDataConfig(
@@ -1387,7 +1402,13 @@ def _axis_pretrain_config(
             # round 1's NAME, resolved against whatever `assets_base_dir` this run uses -- a
             # literal `./assets/<round1>` would silently stop following round 1 the moment
             # `--assets-base-dir` was passed. See `AxisFrankaPretrainDataConfig.norm_stats_from`.
-            norm_stats_from=_AXIS_ROUND1_NAME if name else None,
+            # A NAMED arm inherits round 1's stats by default, because the round-2 schedule arms
+            # are the same corpus under a different draw and must be normalised identically.
+            # `own_norm_stats` opts out for an arm whose DISTRIBUTION differs -- the co-train
+            # mixture is 25% simulated, and round 1's stats are the EEF space's 7-D ones, so
+            # inheriting them fails as a broadcast error against 8-D actions rather than as
+            # anything that names the cause.
+            norm_stats_from=None if own_norm_stats else (_AXIS_ROUND1_NAME if name else None),
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             # 640x360 corpora only; a no-op on square frames. Declared per config so a corpus
@@ -1436,6 +1457,11 @@ def _axis_pretrain_config(
             )
         ),
         batch_size=batch_size,   # GLOBAL; per-GPU = batch_size / fsdp_devices
+        # Retention is part of the ARM, not of the launch command: a run whose kept checkpoints
+        # depend on a flag someone remembered is a run whose artefacts cannot be reconstructed
+        # from its config. Left at TrainConfig's defaults when unset.
+        **({"save_interval": save_interval} if save_interval is not None else {}),
+        **({"keep_period": keep_period} if keep_period is not None else {}),
         fsdp_devices=8,          # 8x A100-80GB single node
         num_workers=8,
         # Appendix G initialises stage 2 from the EMA-SMOOTHED params, and openpi's
@@ -1589,6 +1615,76 @@ _CONFIGS = [
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
                           center_crop=True, name="pi05_axis_drop_top", schedule_required=True,
                           expected_mode="drop_top"),
+    #
+    # ================= AXIS x DROID CO-TRAINING =================
+    #
+    # One concat dataset over BOTH corpora -- the 684 AXIS `__droid8d` task roots plus the
+    # converted DROID roots, named together in one roots index -- with the 25/75 mixture decided
+    # OFFLINE and replayed verbatim by `ScheduleSampler`. The mixture is an artifact, not an RNG
+    # outcome, for the same reason the round-2 arms are: a checkpoint's composition has to be
+    # readable off the run record rather than reconstructed from a seed.
+    #
+    # WHY BOTH HALVES CAN SHARE ONE INDEX SPACE. Both land in the DROID-8D layout -- state =
+    # 7 joint angles + gripper closedness in [0,1], action = 7 joint velocities (rad/s, clipped
+    # to the +-1 rad/s bound DROID's own controller enforces) + closedness. Verified numerically
+    # against the released pi05_droid norm stats: the AXIS gripper channel's std is 0.441 against
+    # DROID's 0.441, and the joint-velocity scales agree to within 0.6-1.2x. The two corpora are
+    # the same variable measured on two robots, not two variables sharing a tensor.
+    #
+    # WHY 25% AND NOT THE 35.3% THE FRAME COUNTS GIVE. Frames overstate what the sim half
+    # contributes: AXIS is 684 tasks x ~40 near-duplicate episodes (4,600 frames per distinct
+    # instruction), DROID is ~57,774 distinct real situations (120 frames per instruction) -- a
+    # 38x difference in redundancy. Sampling the natural ratio would spend a third of the gradient
+    # budget on a much narrower distribution. 25% is the deliberate first point, chosen to be
+    # raised rather than lowered: over-weighting sim pulls a REAL-robot checkpoint toward
+    # simulated visuals and dynamics, which is the one failure this run cannot afford.
+    #
+    # WHAT MUST EXIST BEFORE THIS NAME CAN LAUNCH (`create()` raises if the schedule is absent):
+    #   AXIS_PRETRAIN_ROOTS_INDEX  both corpora's roots, AXIS ids as-is, DROID shards above them
+    #   AXIS_PRETRAIN_RANGES       non-idle sample ranges covering both
+    #   data.schedule_path         the cotrain artifact, meta["mode"] == "cotrain"
+    #   assets                     OWN norm stats over the MIXTURE
+    #                              (scripts/compute_norm_stats.py --config-name pi05_axis_droid_cotrain)
+    #
+    # NORM STATS ARE THE MIXTURE'S OWN, NOT pi05_droid's, and that is a reversal worth stating.
+    # `pi05_droid_finetune` upstream says to reuse DROID's stats, and for a pure DROID fine-tune
+    # that is right. Here the sampled distribution is a 25/75 blend whose state half is visibly
+    # different -- the AXIS wrist sits ~1.7 rad from DROID's on joint 7 and pegs its limit on
+    # 3.7% of frames -- so DROID's stats would normalise one quarter of the batch against
+    # statistics it does not have. `AxisFrankaPretrainDataConfig` already made this call once for
+    # the same reason; this keeps it.
+    #
+    # BUDGET. At GLOBAL batch 64 the mixture draws 64 rows/step, 16 of them AXIS. 200,000 steps =
+    # 12.8M draws: 3.2M AXIS (0.44 epochs of the 7.34M non-idle rows) and 9.6M DROID (0.69 epochs
+    # of 13.95M). Still under one pass of either half, so the schedule draws WITHOUT replacement
+    # and no frame is seen twice. ~55 h at the measured 1.0 s/it.
+    #
+    # THE SCHEDULE ARTIFACT MUST MATCH. `ScheduleSampler.check_num_train_steps` refuses a budget
+    # longer than the artifact -- the torch loader would restart an exhausted sampler from row 0
+    # and quietly grant an extra pass. Changing this number means rebuilding
+    # `schedule_cotrain_sim25.npz` at the same --steps.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain", schedule_required=True, expected_mode="cotrain",
+        # Its own stats, over the 25/75 mixture. See the paragraph above on why this reverses
+        # both the named-arm default and `pi05_droid_finetune`'s advice.
+        own_norm_stats=True,
+        # 15, NOT the paper arms' 10: this run initialises from pi05_droid, which was produced at
+        # 15, and a horizon the init was not trained at changes what the checkpoint means without
+        # anything raising. `pi05_droid_finetune` upstream uses 16 for the same reason it uses a
+        # different budget -- it is a fine-tune of the released model, not a co-train beside it.
+        action_horizon=15,
+        # RETENTION. `max_to_keep=1` is hardcoded in `initialize_checkpoint_dir`, so each new save
+        # REPLACES the previous one and disk stays flat; `keep_period` is the exception list --
+        # every 50,000th step is retained permanently (50k, 100k). Saving every 10k therefore costs
+        # one rolling checkpoint plus the milestones, not ten.
+        #
+        # The saved `train_state` item carries `opt_state` and `ema_params` (`_split_params` moves
+        # only the inference params out), so a resume continues the optimiser instead of restarting
+        # Adam's moments from zero. Gradients themselves are not state and are not saved -- they are
+        # recomputed from the batch at every step.
+        save_interval=10_000, keep_period=50_000,
+    ),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
     # measured against the full-data baseline it changes two things at once -- which rows, and how
     # many. This arm keeps the SAME NUMBER of rows drawn uniformly at random, so the only remaining
