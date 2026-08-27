@@ -665,6 +665,9 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # fails loudly instead of quietly training the plain control under the arm's name (the only
     # symptom would otherwise be the ABSENCE of the "index schedule" log line).
     schedule_required: bool = False
+    # A named loss-reweighting arm that forgets --data.awr_weights trains the plain BC control
+    # under the arm's name -- which is precisely what happened to the 5k eef awr arms. Fail loud.
+    awr_required: bool = False
     # "drop" / "anneal" for a named schedule arm, or None otherwise. Reaches DataConfig as
     # `pretrain_expected_mode` and is checked against the artifact's own `meta["mode"]` in
     # data_loader.py -- binds the config NAME to the artifact's actual content, since nothing
@@ -682,6 +685,23 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # (`QualityTags.check_reward_id`) is what separates `cfg_v2` from `cfg_phase`, which share
     # this one config name.
     quality_required: bool = False
+    # STAGE-2 CONSTANT pi0.7 quality tag -- the heldout CFG finetune twins ONLY; None for every
+    # other arm. DISTINCT FROM `quality_path`, which is stage 1's per-row artifact over the
+    # concatenated pretrain corpus: a finetune on uniformly expert heldout demos has nothing to
+    # bin, so the tag is a CONSTANT anchored at what inference asks for
+    # (slb_cfg.INFER_QUALITY == 5) while the transform's own two-level dropout keeps the
+    # unconditional branch trained -- the same mechanism, and the same transform
+    # (`quality_conditioning.LiberoQualityConditioning`), as `LeRobotLiberoDataConfig.quality_tag`.
+    # `create()` refuses to combine it with `quality_path` (two stages in one run), and with
+    # `awr_weights` or `schedule_path` (two arms at once, and the schedule leaves no sampler slot
+    # for the presentation counter the dropout is keyed on).
+    #
+    # NORM STATS: a tagged config must NEVER run compute_norm_stats -- the conditioning transform
+    # heads the repack group and RAISES without the presentation counter that only the training
+    # loader wires (`wrap_presentations`). Set `norm_stats_from` to the untagged twin: the stats
+    # are over the same roots/ranges/columns and the tag never touches state or actions, so the
+    # twin's stats ARE this arm's stats.
+    quality_tag: int | None = None
     # The config NAME whose norm stats this one must read (round 1's, for the round-2 schedule
     # arms), or None to keep its own. A name, not a path, deliberately: `TrainConfig.assets_dirs`
     # is `assets_base_dir / name`, so resolving the sibling from the `assets_dirs` handed to
@@ -741,6 +761,13 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
                 "supervision (which rows, in what order); combining it with loss reweighting "
                 "would make this run two arms at once."
             )
+        if self.awr_required and not self.awr_weights:
+            raise ValueError(
+                "this is a named loss-reweighting arm but awr_weights is not set. Pass "
+                "--data.awr_weights=<artifact path> at launch; otherwise this run trains the "
+                "plain BC control under the arm's name -- which is exactly what happened to the "
+                "5k eef awr arms (the named-config guard nulled the env var silently)."
+            )
         if self.quality_required and not self.quality_path:
             # A launch that omits --data.quality_path trains the plain BC control under this arm's
             # name; the log line announcing the conditioning simply never appears.
@@ -772,18 +799,52 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
                 "quality_path and awr_weights are both set; conditioning and loss reweighting "
                 "are two different mechanisms, so this run would be two arms at once."
             )
+        if self.quality_tag is not None:
+            if self.quality_path:
+                raise ValueError(
+                    "quality_tag (the stage-2 constant) and quality_path (stage 1's per-row "
+                    "artifact) are both set; the two tag the same prompt from different "
+                    "sources, and one run cannot be both stages."
+                )
+            if self.awr_weights:
+                raise ValueError(
+                    "quality_tag and awr_weights are both set; conditioning and loss "
+                    "reweighting are two different mechanisms, so this run would be two arms "
+                    "at once."
+                )
+            if self.schedule_path:
+                raise ValueError(
+                    "quality_tag and schedule_path are both set. The schedule replaces the "
+                    "loader's draw entirely, which leaves no sampler slot for the presentation "
+                    "counter the stage-2 dropout is keyed on."
+                )
         state_col = "state_eef" if self.eef_action else "observation.state"
         action_col = "action_eef" if self.eef_action else "action"
-        # NO quality conditioning transform here, deliberately, and this is load-bearing.
-        # `quality_conditioning.wrap_and_transform` -- the only supported way to assemble the
-        # dataset wrapper and `AxisQualityConditioning`, and what the loader calls -- PREPENDS the
-        # conditioning to the transform list it is handed, which is `transform_dataset`'s and
-        # therefore starts with these very inputs. Heading the repack group as well would append
-        # the tag TWICE ("...\nQuality: 5\nQuality: 5"): in range, tokenizable, unmatched by any
-        # eval-time prompt, and silent. So the repack group stays exactly the control's, with and
-        # without an artifact -- asserted in config_cfg_arm_test.py.
+        # NO ARTIFACT (stage-1) conditioning transform here, deliberately, and this is
+        # load-bearing. `quality_conditioning.wrap_and_transform` -- the only supported way to
+        # assemble the dataset wrapper and `AxisQualityConditioning`, and what the loader calls
+        # -- PREPENDS the conditioning to the transform list it is handed, which is
+        # `transform_dataset`'s and therefore starts with these very inputs. Heading the repack
+        # group as well would append the tag TWICE ("...\nQuality: 5\nQuality: 5"): in range,
+        # tokenizable, unmatched by any eval-time prompt, and silent. So with `quality_path` the
+        # repack group stays exactly the control's -- asserted in config_cfg_arm_test.py.
+        #
+        # The CONSTANT-tag path (`quality_tag`, the heldout CFG finetune twins) is the OPPOSITE
+        # case and mirrors `LeRobotLiberoDataConfig`: no artifact, no dataset wrapper, so the
+        # head of the repack group IS the right place -- the transform needs `episode_index`/
+        # `frame_index` and the presentation counter, all of which `RepackTransform` drops. The
+        # guards above make the two paths mutually exclusive, so the double-tag route is closed.
+        quality_inputs: list[_transforms.DataTransformFn] = []
+        if self.quality_tag is not None:
+            # Local import, matching LeRobotLiberoDataConfig: only the tagged twins reach this.
+            from openpi.training import quality_conditioning
+
+            quality_inputs = [
+                quality_conditioning.LiberoQualityConditioning(q_ep=int(self.quality_tag))
+            ]
         repack_transform = _transforms.Group(
             inputs=[
+                *quality_inputs,
                 _transforms.RepackTransform(
                     {
                         "base_0_rgb": "observation.images.third_person",
@@ -1313,7 +1374,9 @@ def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | Non
                                    eef_action: bool = True,
                                    freeze_vision: bool = False,
                                    roots_index: str | None = None,
-                                   ranges_path: str | None = None) -> TrainConfig:
+                                   ranges_path: str | None = None,
+                                   quality_tag: int | None = None,
+                                   norm_stats_from: str | None = None) -> TrainConfig:
     """One policy over all 20 held-out tasks -- the LIBERO-Plus-style protocol this suite replaces.
 
     Same recipe as `_axis_heldout_gate_config` (pi05_base init, LoRA, vision unfrozen, constant LR,
@@ -1354,6 +1417,9 @@ def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | Non
             # mismatched; it was simply the wrong population.
             roots_index=roots_index or os.environ.get("HELDOUT_ROOTS_ALL"),
             ranges_path=ranges_path or os.environ.get("HELDOUT_RANGES_ALL"),
+            # The quality-tagged CFG finetune twins ONLY; None (a no-op) for every other arm.
+            quality_tag=quality_tag,
+            norm_stats_from=norm_stats_from,
             # stage-1 speaks 7-D relative EEF (state_eef 8-D / action_eef 7-D). Fine-tuning in any
             # other space forces the model to re-learn the action space and discards part of the
             # pretraining this benchmark exists to measure. The eval MUST run with
@@ -1556,6 +1622,7 @@ def _axis_pretrain_config(
     eef: bool = False, paper: bool = False, name: str | None = None,
     schedule_required: bool = False, expected_mode: str | None = None,
     quality_required: bool = False, center_crop: bool = False,
+    norm_stats_from_name: str | None = None, awr_required: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1674,7 +1741,12 @@ def _axis_pretrain_config(
             # policy wrong. Every named config today passes eef=True, so this changes nothing
             # that exists -- it only stops a droid8 arm from inheriting statistics for columns
             # it does not have.
-            norm_stats_from=_AXIS_ROUND1_NAME if (name and eef) else None,
+            # An explicit source wins: the d8 mechanism arms share the d8 BASELINE's stats
+            # for the same reason the eef schedule arms share round 1's -- the comparison
+            # requires identical normalisation, and per-arm stats would be a second
+            # uncontrolled difference.
+            norm_stats_from=(norm_stats_from_name if norm_stats_from_name
+                             else (_AXIS_ROUND1_NAME if (name and eef) else None)),
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             # 640x360 corpora only; a no-op on square frames. Declared per config so a corpus
@@ -1696,6 +1768,7 @@ def _axis_pretrain_config(
             # (quality_conditioning.QualityTags.check_reward_id) is what separates `cfg_v2` from
             # `cfg_phase`, which share this one config name.
             quality_required=quality_required,
+            awr_required=awr_required,
             # NB: for every arm but the round-2 schedule ones the `assets` above is the empty
             # default -> own norm stats (compute_norm_stats), NOT pi05_droid's. See the class
             # docstring / reports/pretrain_dataloader_design.md.
@@ -1855,6 +1928,28 @@ _CONFIGS = [
     # row-indexed AWR / schedule / quality artifacts remain valid against it.
     _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
                           center_crop=True, name="pi05_axis_pretrain_d8_paper_5k"),
+    # ---- DROID-8D twins of the mechanism configs. Identical to their eef siblings except
+    # eef=False (droid8 columns) and norm stats pinned to the d8 baseline. The row-indexed
+    # schedule/quality artifacts carry over unchanged: corpus_d8 preserves row count and order
+    # exactly, so the same .npz files drive both action spaces.
+    _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_drop_top_d8",
+                          schedule_required=True, expected_mode="drop_top",
+                          norm_stats_from_name="pi05_axis_pretrain_d8_paper_5k"),
+    _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_anneal_d8",
+                          schedule_required=True, expected_mode="anneal",
+                          norm_stats_from_name="pi05_axis_pretrain_d8_paper_5k"),
+    _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_cfg_d8",
+                          quality_required=True,
+                          norm_stats_from_name="pi05_axis_pretrain_d8_paper_5k"),
+    # The AWR arm gets its own REQUIRED-FLAG config; weights ride --data.awr_weights, never the
+    # env var a named config silently nulls.
+    _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_awr_d8",
+                          awr_required=True,
+                          norm_stats_from_name="pi05_axis_pretrain_d8_paper_5k"),
     #
     # ROUND-2 INDEX-SCHEDULE ARMS. Both carry round 1's model, optimiser and budget (20,605 steps
     # = one epoch of the rung-5000 corpus, at GLOBAL batch 64) and differ from the `bc` control,
@@ -2491,6 +2586,184 @@ _CONFIGS = [
         freeze_vision=True,
         roots_index="/disk/axis/render/splits_eef/clean10.roots.json",
         ranges_path="/disk/axis/render/splits_eef/clean10.ranges.json",
+    ),
+    # TASK-QUALIFICATION ARM. The same pinned recipe as _r2 (frozen vision, horizon 10, droid8,
+    # own norm stats) over a WIDER index: the clean-8 plus the night's newly rendered candidates.
+    # The index PATHS are fixed here; their CONTENTS are written by the candidate pipeline after
+    # screening -- so the config is registered once and the task set is data, not code. Steps are
+    # read from the SAME ranges file at import time; if the file grows, re-resolving the config
+    # yields the matching budget. compute_norm_stats on THIS config name fits statistics on
+    # exactly the tasks the arm trains, in its own assets dir.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            20, "/disk/axis/render/splits_eef/qual_v1.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v1.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v1",
+        eef_action=False,
+        # MEASURED 2026-08-24, round 2 vs round 1 on the identical eval: freezing the vision tower
+        # collapsed every place task (1889 58%->0%, 953 34%->0%, 809 8%->2%) and helped only the
+        # pick-only task (868 48%->52%). The SLB-era "freeze_vision fixes the 0-20% floor"
+        # diagnosis does NOT transfer here: on this single-viewpoint rendered corpus the SigLIP
+        # finetune IS the domain adaptation the place tasks need. Qualification uses the recipe
+        # that put 3 tasks in band, which is round 1's: vision trainable.
+        freeze_vision=False,
+        roots_index="/disk/axis/render/splits_eef/qual_v1.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v1.ranges.json",
+    ),
+    # Benchmark v2: same pinned recipe as qual_v1 but over the TRUE-VARIANT re-rendered corpus
+    # (the slot-swap defect fix, 2026-08-26 -- each attempt renders in the scene variant it was
+    # collected on). Registered as a PAIR whose only difference is the init checkpoint, so the
+    # base-vs-BC-pretrain comparison is one-thing-different by construction. 5 epochs is the
+    # owner-pinned qualification budget.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2",
+        eef_action=False,
+        freeze_vision=False,
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bc",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awr",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/libero5k_d8_awr_v2/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awrp",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/libero5k_d8_awr_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfg",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_dropt",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_drop_top_d8/libero5k_d8_drop_top_v2/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_droptp",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_drop_top_d8/libero5k_d8_drop_top_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_anneal",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_anneal_d8/libero5k_d8_anneal_v2/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_annealp",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_anneal_d8/libero5k_d8_anneal_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgv2",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_v2/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    # QUALITY-TAGGED twins of the two CFG finetune arms above: same demos, same 5-epoch budget,
+    # same init -- the ONLY difference is that training prompts carry the constant "Quality: 5"
+    # tag (with the stage-2 two-level dropout keeping the unconditional branch trained), so the
+    # finetune preserves the conditioning channel the stage-1 CFG checkpoints were pretrained
+    # with instead of finetuning it away on bare prompts. Serve with
+    #   scripts/serve_policy.py --quality-tag 5 [--guidance-scale <beta - 1>]
+    # -- the serve-time spelling (FixedQualityConditioning) and this train-time spelling
+    # (LiberoQualityConditioning) are the SAME apply_metadata call, "\nQuality: 5".
+    #
+    # norm_stats_from names the UNTAGGED twin: the stats are computed over the same roots/
+    # ranges/columns and the tag never touches state or actions, so the twin's stats ARE this
+    # arm's stats -- and a tagged config must not run compute_norm_stats at all (its
+    # conditioning transform heads the repack group and raises without the presentation counter
+    # only the training loader wires).
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgt",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgv2t",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_v2/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfgv2",
     ),
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
     # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen

@@ -716,17 +716,33 @@ class PresentationSampler(torch.utils.data.Sampler[int]):
     it does not merely document "restart clean" and hope.
     """
 
-    def __init__(self, n_rows: int, *, seed: int = 0, shuffle: bool = True):
+    def __init__(self, n_rows: int, *, seed: int = 0, shuffle: bool = True, rows=None):
         n = int(n_rows)
         if n <= 0:
             raise ValueError(f"PresentationSampler got n_rows={n}; there is nothing to present")
         self._n = n
+        # Optional row restriction (the pretrain concat branch's non-idle plan): the counter
+        # still rides as `presentation * n_rows + row` over the FULL flat space, so
+        # `PresentationKeyedDataset`'s divmod decode is unchanged; only which rows are drawn
+        # narrows. One presentation = every KEPT row exactly once.
+        self._rows = None
+        if rows is not None:
+            r = torch.as_tensor(np.asarray(rows), dtype=torch.long)
+            if len(r) == 0:
+                raise ValueError("PresentationSampler got an empty row restriction")
+            if int(r.min()) < 0 or int(r.max()) >= n:
+                raise ValueError(
+                    f"PresentationSampler row restriction indexes [{int(r.min())}, "
+                    f"{int(r.max())}] outside the dataset (n_rows={n}); the plan belongs to a "
+                    f"different corpus."
+                )
+            self._rows = r
         self._seed = int(seed)
         self._shuffle = bool(shuffle)
         self._presentation = 0
 
     def __len__(self) -> int:
-        return self._n
+        return self._n if self._rows is None else len(self._rows)
 
     @property
     def presentation(self) -> int:
@@ -736,13 +752,15 @@ class PresentationSampler(torch.utils.data.Sampler[int]):
     def __iter__(self):
         e = self._presentation
         self._presentation += 1
+        m = self._n if self._rows is None else len(self._rows)
         if self._shuffle:
             gen = torch.Generator()
             gen.manual_seed(self._seed + e)
-            order = torch.randperm(self._n, generator=gen)
+            order = torch.randperm(m, generator=gen)
         else:
-            order = torch.arange(self._n)
-        yield from (order + e * self._n).tolist()
+            order = torch.arange(m)
+        base = order if self._rows is None else self._rows[order]
+        yield from (base + e * self._n).tolist()
 
 
 class PresentationKeyedDataset:
@@ -813,7 +831,8 @@ class PresentationKeyedDataset:
             )
 
 
-def wrap_presentations(dataset, conditioning: LiberoQualityConditioning, *, seed: int, shuffle: bool):
+def wrap_presentations(dataset, conditioning: LiberoQualityConditioning, *, seed: int, shuffle: bool,
+                       rows=None):
     """Build stage 2's dataset wrapper and its sampler TOGETHER. The only supported constructor.
 
     Same lesson as `wrap_and_transform`, one stage later: of the two ways to wire half of this,
@@ -823,7 +842,7 @@ def wrap_presentations(dataset, conditioning: LiberoQualityConditioning, *, seed
     0.8075 realized rate while doing it.
     """
     return PresentationKeyedDataset(dataset, conditioning), PresentationSampler(
-        len(dataset), seed=seed, shuffle=shuffle
+        len(dataset), seed=seed, shuffle=shuffle, rows=rows
     )
 
 
