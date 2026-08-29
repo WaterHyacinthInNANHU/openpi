@@ -116,6 +116,23 @@ def init_train_state(
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
+
+    # FREEZE TRIPWIRE: a freeze_filter that matches nothing trains as a plain clone of
+    # the unfrozen arm, silently. Log the split at startup so every run carries the
+    # evidence, and refuse to train a config that DECLARES a freeze which resolved to
+    # zero params (the silent-no-op failure class).
+    def _n_params(tree) -> int:
+        return sum(int(np.prod(x.shape)) for x in jax.tree.leaves(tree))
+
+    total_params = _n_params(train_state_shape.params.to_pure_dict())
+    trainable_params = _n_params(train_state_shape.params.filter(config.trainable_filter).to_pure_dict())
+    frozen_params = total_params - trainable_params
+    logging.info(
+        f"param_counts: total={total_params} trainable={trainable_params} frozen={frozen_params}"
+    )
+    if not isinstance(config.freeze_filter, nnx.Nothing) and frozen_params == 0:
+        raise ValueError("freeze_filter is set but matched 0 params -- refusing to train a silent clone")
+
     state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
     if resume:
