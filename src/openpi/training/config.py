@@ -1445,7 +1445,7 @@ def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | Non
             # The quality-tagged CFG finetune twins ONLY; None (a no-op) for every other arm.
             quality_tag=quality_tag,
             norm_stats_from=norm_stats_from,
-            # Phase-reward stage-2 arms (qual_v2_{awrq,annealq,dropq,cfgq}) ONLY; the defaults
+            # Phase-reward stage-2 arms (qual_v2_{awrq,annealq,dropq,cfgq} + the _s3 twins) ONLY; the defaults
             # are inert for every other caller, so no existing config changes behavior.
             awr_weights=awr_weights,
             awr_required=awr_required,
@@ -2912,6 +2912,126 @@ _CONFIGS = [
         norm_stats_from="pi05_axis_heldout_qual_v2",
         quality_path="/disk/axis/render/splits_eef/quality_phase_heldout.npz",
         quality_required=True,
+    ),
+    # SERVER-3 LOCAL twin of pi05_axis_heldout_qual_v2_cfgv2t: identical recipe, only the
+    # paths differ (payload shipped to /home/mqd/axis/heldout_ft). Registered under its own
+    # name so the server-2 entries above stay byte-inert on this box.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgv2t_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_v2/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfgv2",
+    ),
+    # SERVER-3 LOCAL phase-reward arm finetunes (2026-08-28). The stage-1 phase-reward arms
+    # were RETRAINED after the reward bug (old results void); these finetune the retrained
+    # checkpoints, which land server-3-locally. UNTAGGED -- protocol-identical to the earlier
+    # server-2 qual_v2 arms (same recipe, same data, no quality conditioning); the only
+    # variable per arm is `init_path`, which is the treatment. `norm_stats_from` points at
+    # the SHIPPED stats copy (assets/pi05_axis_heldout_qual_v2_cfgv2): every qual_v2 arm
+    # trains on the identical roots/ranges, so those statistics are these arms' own by
+    # construction, exactly as the cfgv2t_s3 twin above resolves them.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awrp_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/libero5k_d8_awr_phase/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfgv2",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgp_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_phase/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfgv2",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_droptp_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_drop_top_d8/libero5k_d8_drop_top_phase/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfgv2",
+    ),
+    # QUALITY-AWARE PHASE FINETUNE ARMS (night 9), SERVER-3 SHARE: awrq + dropq train here
+    # (annealq + cfgq train on server 2). Each arm BOTH initializes from its phase-supervision
+    # stage-1 checkpoint (the ORIGINALS live on this box; gen-3, mtime-checked) AND applies the
+    # same supervision during the qual_v2 finetune, from artifacts derived on the held-out
+    # corpus (built+guard-verified on server 2, shipped here md5-identical; see
+    # /disk/axis/heldout20/night9_PLAN.md on server 2).
+    #
+    # NORM STATS come from the untagged pi05_axis_heldout_qual_v2 twin (assets copy shipped;
+    # byte-identical to the _cfgv2 copy the other _s3 arms read): same roots/ranges/columns,
+    # and reweighting/scheduling never touches state or actions. Do NOT run compute_norm_stats.
+    #
+    # EVERY GUARD IS ON (awr_required / schedule_required+expected_mode): a launch that loses
+    # the artifact flag must refuse, not silently train the BC control under the arm's name.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awrq_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/libero5k_d8_awr_phase/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+        awr_weights="/home/mqd/axis/heldout_ft/splits_eef/awr_weights_phase_heldout.json",
+        awr_required=True,
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_dropq_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_drop_top_d8/libero5k_d8_drop_top_phase/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+        schedule_path="/home/mqd/axis/heldout_ft/splits_eef/schedule_drop_top_phase_heldout.npz",
+        schedule_required=True,
+        expected_mode="drop_top",
+    ),
+    # FROZEN-VISION DECOMPOSITION (night 10), SERVER-3 SHARE: the bcvfz finetune trains here
+    # while awrvfz trains on server 2. Pinned qual_v2 recipe unchanged (vision TRAINABLE at
+    # finetune; the ONLY stage-1 variable is the frozen SigLIP tower of the init checkpoint,
+    # libero5k_d8_bc_vfz, which lives LOCALLY on this box). Plain BC: no supervision kwargs.
+    # Norm stats from the untagged qual_v2 twin's staged assets copy -- same roots/ranges/
+    # columns; do NOT run compute_norm_stats.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bcvfz_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k_vfz/libero5k_d8_bc_vfz/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
     ),
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
     # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen
