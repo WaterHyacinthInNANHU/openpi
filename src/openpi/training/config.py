@@ -1108,21 +1108,27 @@ def _slb_freeze_filter(freeze_vision: bool):
     return nnx.Any(base, nnx_utils.PathRegex(".*img.*"))
 
 def _pretrain_freeze_filter(freeze_vision: bool):
-    """Freeze ONLY the SigLIP image tower for a full-weight pretrain arm (the `_vfz` twins).
+    """Freeze the SigLIP vision ENCODER for a full-weight pretrain arm (the `_vfz` twins).
+
+    Scope is MolmoBot-aligned: img/{Transformer,embedding,pos_embedding} freeze (412,442,352
+    params) while img/head -- the projector; their conversion maps it to multi_modal_projector
+    and their "vision_tower" freeze regex does not match it -- stays TRAINABLE (2,361,344
+    params). A bare `.*img.*` (the `_slb_freeze_filter` tower regex) would over-freeze the
+    projector, which is exactly the coverage difference this helper exists to encode.
 
     Unlike `_slb_freeze_filter` there is no LoRA base here: with `freeze_vision` unset this
     returns the `freeze_filter` field's default value (`nnx.Nothing()`), so a config built
     through this helper resolves identically to one built before the kwarg existed (proven by
-    the before/after snapshot at patch time). `.*img.*` is the same tower regex
-    `_slb_freeze_filter` uses; that the ~400M matched params are actually nonzero is asserted
-    by the param-count tripwire in scripts/train.py at startup -- a regex that matches nothing
-    would otherwise train a silent clone of the unfrozen arm.
+    the before/after snapshot at patch time). That the matched params are actually nonzero is
+    asserted by the param-count tripwire in scripts/train.py at startup, and the driver's
+    bit-identity check asserts the complement: img/head MUST move -- a projector that never
+    moves means the filter over-matched again.
     """
     if not freeze_vision:
         return nnx.Nothing()
     import openpi.shared.nnx_utils as nnx_utils
 
-    return nnx_utils.PathRegex(".*img.*")
+    return nnx_utils.PathRegex(".*img/(Transformer|embedding|pos_embedding).*")
 
 
 # Knowledge insulation (arXiv:2505.23705), shared by every KI arm so the DROID, AXIS-pretrain
