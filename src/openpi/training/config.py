@@ -1376,7 +1376,14 @@ def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | Non
                                    roots_index: str | None = None,
                                    ranges_path: str | None = None,
                                    quality_tag: int | None = None,
-                                   norm_stats_from: str | None = None) -> TrainConfig:
+                                   norm_stats_from: str | None = None,
+                                   awr_weights: str | None = None,
+                                   awr_required: bool = False,
+                                   schedule_path: str | None = None,
+                                   schedule_required: bool = False,
+                                   expected_mode: str | None = None,
+                                   quality_path: str | None = None,
+                                   quality_required: bool = False) -> TrainConfig:
     """One policy over all 20 held-out tasks -- the LIBERO-Plus-style protocol this suite replaces.
 
     Same recipe as `_axis_heldout_gate_config` (pi05_base init, LoRA, vision unfrozen, constant LR,
@@ -1420,6 +1427,15 @@ def _axis_heldout_multitask_config(*, num_train_steps: int, init_path: str | Non
             # The quality-tagged CFG finetune twins ONLY; None (a no-op) for every other arm.
             quality_tag=quality_tag,
             norm_stats_from=norm_stats_from,
+            # Phase-reward stage-2 arms (qual_v2_{awrq,annealq,dropq,cfgq}) ONLY; the defaults
+            # are inert for every other caller, so no existing config changes behavior.
+            awr_weights=awr_weights,
+            awr_required=awr_required,
+            schedule_path=schedule_path,
+            schedule_required=schedule_required,
+            expected_mode=expected_mode,
+            quality_path=quality_path,
+            quality_required=quality_required,
             # stage-1 speaks 7-D relative EEF (state_eef 8-D / action_eef 7-D). Fine-tuning in any
             # other space forces the model to re-learn the action space and discards part of the
             # pretraining this benchmark exists to measure. The eval MUST run with
@@ -2764,6 +2780,78 @@ _CONFIGS = [
         ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2_cfgv2",
+    ),
+    # QUALITY-AWARE PHASE FINETUNE ARMS (night 9). Same demos, same 5-epoch budget and pinned
+    # recipe as the qual_v2 family, but each arm BOTH initializes from its phase-supervision
+    # stage-1 checkpoint AND applies the same supervision during the finetune, from artifacts
+    # derived on the held-out corpus itself (phase signals replayed per attempt in the TRUE
+    # scene variant, row-aligned to the corpus -- see /disk/axis/heldout20/phase_arms/ and
+    # /disk/axis/render/splits_eef/phase_signals_heldout/).
+    #
+    # NORM STATS come from the untouched pi05_axis_heldout_qual_v2 arm: same roots/ranges/
+    # columns, and reweighting/scheduling/conditioning never touches state or actions, so the
+    # sibling's stats ARE these arms' stats. These configs must NOT run compute_norm_stats.
+    #
+    # EVERY GUARD IS ON (awr_required / schedule_required+expected_mode / quality_required):
+    # a launch that loses the artifact flag must refuse, not silently train the BC control
+    # under the arm's name -- that failure has shipped twice in this project already.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awrq",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/libero5k_d8_awr_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+        awr_weights="/disk/axis/render/splits_eef/awr_weights_phase_heldout.json",
+        awr_required=True,
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_annealq",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_anneal_d8/libero5k_d8_anneal_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+        schedule_path="/disk/axis/render/splits_eef/schedule_anneal_phase_heldout.npz",
+        schedule_required=True,
+        expected_mode="anneal",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_dropq",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_drop_top_d8/libero5k_d8_drop_top_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+        schedule_path="/disk/axis/render/splits_eef/schedule_drop_top_phase_heldout.npz",
+        schedule_required=True,
+        expected_mode="drop_top",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgq",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+        quality_path="/disk/axis/render/splits_eef/quality_phase_heldout.npz",
+        quality_required=True,
     ),
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
     # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen
