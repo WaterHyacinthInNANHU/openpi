@@ -1107,6 +1107,24 @@ def _slb_freeze_filter(freeze_vision: bool):
         return base
     return nnx.Any(base, nnx_utils.PathRegex(".*img.*"))
 
+def _pretrain_freeze_filter(freeze_vision: bool):
+    """Freeze ONLY the SigLIP image tower for a full-weight pretrain arm (the `_vfz` twins).
+
+    Unlike `_slb_freeze_filter` there is no LoRA base here: with `freeze_vision` unset this
+    returns the `freeze_filter` field's default value (`nnx.Nothing()`), so a config built
+    through this helper resolves identically to one built before the kwarg existed (proven by
+    the before/after snapshot at patch time). `.*img.*` is the same tower regex
+    `_slb_freeze_filter` uses; that the ~400M matched params are actually nonzero is asserted
+    by the param-count tripwire in scripts/train.py at startup -- a regex that matches nothing
+    would otherwise train a silent clone of the unfrozen arm.
+    """
+    if not freeze_vision:
+        return nnx.Nothing()
+    import openpi.shared.nnx_utils as nnx_utils
+
+    return nnx_utils.PathRegex(".*img.*")
+
+
 # Knowledge insulation (arXiv:2505.23705), shared by every KI arm so the DROID, AXIS-pretrain
 # and SLB twins are comparable. The FAST token budget is no longer a model field: the ids are
 # spliced into the prompt, so `max_token_len` (250 for KI, see Pi0Config.__post_init__) is what
@@ -1639,6 +1657,7 @@ def _axis_pretrain_config(
     schedule_required: bool = False, expected_mode: str | None = None,
     quality_required: bool = False, center_crop: bool = False,
     norm_stats_from_name: str | None = None, awr_required: bool = False,
+    freeze_vision: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1818,7 +1837,10 @@ def _axis_pretrain_config(
         # `checkpoints._split_params` writes ema_params (when set) as the `params` item -- so
         # EMA here is what makes <ckpt>/<step>/params the artifact stage 2 must consume.
         ema_decay=0.999 if paper else None,
-        # NO freeze_filter -> all params trainable (full weight).
+        # Default: NO freeze_filter -> all params trainable (full weight). The `_vfz`
+        # twins pass freeze_vision=True to freeze ONLY the SigLIP tower on top of the
+        # otherwise-identical full-weight recipe; see _pretrain_freeze_filter.
+        freeze_filter=_pretrain_freeze_filter(freeze_vision),
     )
 
 
@@ -1966,6 +1988,20 @@ _CONFIGS = [
                           center_crop=True, name="pi05_axis_awr_d8",
                           awr_required=True,
                           norm_stats_from_name="pi05_axis_pretrain_d8_paper_5k"),
+    # ---- FROZEN-VISION (_vfz) twins. Identical to their unfrozen counterparts in every field
+    # except freeze_vision=True (SigLIP tower frozen; ~400M params, logged and asserted nonzero
+    # at startup by scripts/train.py). The bc twin pins norm stats to the unfrozen baseline's
+    # assets dir EXPLICITLY: the unfrozen bc computed those stats, and recomputing them under
+    # the vfz name would be a second uncontrolled difference between the arms being compared.
+    _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_pretrain_d8_paper_5k_vfz",
+                          norm_stats_from_name="pi05_axis_pretrain_d8_paper_5k",
+                          freeze_vision=True),
+    _axis_pretrain_config(eef=False, paper=True, batch_size=64, num_train_steps=20_605,
+                          center_crop=True, name="pi05_axis_awr_d8_vfz",
+                          awr_required=True,
+                          norm_stats_from_name="pi05_axis_pretrain_d8_paper_5k",
+                          freeze_vision=True),
     #
     # ROUND-2 INDEX-SCHEDULE ARMS. Both carry round 1's model, optimiser and budget (20,605 steps
     # = one epoch of the rung-5000 corpus, at GLOBAL batch 64) and differ from the `bc` control,
@@ -2650,6 +2686,28 @@ _CONFIGS = [
         freeze_vision=False,
         init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
                   "libero5k_d8_bc/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awrvfz",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/libero5k_d8_awr_phase_vfz/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bcvfz",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/libero5k_d8_bc_vfz/20604/params",
         roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
         ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
     ),
