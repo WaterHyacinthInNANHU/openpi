@@ -2614,7 +2614,8 @@ _CONFIGS = [
         # Same 20-epoch budget as round 1, but computed from the CLEAN index this arm
         # actually trains on rather than the 20-task one.
         num_train_steps=heldout_epoch_steps(
-            20, "/disk/axis/render/splits_eef/clean10.ranges.json", HELDOUT_GATE_BATCH),
+            20, "/disk/axis/render/splits_eef/clean10.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/clean10.ranges.json") else 1,
         name="pi05_axis_heldout_multitask_d8_r2",
         eef_action=False,
         freeze_vision=True,
@@ -2631,7 +2632,8 @@ _CONFIGS = [
     # transfer. Re-run against the droid8 stage-1 when it exists.
     _axis_heldout_multitask_config(
         num_train_steps=heldout_epoch_steps(
-            20, "/disk/axis/render/splits_eef/clean10.ranges.json", HELDOUT_GATE_BATCH),
+            20, "/disk/axis/render/splits_eef/clean10.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/clean10.ranges.json") else 1,
         name="pi05_axis_heldout_multitask_d8_r2_bc",
         init_path="/disk/axis/stage1_ckpts/pi05_axis_pretrain_eef_paper_5k/libero5k_bc/20604/params",
         eef_action=False,
