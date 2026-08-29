@@ -93,6 +93,21 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
         # Pass 8-D state through unpadded: Normalize runs next, and padding here would
         # feed it 24 dims of zeros that quantile-normalize to -1.0 (see module docstring).
         state = np.asarray(data["state"], dtype=np.float32)
+        # WIDTH IS A CONTRACT. Both legitimate stage-1 layouts are 8-D -- `state_eef`
+        # [pos3, axis-angle3, closedness, closedness] and droid8 [7 joint angles, closedness] --
+        # so anything else means the config and the corpus disagree. The case this catches: an
+        # `eef_action=False` config pointed at an UNCONVERTED corpus, whose observation.state is
+        # 9-D (7 joint angles + 2 finger widths in metres). That trains happily on absolute joint
+        # positions and slices the output to [:8], keeping one finger width and dropping the
+        # other. Nothing errors, the loss falls, and the policy is meaningless -- the same shape
+        # of failure as the 180-degree orientation incident, which cost three trained models.
+        if state.shape[-1] != 8:
+            raise ValueError(
+                f"state is {state.shape[-1]}-D; AxisFranka stage-1 requires 8-D. A 9-D state is "
+                f"the RAW corpus layout (7 joint angles + 2 finger widths): convert it with "
+                f"axis.episode.convert_droid_actions and point AXIS_PRETRAIN_ROOTS_INDEX at the "
+                f"converted roots index, or use an eef_action=True config with state_eef."
+            )
         base = _to_hwc_uint8(data["base_0_rgb"])
         raw_wrist = data.get("left_wrist_0_rgb")
         has_wrist = raw_wrist is not None
