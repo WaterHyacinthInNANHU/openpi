@@ -52,6 +52,30 @@ from openpi.policies.eef_math import (  # noqa: E402
 )
 
 
+def _center_crop_square(arr: np.ndarray) -> np.ndarray:
+    """Crop the WIDER axis to the shorter one, centred. A no-op on an already-square frame.
+
+    The 5k `camera_fixed` render stores 640x360 (16:9) for BOTH cameras. The model input is
+    224x224, so a straight resize would squash 16:9 into 1:1 and distort every frame. LIBERO
+    renders square, so cropping to square matches the benchmark's framing rather than
+    letterboxing ours into it.
+
+    CROPPING IS DECLARED, NEVER INFERRED -- the caller passes `center_crop`, this function does
+    not sniff the aspect ratio and decide. The corpora disagree (v3 is 126x224, randcam 224x224,
+    the 5k 640x360) and a transform that silently activates on shape would change what an old
+    corpus means without anything in the config recording it. That is the same failure as the
+    180-degree orientation incident, which cost three trained models.
+    """
+    if arr.ndim < 2:
+        return arr
+    h, w = arr.shape[:2]
+    if h == w:
+        return arr
+    side = min(h, w)
+    top, left = (h - side) // 2, (w - side) // 2
+    return arr[top:top + side, left:left + side]
+
+
 @dataclasses.dataclass(frozen=True)
 class AxisFrankaInputs(_transforms.DataTransformFn):
     """Repack AXIS-Franka rows into the pi0.5 input layout.
@@ -60,14 +84,39 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
     docstring. `PadStatesAndActions` in `model_transforms` does that, after `Normalize`.
     """
 
+    # Crop both cameras to square before the downstream resize to 224. Needed for the 5k
+    # `camera_fixed` corpus (640x360); a no-op on the square randcam frames, and DELIBERATELY
+    # off by default so no existing config changes meaning.
+    center_crop: bool = False
+
     def __call__(self, data: dict) -> dict:
         # Pass 8-D state through unpadded: Normalize runs next, and padding here would
         # feed it 24 dims of zeros that quantile-normalize to -1.0 (see module docstring).
         state = np.asarray(data["state"], dtype=np.float32)
+        # WIDTH IS A CONTRACT. Both legitimate stage-1 layouts are 8-D -- `state_eef`
+        # [pos3, axis-angle3, closedness, closedness] and droid8 [7 joint angles, closedness] --
+        # so anything else means the config and the corpus disagree. The case this catches: an
+        # `eef_action=False` config pointed at an UNCONVERTED corpus, whose observation.state is
+        # 9-D (7 joint angles + 2 finger widths in metres). That trains happily on absolute joint
+        # positions and slices the output to [:8], keeping one finger width and dropping the
+        # other. Nothing errors, the loss falls, and the policy is meaningless -- the same shape
+        # of failure as the 180-degree orientation incident, which cost three trained models.
+        if state.shape[-1] != 8:
+            raise ValueError(
+                f"state is {state.shape[-1]}-D; AxisFranka stage-1 requires 8-D. A 9-D state is "
+                f"the RAW corpus layout (7 joint angles + 2 finger widths): convert it with "
+                f"axis.episode.convert_droid_actions and point AXIS_PRETRAIN_ROOTS_INDEX at the "
+                f"converted roots index, or use an eef_action=True config with state_eef."
+            )
         base = _to_hwc_uint8(data["base_0_rgb"])
         raw_wrist = data.get("left_wrist_0_rgb")
         has_wrist = raw_wrist is not None
         wrist = _to_hwc_uint8(raw_wrist) if has_wrist else np.zeros_like(base)
+        if self.center_crop:
+            # BOTH cameras, identically. The wrist is 16:9 too, and cropping only one would
+            # give the two views different effective fields of view.
+            base = _center_crop_square(base)
+            wrist = _center_crop_square(wrist)
         # openpi wants separate `image` / `image_mask` dicts with the model's 3 camera
         # slots; pad the unused right wrist with zeros (masked off for the pi0.5 flow).
         out = {
@@ -96,6 +145,19 @@ class AxisFrankaInputs(_transforms.DataTransformFn):
 class AxisFrankaOutputs(_transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         return {"actions": np.asarray(data["actions"])[:, :8]}
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisFrankaJoint9Outputs(_transforms.DataTransformFn):
+    """Joint-POSITION variant: slice the padded 32-D output back to 9 = 7 joint targets + 2 finger
+    widths, the space the stage-1 corpus and the held-out render store.
+
+    The 8-D slice above is for the DROID velocity space; applying it to a 9-D policy drops the last
+    finger width and shifts the first one into the closedness slot the eval reads.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"])[:, :9]}
 
 
 @dataclasses.dataclass(frozen=True)

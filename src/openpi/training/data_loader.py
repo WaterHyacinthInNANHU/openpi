@@ -671,9 +671,38 @@ def create_torch_data_loader(
         # ONE call builds the wrapper and the sampler: drawn 0..n-1 by any other sampler, the
         # wrapper reports presentation 0 for every sample and stage 2 silently trains the fixed
         # 19.25% partition instead of a dropout. See `wrap_presentations`.
+        stage2_rows = None
+        if getattr(data_config, "pretrain_roots_index", None):
+            # The heldout CFG finetune twins run stage-2 conditioning OVER the pretrain concat
+            # branch, whose non-idle row restriction normally arrives as the RowSampler built
+            # further down. One sampler slot cannot hold both, so the restricted rows ride
+            # INSIDE the PresentationSampler instead -- planned here and handed to the same
+            # single wrap_presentations call, so wrapper and sampler still cannot be built
+            # apart. The pretrain sampler branch below is gated off for this config.
+            if getattr(data_config, "pretrain_schedule_path", None):
+                raise ValueError(
+                    "stage-2 quality conditioning and pretrain_schedule_path are both set. The "
+                    "schedule replays a precomputed (step, batch) block of plain row indices, "
+                    "which leaves no sampler slot for the presentation counter -- every draw "
+                    "would decode presentation 0 and the dropout would silently become a fixed "
+                    "partition."
+                )
+            if getattr(data_config, "pretrain_awr_weights", None):
+                raise ValueError(
+                    "stage-2 quality conditioning and pretrain_awr_weights are both set; "
+                    "conditioning and loss reweighting are two different mechanisms, so this "
+                    "run would be two arms at once (and StrictWeightedRowDataset cannot index "
+                    "the presentation-extended draw)."
+                )
+            from openpi.training import pretrain_dataset as _pretrain_dataset
+
+            stage2_rows = _pretrain_dataset.plan_rows_from_roots(
+                data_config.pretrain_roots_index, data_config.pretrain_ranges_path
+            )
         dataset, stage2_sampler = _quality_conditioning.wrap_presentations(
-            dataset, stage2_conditioning, seed=seed, shuffle=shuffle
+            dataset, stage2_conditioning, seed=seed, shuffle=shuffle, rows=stage2_rows
         )
+        n_draw = len(dataset) if stage2_rows is None else int(len(stage2_rows))
         logging.info(
             "stage-2 quality conditioning: q_ep=%d drop_whole=%.4f drop_component=%.4f "
             "target_tagged=%.4f seed=%d n_rows=%d shuffle=%s presentations_needed=%s",
@@ -681,9 +710,9 @@ def create_torch_data_loader(
             float(stage2_conditioning.drop_component),
             (1.0 - float(stage2_conditioning.drop_whole))
             * (1.0 - float(stage2_conditioning.drop_component)),
-            int(stage2_conditioning.seed), len(dataset), shuffle,
+            int(stage2_conditioning.seed), n_draw, shuffle,
             "unknown" if num_train_steps is None
-            else -(-num_train_steps * batch_size // len(dataset)),
+            else -(-num_train_steps * batch_size // n_draw),
         )
     if quality_path:
         # π0.7 quality conditioning. This REPLACES the `transform_dataset` call below rather than
@@ -784,7 +813,11 @@ def create_torch_data_loader(
                 # training loss can reweight. No other variant gets this wrapper, so
                 # their batches keep exactly the keys they had before.
                 dataset = slb_variant_sampler.WeightedRowDataset(dataset, weights_by_row)
-        elif getattr(data_config, "pretrain_roots_index", None):
+        elif getattr(data_config, "pretrain_roots_index", None) and stage2_sampler is None:
+            # (When the stage-2 quality path is active, its PresentationSampler already carries
+            # the restricted row plan -- see the stage-2 block above -- so this branch must not
+            # overwrite it with a plain RowSampler, which would silently decode presentation 0
+            # for every sample.)
             # Pretraining: restrict the concatenated multi-task dataset to the non-idle
             # sample-ranges, drawn UNIFORMLY -- and, when an AWR weights artifact is configured,
             # carry a per-row Eq E.7 weight into the batch so the loss can reweight.
