@@ -2834,6 +2834,25 @@ _CONFIGS = [
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
     ),
+    # NIGHT 13: bc-tagged control -- does tagged finetuning help WITHOUT a CFG pretrain?
+    # bc 20604 init + constant quality_tag=5, the cfgt registration pattern exactly. Norm
+    # stats from the untagged pi05_axis_heldout_qual_v2 twin (same roots/ranges/columns and
+    # the tag never touches state or actions); a tagged config must not run
+    # compute_norm_stats.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bct",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
     _axis_heldout_multitask_config(
         num_train_steps=heldout_epoch_steps(
             5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
