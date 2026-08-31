@@ -2853,6 +2853,7 @@ _CONFIGS = [
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2",
     ),
+
     _axis_heldout_multitask_config(
         num_train_steps=heldout_epoch_steps(
             5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
@@ -3056,6 +3057,92 @@ _CONFIGS = [
         init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k_vfz/libero5k_d8_bc_vfz/20604/params",
         roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
         ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
+    # NIGHT 11 EPOCH-CURVE CELLS: plain qual_v2 finetunes from @6000-step stage-1 inits
+    # (owner's visual-first hypothesis; each cell's 20604 twin already exists). awrp6k and
+    # bc6k init from @6k-RESEED mini-pretrains (true intermediates were not kept; identical
+    # recipe prefix modulo data-order seed, labeled honestly in status pushes).
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awrp6k_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/libero5k_d8_awr_phase_6k/6000/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bcvfz6k_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k_vfz/libero5k_d8_bc_vfz/6000/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bc6k_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/libero5k_d8_bc_6k/6000/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_annealp6k_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_anneal_d8/libero5k_d8_anneal_phase/6000/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
+    # NIGHT 12 (Track C): cfgv2t-exact analogue on the PHASE reward -- gen-3 cfg_phase
+    # init (shipped from server 2; s3's own cfg_phase tree is STALE gen-2) + constant
+    # quality_tag=5, mirroring server 2's pi05_axis_heldout_qual_v2_cfgt registration.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgpt_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_phase_gen3/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
+    # NIGHT 13: serve-side twin of server 2's pi05_axis_heldout_qual_v2_bct (bc 20604 init
+    # + constant quality_tag=5). Registered here so the GUIDED cell can serve the shipped
+    # checkpoint with a config whose data paths resolve on THIS box; init_path is inert at
+    # serve time and mirrors server 2's registration.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bct_s3",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2",
     ),
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
