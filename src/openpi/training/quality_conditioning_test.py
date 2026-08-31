@@ -806,3 +806,35 @@ def test_q_defaults_to_five(monkeypatch):
     monkeypatch.setattr(qc, "apply_metadata", spy)
     check_token_budget(["pick up the bowl"], 200, tokenizer=_tok(200))
     assert seen == [5]
+
+
+def test_seg_filename_binds_row_granularity_in_both_directions(tmp_path):
+    """Catches: the row-built (segment) artifact read under the episode arm's name and vice
+    versa. Same exposure as the reward-id swap: one config name, four artifacts, and the
+    filename is the only witness."""
+    row = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="phase",
+                          name="quality_phase_seg.npz",
+                          meta_overrides={"granularity": "row"})
+    QualityTags(row).check_reward_id()
+    ep_named_seg = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="phase",
+                                   name="quality_phase_seg.npz",
+                                   meta_overrides={"granularity": "episode"})
+    with pytest.raises(ValueError, match="granularity"):
+        QualityTags(ep_named_seg).check_reward_id()
+    row_named_plain = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="phase",
+                                      name="quality_phase.npz",
+                                      meta_overrides={"granularity": "row"})
+    with pytest.raises(ValueError, match="granularity"):
+        QualityTags(row_named_plain).check_reward_id()
+
+
+def test_a_pre_granularity_artifact_reads_as_episode_level(tmp_path):
+    """Catches: refusing every artifact built before meta['granularity'] existed. They were all
+    episode-level, so the unsuffixed name must keep passing without a rebuild."""
+    legacy = _write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="phase",
+                             name="quality_phase.npz")
+    QualityTags(legacy).check_reward_id()
+    with pytest.raises(ValueError, match="granularity"):
+        # ...but it cannot masquerade as the segment arm just by renaming the file.
+        QualityTags(_write_artifact(tmp_path, [1, NO_TAG, 3], reward_id="phase",
+                                    name="quality_phase_seg.npz")).check_reward_id()

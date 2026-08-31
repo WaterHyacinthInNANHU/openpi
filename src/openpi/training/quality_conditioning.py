@@ -234,11 +234,28 @@ class QualityTags:
         if not stem.startswith(_NAME_PREFIX):
             return
         claimed = stem[len(_NAME_PREFIX):]
+        # `_seg` claims ROW granularity (the segment-level ablation, built by
+        # `build_quality_labels --granularity row`); its absence claims episode granularity.
+        # Checked in BOTH directions for the same reason the reward id is: all four artifacts run
+        # under one config name, and the filename is the only thing separating them. Artifacts
+        # that predate the field wrote no meta['granularity'] and were all episode-level, so the
+        # default reads them correctly rather than refusing them.
+        claimed_gran = "episode"
+        if claimed.endswith("_seg"):
+            claimed, claimed_gran = claimed[: -len("_seg")], "row"
         if claimed != self.reward_id:
             raise ValueError(
                 f"quality artifact {named} is named for reward_id={claimed!r} but its own meta "
                 f"reports {self.reward_id!r}. Both CFG arms run under pi05_axis_cfg, so this run "
                 f"would record itself as {claimed!r} while conditioning on {self.reward_id!r}."
+            )
+        built_gran = str(self.meta.get("granularity", "episode"))
+        if claimed_gran != built_gran:
+            raise ValueError(
+                f"quality artifact {named} is named for granularity={claimed_gran!r} but its own "
+                f"meta reports {built_gran!r}. The `_seg` suffix is the only thing separating the "
+                f"episode-tag arm from the row-tag arm, so this run would record itself as one "
+                f"granularity while conditioning on the other."
             )
 
     def check_dataset_rows(self, n_dataset_rows: int, roots_index: str | None = None) -> None:
