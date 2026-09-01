@@ -280,6 +280,7 @@ def create_data_loader(
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
     resuming: bool = False,
+    start_step: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -324,6 +325,7 @@ def create_data_loader(
         framework=framework,
         num_train_steps=config.num_train_steps,
         resuming=resuming,
+        start_step=start_step,
     )
 
 
@@ -430,7 +432,8 @@ def _bin_row_share(meta: dict) -> dict:
     return {str(b): round(int(c) / total, 4) for b, c in sorted(counts.items(), key=lambda kv: int(kv[0]))}
 
 
-def _check_quality_resume(quality_path: str, resuming: bool) -> None:
+def _check_quality_resume(
+        quality_path: str, resuming: bool, *, exact_resume: bool = False) -> None:
     """A resume restarts the row permutation at epoch 0 while the optimiser continues from step k.
 
     The CFG arm's ONLY claim is coverage neutrality: it draws exactly the rows the round-1 control
@@ -449,7 +452,15 @@ def _check_quality_resume(quality_path: str, resuming: bool) -> None:
     Note this is a DIFFERENT mechanism from `_check_schedule_resume`'s -- the schedule arms replay
     an artifact, this arm draws a permutation -- but the same consequence and the same cause: no
     loader position is checkpointed. Both refuse rather than warn.
+
+    EXCEPTION -- `exact_resume`: when a ScheduleSampler drives the rows AND the loader was
+    fast-forwarded to the restored step, the loader position IS checkpointed (it is the step
+    number; the sampler is RNG-free and step-deterministic) and the quality wrapper itself is
+    stateless, so the refusal's premise does not hold. Gated by the caller to that case only;
+    the RowSampler arms can never set it.
     """
+    if exact_resume:
+        return
     if resuming:
         raise ValueError(
             f"config.resume is set together with pretrain_quality_path={quality_path!r}, but "
@@ -509,7 +520,8 @@ def _check_stage2_quality_resume(resuming: bool) -> None:
         )
 
 
-def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
+def _check_schedule_resume(
+        schedule_path: str, resuming: bool, *, exact_resume: bool = False) -> None:
     """A resume replays the schedule from row 0 while the optimiser continues from step k.
 
     openpi checkpoints no data-loader position (`checkpoints.restore_state` drops its
@@ -517,7 +529,14 @@ def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
     whose ramp only starts at `ramp_start_step ~= 0.85 * num_train_steps`, any resume before the
     last ~15% of training means the ramp is never reached and the arm silently degenerates into
     the uniform control.
+
+    EXCEPTION -- `exact_resume`: the sampler was fast-forwarded to the restored step, which for
+    a ScheduleSampler is a complete loader position (row t IS step t's batch, no RNG). The
+    anneal ramp is a property of the artifact's row order, so a fast-forwarded resume lands in
+    the ramp exactly where the uninterrupted run would be.
     """
+    if exact_resume:
+        return
     if resuming:
         raise ValueError(
             f"config.resume is set together with pretrain_schedule_path={schedule_path!r}, but "
@@ -642,6 +661,7 @@ def create_torch_data_loader(
     framework: str = "jax",
     num_train_steps: int | None = None,
     resuming: bool = False,
+    start_step: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -729,7 +749,10 @@ def create_torch_data_loader(
         # RAISES. The row permutation this arm shares with the control restarts at epoch 0 on a
         # resume while the optimiser continues from step k, so a mid-run resume silently halves
         # the coverage the arm's entire claim rests on. Checked first, before anything expensive.
-        _check_quality_resume(quality_path, resuming)
+        _check_quality_resume(
+            quality_path, resuming,
+            exact_resume=bool(start_step)
+            and bool(getattr(data_config, "pretrain_schedule_path", None)))
         tags = quality_conditioning.QualityTags(quality_path)
         # The filename is the only thing separating cfg_v2 from cfg_phase: one config name, one
         # artifact structure, two rewards. Checked before anything expensive happens.
@@ -897,8 +920,19 @@ def create_torch_data_loader(
                 # openpi checkpoints no loader position (checkpoints.restore_state drops its
                 # data_loader argument), so a resume at step k would replay the schedule from
                 # row 0 while the optimiser continues from k -- see `_check_schedule_resume`.
-                _check_schedule_resume(schedule_path, resuming)
-                sampler = ScheduleSampler(schedule_path)
+                _check_schedule_resume(schedule_path, resuming,
+                                       exact_resume=bool(start_step))
+                sampler = ScheduleSampler(schedule_path, start_step=start_step)
+                if start_step and start_step < sampler.total_steps:
+                    import hashlib as _hashlib
+
+                    _fp = sampler.rows_for_step(start_step)
+                    logging.info(
+                        "EXACT RESUME: schedule fast-forwarded to step %d; first batch rows "
+                        "sha256=%s head=%s",
+                        start_step, _hashlib.sha256(_fp.tobytes()).hexdigest()[:16],
+                        _fp[:4].tolist(),
+                    )
                 # Bind the artifact's own content to the arm this config's NAME promises: nothing
                 # else ties `pi05_axis_drop`/`pi05_axis_anneal` to the file handed to them at
                 # launch, so a mismatched artifact would otherwise train silently under the wrong

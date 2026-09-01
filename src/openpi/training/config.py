@@ -1295,6 +1295,28 @@ _AXIS_ROUND1_NAME = "pi05_axis_pretrain_eef_paper"
 _AXIS_PRETRAIN_REPO_ID = "Devon018/Franka-Datasets-v2"
 
 
+def _pretrain_freeze_filter(freeze_vision: bool):
+    """Freeze the SigLIP vision ENCODER for a full-weight pretrain arm (the `_vfz` twins).
+
+    Scope is MolmoBot-aligned: img/{Transformer,embedding,pos_embedding} freeze (412,442,352
+    params) while img/head -- the projector; their conversion maps it to multi_modal_projector
+    and their "vision_tower" freeze regex does not match it -- stays TRAINABLE (2,361,344
+    params). A bare `.*img.*` (the `_slb_freeze_filter` tower regex) would over-freeze the
+    projector, which is exactly the coverage difference this helper exists to encode.
+
+    With `freeze_vision` unset this returns the `freeze_filter` field's default value
+    (`nnx.Nothing()`), so a config built through this helper resolves identically to one built
+    before the kwarg existed. This box's train.py has no param-count tripwire, so the launch
+    driver must verify the freeze against checkpoints (bit-identity of the frozen subtree,
+    drift of img/head).
+    """
+    if not freeze_vision:
+        return nnx.Nothing()
+    import openpi.shared.nnx_utils as nnx_utils
+
+    return nnx_utils.PathRegex(".*img/(Transformer|embedding|pos_embedding).*")
+
+
 def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
     eef: bool = False, paper: bool = False, name: str | None = None,
@@ -1303,6 +1325,7 @@ def _axis_pretrain_config(
     action_horizon: int | None = None, own_norm_stats: bool = False,
     awr_required: bool = False, norm_stats_from_name: str | None = None,
     save_interval: int | None = None, keep_period: int | None = None,
+    freeze_vision: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1491,7 +1514,10 @@ def _axis_pretrain_config(
         # `checkpoints._split_params` writes ema_params (when set) as the `params` item -- so
         # EMA here is what makes <ckpt>/<step>/params the artifact stage 2 must consume.
         ema_decay=0.999 if paper else None,
-        # NO freeze_filter -> all params trainable (full weight).
+        # Default: NO freeze_filter -> all params trainable (full weight). The `_vfz`
+        # twins pass freeze_vision=True to freeze ONLY the SigLIP tower on top of the
+        # otherwise-identical recipe; see _pretrain_freeze_filter.
+        freeze_filter=_pretrain_freeze_filter(freeze_vision),
     )
 
 
@@ -1783,6 +1809,28 @@ _CONFIGS = [
         paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
         name="pi05_axis_droid_cotrain_cfg", schedule_required=True, expected_mode="cotrain",
         quality_required=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # cfg_vfz: the cfg arm with the SigLIP encoder frozen (MolmoBot-aligned scope). Same
+    # schedule, same tags artifact, same everything -- the freeze is the only difference, so
+    # cfg vs cfg_vfz isolates what vision adaptation contributes under the tag treatment.
+    # NOTE: the plain-BC co-train control trained UNFROZEN; a frozen-BC control is required
+    # before attributing cfg_vfz-vs-BC differences to the tag alone.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_cfg_vfz", schedule_required=True, expected_mode="cotrain",
+        quality_required=True, freeze_vision=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # bc_vfz: the plain-BC co-train with the same SigLIP freeze -- the frozen pair's control.
+    # Same mix schedule, no quality tags; differs from pi05_axis_droid_cotrain ONLY in the
+    # freeze filter (and in reusing that arm's norm stats rather than recomputing them).
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_vfz", schedule_required=True, expected_mode="cotrain",
+        freeze_vision=True,
         norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
         save_interval=10_000, keep_period=50_000,
     ),

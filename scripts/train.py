@@ -238,11 +238,17 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # Exact resume for schedule-driven arms: the sampler is step-deterministic, so the loader
+    # fast-forwards to the step restore_state will load. Asserted against the actually-restored
+    # step below -- a mismatch would feed the wrong rows and must abort, not train.
+    resume_step = int(checkpoint_manager.latest_step()) + 1 if resuming else 0
+
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
         resuming=resuming,
+        start_step=resume_step,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
@@ -261,6 +267,12 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        if int(train_state.step) != resume_step:
+            raise RuntimeError(
+                f"restored step {int(train_state.step)} != latest_step {resume_step} that the "
+                f"data loader was fast-forwarded to; the loader would feed the wrong rows. "
+                f"(Did a newer checkpoint land between loader construction and restore?)"
+            )
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
