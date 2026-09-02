@@ -2852,6 +2852,47 @@ _CONFIGS = [
         roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
         ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
     ),
+    # P0 TABLE COMPLETION (2026-09-03): FT twins for the three missing v2-reward cells --
+    # awr-episode-v2, drop-episode-v2 (plain FT, awrpep/droptpep patterns) and cfg-chunk-v2
+    # (tagged FT, cfgpst pattern). Only the inits move.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_awrvep",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_awr_d8/"
+                  "libero5k_d8_awr_v2_ep/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_droptvep",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_drop_top_d8/"
+                  "libero5k_d8_drop_top_v2_ep/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgv2st",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_v2_seg/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
     # QUALITY-TAGGED twins of the two CFG finetune arms above: same demos, same 5-epoch budget,
     # same init -- the ONLY difference is that training prompts carry the constant "Quality: 5"
     # tag (with the stage-2 two-level dropout keeping the unconditional branch trained), so the
