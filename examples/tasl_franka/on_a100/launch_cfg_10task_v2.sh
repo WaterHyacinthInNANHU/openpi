@@ -31,8 +31,9 @@ DS=$HF_LEROBOT_HOME/ZhixuLi/tasl-fr3-10task-pbc-v2
 [ -r "$FILTER" ] || { echo "FATAL: missing idle filter $FILTER"; exit 1; }
 [ -d "$BASE/params" ] || { echo "FATAL: missing base params $BASE/params"; exit 1; }
 [ -r "$BASE/assets/Devon018/Franka-Datasets-v2/norm_stats.json" ] || { echo "FATAL: missing base norm stats"; exit 1; }
-N=$(ls "$DS/data/chunk-000/" 2>/dev/null | wc -l)
-[ "$N" -eq 392 ] || { echo "FATAL: dataset incomplete, $N/392 parquet"; exit 1; }
+# LeRobot v3.0 concatenates episodes into ~100 MB files, so count episodes/frames from meta, not parquet files.
+N=$(python3 -c "import json;d=json.load(open('$DS/meta/info.json'));print(d['codebase_version'],d['total_episodes'],d['total_frames'])" 2>/dev/null)
+[ "$N" = "v3.0 392 62680" ] || { echo "FATAL: dataset meta mismatch: got '$N', want 'v3.0 392 62680' at $DS"; exit 1; }
 BUSY=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | sort -u | wc -l)
 [ "$BUSY" -eq 0 ] || { echo "FATAL: $BUSY compute process(es) already on the GPUs -- this box is shared, do not stack runs"; nvidia-smi; exit 1; }
 
@@ -45,7 +46,7 @@ echo " global batch: $BATCH   (per GPU $((BATCH/NGPU)))"
 echo " steps       : ${STEPS:-16000 (config)}"
 echo " base        : $BASE"
 echo " norm stats  : base's own Devon018/Franka-Datasets-v2"
-echo " data        : $DS  ($N parquet)"
+echo " data        : $DS  ($N)"
 echo " filter      : $FILTER"
 echo " prompt tag  : Quality: 5, stage-2 dropout 0.15 / 0.05, seed 42"
 echo "=========================================="
