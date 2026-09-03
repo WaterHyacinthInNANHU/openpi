@@ -1059,6 +1059,19 @@ class LeRobotRLinfPbcDataConfig(DataConfigFactory):
 # The in-house PBC base checkpoint (pi0.5, AXIS sim + real DROID co-train, EMA weights) and the
 # norm stats it was trained with.  Kept as module constants so every *_pbc config points at the
 # same step and the same stats -- change them here, not per config.
+# ---------------------------------------------------------------------------
+# AXIS Server 3 cotrain base (2026-08-26).
+# 底座 = pi05_axis_droid_cotrain / cotrain_sim25 / 199999,在本机 8xA100 上训的 200k 步,
+# 数据是 DROID 75% + AXIS 仿真 25% 的混合共训(config 名里的 sim25 就是这个 25%)。
+# 它用 own_norm_stats=True 训练,所以自带一套针对混合分布算的 norm stats;
+# action_horizon 也是 15(不是 droid_lora 家族的 16)。底座与 norm stats 必须成对使用。
+# ---------------------------------------------------------------------------
+COTRAIN_BASE_STEP_DIR = "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_droid_cotrain/cotrain_sim25/199999"
+COTRAIN_BASE_PARAMS = COTRAIN_BASE_STEP_DIR + "/params"
+COTRAIN_BASE_ASSETS_DIR = COTRAIN_BASE_STEP_DIR + "/assets"
+COTRAIN_BASE_ASSET_ID = "Devon018/Franka-Datasets-v2"
+COTRAIN_FILTER_JSON = "/localdisk/tasl_franka_finetune/filters/nonidle_ranges_tail10.json"
+
 PBC_BASE_STEP_DIR = "/data1/Franka_RealRobot/checkpoints/axis_pi05_droid_plainbc_v1/199999"
 PBC_BASE_PARAMS = f"{PBC_BASE_STEP_DIR}/params"
 PBC_BASE_ASSETS_DIR = f"{PBC_BASE_STEP_DIR}/assets"
@@ -3826,6 +3839,71 @@ _CONFIGS = [
         checkpoint_base_dir="/data1/Franka_RealRobot/checkpoints",
         save_interval=5_000,
         keep_period=5_000,
+        log_interval=100,
+    ),
+    #
+    # AXIS Server 3 (2026-08-26): 自研 cotrain 200k 底座 + 10 task 真机数据的 LoRA 微调。
+    #
+    # 与 labserver 的 baseline `pi05_droid_franka_lora_10task_v2` 刻意保持一致的部分:
+    #   LoRA 变体与秩(gemma_2b_lora / gemma_300m_lora)、freeze_filter、AdamW(clip 1.0)、
+    #   无 EMA、peak_lr 2.5e-5 -> 2.5e-6 的余弦退火、warmup 占总步数 10%、prompt_from_task、
+    #   DROID 原生关节速度动作(不加 delta 变换)、静止帧尾部过滤。
+    #
+    # 刻意不同的部分(都是绑在底座上的,换底座就必须跟着换):
+    #   1) 初始权重  = 本机 cotrain_sim25/199999,不是官方 pi05_droid
+    #   2) norm stats = 底座自带的那套(混合分布),不是 DROID 的 —— 归一化统计量是权重
+    #      "以为"的坐标系,用错不会报错,只会让上真机时动作幅度错。
+    #   3) action_horizon = 15,跟底座训练时一致(baseline 是 16)
+    #   4) 数据 = HF ZhixuLi/tasl-fr3-10task-pbc-v2,中心裁剪(1280x720 取中间 720x720 再缩到 224)
+    #      已经在导出 parquet 时烘焙进像素,所以训练端不需要任何裁剪变换,
+    #      openpi 的 resize_with_pad 对已经是正方形的输入是空操作。
+    #      !! 推理端必须喂同样的中心裁剪,否则模型看到的视野和训练时不一致 !!
+    #   5) batch 64 / 16k 步(8xA100),baseline 是 batch 32 / 30k 步。
+    #      总样本量 16000*64 = 1,024,000,对比 baseline 的 30000*32 = 960,000,相差 6.7%。
+    #      learning rate 刻意没有跟着 batch 一起放大,以保持与 baseline 的可比性。
+    #
+    # 等效 epoch: 1,024,000 / 58,760 个可采样起点 = 17.4 遍;8k 步处 = 8.7 遍。
+    TrainConfig(
+        name="pi05_cotrain_franka_lora_10task_pbc_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                filter_dict_path=COTRAIN_FILTER_JSON,
+            ),
+            assets=AssetsConfig(
+                assets_dir=COTRAIN_BASE_ASSETS_DIR,
+                asset_id=COTRAIN_BASE_ASSET_ID,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(COTRAIN_BASE_PARAMS),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600,
+            peak_lr=2.5e-5,
+            decay_steps=16_000,
+            decay_lr=2.5e-6,
+        ),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000,
+        keep_period=2_000,
         log_interval=100,
     ),
     #
