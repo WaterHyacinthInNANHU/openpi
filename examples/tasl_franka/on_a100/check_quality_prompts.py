@@ -13,7 +13,6 @@ import collections
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 from openpi.training import quality_conditioning as _qc
-import openpi.transforms as _transforms
 
 
 def main():
@@ -33,7 +32,7 @@ def main():
         indices = iter(sampler)
     else:
         indices = iter(range(len(dataset)))
-    repacked = _transforms.TransformedDataset(dataset, list(data_config.repack_transforms.inputs))
+    repacked = _data_loader.TransformedDataset(dataset, list(data_config.repack_transforms.inputs))
 
     tagged = 0
     examples = collections.OrderedDict()

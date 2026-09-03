@@ -9,7 +9,7 @@ this repo plus the paths below. Server-side layout:
 | `/localdisk/tasl_franka_cfg/lerobot_local` | the local lerobot fork `pyproject.toml` points at (`../lerobot_local`) |
 | `/localdisk/tasl_franka_finetune/checkpoints/<config>/<exp>/` | checkpoints (PBC and CFG runs side by side) |
 | `/localdisk/tasl_franka_finetune/filters/nonidle_ranges_tail10.json` | idle-frame filter (== `examples/tasl_franka/filter_v2_pack/reference/`) |
-| `/localdisk/dihong_workspace/lerobot_home/ZhixuLi/tasl-fr3-10task-pbc-v2` | 10-task dataset, 392 episodes, centre-cropped |
+| `/localdisk/tasl_franka_cfg/lerobot_home/ZhixuLi/tasl-fr3-10task-pbc-v2` | 10-task dataset, 392 episodes / 62,680 frames, centre-cropped, **LeRobot v3.0** (converted copy; the v2.1 original the PBC run used is `/localdisk/dihong_workspace/lerobot_home/ZhixuLi/...`) |
 | `/localdisk/dihong_workspace/runs/ckpts/pi05_axis_droid_cotrain/cotrain_sim25/199999` | PBC base |
 | `/localdisk/dihong_workspace/runs/ckpts/pi05_axis_droid_cotrain_cfg/cotrain_cfg_phase/199999` | CFG base |
 
@@ -43,4 +43,19 @@ git checkout tasl-franka-cfg
 cp -r /localdisk/dihong_workspace/lerobot_local ../lerobot_local     # pyproject: lerobot = { path = "../lerobot_local" }
 source /localdisk/dihong_workspace/env.sh; export no_proxy="$no_proxy,download-r2.pytorch.org"
 GIT_LFS_SKIP_SMUDGE=1 uv sync
+# The lock pins ../lerobot_local (lerobot 0.1.0, old `lerobot.common` layout) but the main-branch
+# data_loader imports the new `lerobot.datasets` API. The pretraining venv on the box quietly overrides
+# the lock the same way; do it explicitly:
+uv pip install -p .venv/bin/python "lerobot @ git+https://github.com/huggingface/lerobot@v0.4.4"
 ```
+
+lerobot 0.4.4 only loads LeRobot **v3.0** datasets, so the v2.1 dataset is copied and converted once
+(`convert_v30.sh` on the box; in-place converter, the original is left alone):
+
+```bash
+export HF_LEROBOT_HOME=/localdisk/tasl_franka_cfg/lerobot_home     # holds the copy
+.venv/bin/python -m lerobot.datasets.v30.convert_dataset_v21_to_v30 \
+    --repo-id=ZhixuLi/tasl-fr3-10task-pbc-v2 --root=$HF_LEROBOT_HOME --push-to-hub=false
+```
+
+(`--root` is the *home* directory, not the dataset directory; the converter appends the repo id itself.)
