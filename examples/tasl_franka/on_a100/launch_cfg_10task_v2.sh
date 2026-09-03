@@ -17,7 +17,7 @@ STEPS=${STEPS:-}                             # empty = the config's 16,000
 
 source /localdisk/dihong_workspace/env.sh 2>/dev/null   # proxy for HF + caches on /localdisk
 export PYTHONPATH=$REPO/src
-export HF_LEROBOT_HOME=/localdisk/dihong_workspace/lerobot_home
+export HF_LEROBOT_HOME=/localdisk/tasl_franka_cfg/lerobot_home   # our LeRobot v3.0 copy (lerobot 0.4.4 refuses v2.1)
 export OPENPI_DATA_HOME=$W/cache/openpi
 export CUDA_VISIBLE_DEVICES=$GPUS
 export XLA_PYTHON_CLIENT_MEM_FRACTION=$MEMFRAC
