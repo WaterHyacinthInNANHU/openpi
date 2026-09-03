@@ -2893,6 +2893,170 @@ _CONFIGS = [
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
     ),
+    # D/C STREAMS (2026-09-04): FT twins for the data-scaling curve (s1000/s2500; the 5k
+    # point reuses qual_v2_bc / n12cfgpt) and the pi0.5 mixed-quality stress fleet
+    # (mq00..mq75). bc-init cells follow the awrvep plain pattern (own norm stats, computed
+    # by the chain); cfg-init cells follow the cfgv2st tagged pattern (constant tag 5,
+    # stats from the untagged pi05_axis_heldout_qual_v2_cfg twin -- a tagged config must
+    # not run compute_norm_stats). Init steps are each subset's 1-epoch budget minus one:
+    # 4168-1, 10472-1, 5624-1 (mixq00/25), 5622-1 (mixq50/75), from
+    # /disk/axis/libero_5k_v2/artifacts/subsets/{scaling,mixq_ranges}_manifest.json.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_s1000bc",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_s1000/4167/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_s1000cfg",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_s1000/4167/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_s2500bc",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_s2500/10471/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_s2500cfg",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_s2500/10471/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq00bc",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_mixq00/5623/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq00cfg",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_mixq00/5623/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq25bc",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_mixq25/5623/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq25cfg",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_mixq25/5623/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq50bc",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_mixq50/5621/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq50cfg",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_mixq50/5621/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq75bc",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_mixq75/5621/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_mq75cfg",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_mixq75/5621/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2_cfg",
+    ),
     # QUALITY-TAGGED twins of the two CFG finetune arms above: same demos, same 5-epoch budget,
     # same init -- the ONLY difference is that training prompts carry the constant "Quality: 5"
     # tag (with the stage-2 two-level dropout keeping the unconditional branch trained), so the
