@@ -1003,9 +1003,29 @@ class LeRobotRLinfDROIDDataConfig(DataConfigFactory):
     image/extra_view_image as camera keys. No second exterior view.
     """
 
+    # A CONSTANT pi0.7 quality tag for finetuning on the CFG-pretrained cotrain base. Real-robot
+    # demos are uniformly expert data, so every sample carries the highest bin (5) -- the value
+    # inference asks for (slb_cfg.INFER_QUALITY) -- and the two-level dropout inside the
+    # transform keeps the unconditional branch trained so guidance at eval still has a
+    # baseline to subtract. Same mechanism and same defaults as LeRobotLiberoDataConfig.quality_tag;
+    # see quality_conditioning.LiberoQualityConditioning. None = untagged (the DROID / PBC arms).
+    quality_tag: int | None = None
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(inputs=[rlinf_franka_droid.RLinfFrankaDroidRepack()])
+        # The tag transform must HEAD the repack group: it needs `prompt` (attached by
+        # prompt_from_task before any transform), `episode_index` / `frame_index` and the
+        # presentation counter, all of which RLinfFrankaDroidRepack drops.
+        quality_inputs: list[_transforms.DataTransformFn] = []
+        if self.quality_tag is not None:
+            from openpi.training import quality_conditioning
+
+            quality_inputs = [
+                quality_conditioning.LiberoQualityConditioning(q_ep=int(self.quality_tag))
+            ]
+        repack_transform = _transforms.Group(
+            inputs=[*quality_inputs, rlinf_franka_droid.RLinfFrankaDroidRepack()]
+        )
         # Joint *velocity* actions (DROID-native): no delta transform.
         data_transforms = _transforms.Group(
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
@@ -1071,6 +1091,17 @@ COTRAIN_BASE_PARAMS = COTRAIN_BASE_STEP_DIR + "/params"
 COTRAIN_BASE_ASSETS_DIR = COTRAIN_BASE_STEP_DIR + "/assets"
 COTRAIN_BASE_ASSET_ID = "Devon018/Franka-Datasets-v2"
 COTRAIN_FILTER_JSON = "/localdisk/tasl_franka_finetune/filters/nonidle_ranges_tail10.json"
+
+# AXIS Server 3 CFG cotrain base (2026-09-03). Same recipe as the cotrain_sim25 base above
+# (DROID 75% + AXIS sim 25% schedule, batch 64, 200k steps, centre crop, action_horizon 15) plus
+# the pi0.7 quality tag in the prompt: every pretraining row carried "\nQuality: <1..5>" from
+# quality_phase.npz (reward_id=phase; DROID real-robot rows pinned at 5; ~15% of rows untagged
+# as the unconditional branch). norm_stats_from_name="pi05_axis_droid_cotrain", so its stats
+# are byte-identical to the cotrain_sim25 base's (verified by md5 on the box).
+CFG_BASE_STEP_DIR = "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_droid_cotrain_cfg/cotrain_cfg_phase/199999"
+CFG_BASE_PARAMS = CFG_BASE_STEP_DIR + "/params"
+CFG_BASE_ASSETS_DIR = CFG_BASE_STEP_DIR + "/assets"
+CFG_BASE_ASSET_ID = COTRAIN_BASE_ASSET_ID
 
 PBC_BASE_STEP_DIR = "/data1/Franka_RealRobot/checkpoints/axis_pi05_droid_plainbc_v1/199999"
 PBC_BASE_PARAMS = f"{PBC_BASE_STEP_DIR}/params"
@@ -3884,6 +3915,62 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(COTRAIN_BASE_PARAMS),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600,
+            peak_lr=2.5e-5,
+            decay_steps=16_000,
+            decay_lr=2.5e-6,
+        ),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000,
+        keep_period=2_000,
+        log_interval=100,
+    ),
+    #
+    # AXIS Server 3 (2026-09-03): CFG cotrain 200k base + the same 10-task real-robot LoRA finetune.
+    #
+    # Identical to pi05_cotrain_franka_lora_10task_pbc_v2 in EVERYTHING except:
+    #   1) init weights = cotrain_cfg_phase/199999 (quality-tagged pretrain), not cotrain_sim25
+    #   2) quality_tag=5: every prompt gets "\nQuality: 5" appended, with the stage-2 dropout
+    #      (whole 0.15, component 0.05 -> ~80.75% of samples tagged) keyed on
+    #      (seed, presentation, episode_index, frame_index) so the realized dropout is
+    #      recomputable from the run record.
+    # norm stats: the CFG base's own assets, byte-identical to the PBC base's.
+    # Serve with  scripts/serve_policy.py --quality-tag 5 [--guidance-scale <beta - 1>]
+    # (guidance_scale 0 == plain conditional branch == the PBC-comparable setting).
+    TrainConfig(
+        name="pi05_cotrain_franka_lora_10task_cfg_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                filter_dict_path=COTRAIN_FILTER_JSON,
+            ),
+            assets=AssetsConfig(
+                assets_dir=CFG_BASE_ASSETS_DIR,
+                asset_id=CFG_BASE_ASSET_ID,
+            ),
+            quality_tag=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(CFG_BASE_PARAMS),
         num_train_steps=16_000,
         batch_size=64,
         freeze_filter=pi0_config.Pi0Config(
