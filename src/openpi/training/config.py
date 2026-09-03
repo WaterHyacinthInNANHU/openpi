@@ -100,6 +100,12 @@ class DataConfig:
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+    # Idle-frame filter for the LeRobot path: {episode_index: [[start, end), ...]} of frames to
+    # KEEP. Upstream openpi had this field on DataConfig for the RLDS DROID loader; the AXIS
+    # fork moved the RLDS filter into its per-dataset list, and the RealWorldFR3 branch reuses
+    # the same file format to restrict the samplable indices of a LeRobot dataset
+    # (data_loader._SubsetDataset). Frames are never deleted, so no action chunk spans a gap.
+    filter_dict_path: str | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
