@@ -3999,6 +3999,33 @@ _CONFIGS = [
         keep_period=2_000,
         log_interval=100,
     ),
+    TrainConfig(
+        # Serve-only config for the AXIS-cotrain-based finetunes (pi05_cotrain_franka_lora_10task_pbc_v2 and
+        # _cfg_v2, trained on AXIS Server 3). Weights come from --policy.dir; this only pins the three things
+        # that must match training and fail silently otherwise:
+        #   action_horizon=15      (the cotrain bases use 15, not the 16 of the official pi05_droid recipe)
+        #   LoRA variants          (the checkpoints are LoRA finetunes; the base arch must match to load)
+        #   asset_id               norm stats are read from <ckpt>/assets/<asset_id>; the bases ship
+        #                          Devon018/Franka-Datasets-v2, NOT the DROID stats
+        # Image geometry: the training data is centre-cropped (1280x720 -> middle 720x720 -> 224), so the
+        # front-end must send centre-cropped frames (dashboard: image mode "crop"). PbcCenterCropImages here is
+        # a no-op on square inputs and cannot repair letterboxed frames.
+        # CFG checkpoints additionally need "\nQuality: N" appended to the prompt by the client (the
+        # dashboard's "CFG quality" control); the tag is a training-time repack transform, not a serve one.
+        name="pi05_cotrain_franka_serve",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfPbcDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="Devon018/Franka-Datasets-v2"),
+        ),
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
