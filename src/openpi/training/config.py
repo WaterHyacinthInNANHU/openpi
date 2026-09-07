@@ -1295,7 +1295,7 @@ _AXIS_ROUND1_NAME = "pi05_axis_pretrain_eef_paper"
 _AXIS_PRETRAIN_REPO_ID = "Devon018/Franka-Datasets-v2"
 
 
-def _pretrain_freeze_filter(freeze_vision: bool):
+def _pretrain_freeze_filter(freeze_vision: bool, lora: bool = False):
     """Freeze the SigLIP vision ENCODER for a full-weight pretrain arm (the `_vfz` twins).
 
     Scope is MolmoBot-aligned: img/{Transformer,embedding,pos_embedding} freeze (412,442,352
@@ -1310,11 +1310,24 @@ def _pretrain_freeze_filter(freeze_vision: bool):
     driver must verify the freeze against checkpoints (bit-identity of the frozen subtree,
     drift of img/head).
     """
-    if not freeze_vision:
-        return nnx.Nothing()
     import openpi.shared.nnx_utils as nnx_utils
 
-    return nnx_utils.PathRegex(".*img/(Transformer|embedding|pos_embedding).*")
+    tower = nnx_utils.PathRegex(".*img/(Transformer|embedding|pos_embedding).*")
+    if lora:
+        # LoRA drag arms: openpi's own LoRA recipe freezes every non-LoRA LLM weight but
+        # leaves the SigLIP tower fully trainable (its params never match the llm freeze);
+        # with freeze_vision the tower is frozen on top. img/head stays trainable either
+        # way -- the same scope as the full-weight _vfz twins, verified by the same
+        # bit-identity proof.
+        base = pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter()
+        return nnx.Any(base, tower) if freeze_vision else base
+    if not freeze_vision:
+        return nnx.Nothing()
+    return tower
 
 
 def _axis_pretrain_config(
@@ -1326,6 +1339,7 @@ def _axis_pretrain_config(
     awr_required: bool = False, norm_stats_from_name: str | None = None,
     save_interval: int | None = None, keep_period: int | None = None,
     freeze_vision: bool = False,
+    lora: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1431,6 +1445,10 @@ def _axis_pretrain_config(
             # the paper arms keep Appendix F Table 10's literal 10.
             pi05=True, action_dim=32,
             action_horizon=action_horizon if action_horizon is not None else (10 if paper else 16),
+            # LoRA drag arms: adapters on both transformers; every non-LoRA weight is frozen by
+            # _pretrain_freeze_filter's lora branch. Not combined with knowledge insulation.
+            **({"paligemma_variant": "gemma_2b_lora",
+                "action_expert_variant": "gemma_300m_lora"} if lora else {}),
             **(_KI_MODEL_KWARGS if knowledge_insulation else {}),
         ),
         data=AxisFrankaPretrainDataConfig(
@@ -1517,7 +1535,7 @@ def _axis_pretrain_config(
         # Default: NO freeze_filter -> all params trainable (full weight). The `_vfz`
         # twins pass freeze_vision=True to freeze ONLY the SigLIP tower on top of the
         # otherwise-identical recipe; see _pretrain_freeze_filter.
-        freeze_filter=_pretrain_freeze_filter(freeze_vision),
+        freeze_filter=_pretrain_freeze_filter(freeze_vision, lora=lora),
     )
 
 
@@ -1833,6 +1851,29 @@ _CONFIGS = [
         freeze_vision=True,
         norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
         save_interval=10_000, keep_period=50_000,
+    ),
+    # ================= REALALIGN LoRA-DRAG STAGE 1 =================
+    # pi05_droid + LoRA adapters only, sim-only on the target-aligned REALALIGN corpus: drag
+    # the checkpoint toward the target environment without the capacity to forget the prior.
+    # Vision tower frozen (stage-1 only); OWN norm stats over the corpus (DROID's quantiles
+    # saturate 25-35% on four state dims, measured); fully-annealed cosine via paper=False;
+    # horizon 15 to match the pi05_droid init. No schedule: sim-only needs no mixture, and
+    # with no real half the quality tags are PURE quality bins -- the co-train tag's
+    # domain entanglement (Quality: 5 was 94% DROID rows) cannot exist here.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=20_000, center_crop=True,
+        name="pi05_axis_realign_lora_bc", lora=True, freeze_vision=True,
+        own_norm_stats=True, action_horizon=15,
+        save_interval=5_000,
+    ),
+    # cfg twin: identical plus the quality artifact; quality_required makes a launch that
+    # forgets --data.quality_path fail rather than train the bc arm under this name.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=20_000, center_crop=True,
+        name="pi05_axis_realign_lora_cfg", lora=True, freeze_vision=True,
+        quality_required=True,
+        own_norm_stats=True, action_horizon=15,
+        save_interval=5_000,
     ),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
     # measured against the full-data baseline it changes two things at once -- which rows, and how
