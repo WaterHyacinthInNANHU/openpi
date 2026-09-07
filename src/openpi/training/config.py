@@ -2697,6 +2697,22 @@ _CONFIGS = [
         roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
         ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
     ),
+    # The MATCHED no-pretrain control (owner priority 2026-09-07): pi05_droid init, NO AXIS
+    # pretraining, otherwise byte-identical to the qual_v2_bc twin. Exists because the original
+    # no-pretrain row inits from pi05_base, so base-vs-bc bundles (DROID finetuning) with (AXIS
+    # corpus pretraining) -- and the eval executes in DROID's joint-velocity convention, so the
+    # DROID share is plausibly material. bc-minus-THIS isolates the AXIS corpus contribution.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_droidctl",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/cache/openpi/openpi-assets/checkpoints/pi05_droid/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
     _axis_heldout_multitask_config(
         num_train_steps=heldout_epoch_steps(
             5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
