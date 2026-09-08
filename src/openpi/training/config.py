@@ -1352,6 +1352,7 @@ def _axis_pretrain_config(
     droid_assets: bool = False,
     warmup_override: int | None = None,
     sim_image_aug: bool = False,
+    init_base: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1520,7 +1521,9 @@ def _axis_pretrain_config(
         # EEF variant inits from pi05_base (its EEF control-mode head); the joint variant from
         # pi05_droid (DROID-8D joint-velocity). Only weights are reused; norm stats are ours.
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            f"gs://openpi-assets/checkpoints/{'pi05_base' if eef else 'pi05_droid'}/params"
+            # `init_base` (one-phase base-init trio): swap ONLY the init to the pre-DROID
+            # generalist; everything else (incl. DROID norm stats) stays the droid recipe's.
+            f"gs://openpi-assets/checkpoints/{'pi05_base' if (eef or init_base) else 'pi05_droid'}/params"
         ),
         num_train_steps=num_train_steps,
         lr_schedule=(
@@ -1921,6 +1924,35 @@ _CONFIGS = [
         own_norm_stats=True, droid_assets=True, warmup_override=1_600,
         sim_image_aug=True,
         schedule_required=True, expected_mode="cotrain", quality_required=True,
+        save_interval=2_000, keep_period=2_000,
+    ),
+    # BASE-INIT TRIO (2026-09-08): the same arms from pi05_base -- the pre-DROID generalist --
+    # to measure whether the AXIS sim data contributes more when the init carries no DROID
+    # prior. Norm stats stay DROID's (PI's own pi05_base->droid recipe pairs base init with
+    # DROID stats). base_realonly is the trio's baseline: the droid finetune recipe verbatim
+    # (16k x 64 over the real 10-task demos only, uniform row draw -- no schedule, no tags,
+    # no sim), so the sim contribution under base init is measured against its own reference.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_base_bc", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True, init_base=True,
+        schedule_required=True, expected_mode="cotrain",
+        save_interval=2_000, keep_period=2_000,
+    ),
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_base_cfg", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True, init_base=True,
+        schedule_required=True, expected_mode="cotrain", quality_required=True,
+        save_interval=2_000, keep_period=2_000,
+    ),
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=16_000, center_crop=True,
+        name="pi05_axis_onephase_base_realonly", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        init_base=True,
         save_interval=2_000, keep_period=2_000,
     ),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
