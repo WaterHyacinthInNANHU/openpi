@@ -698,6 +698,9 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # `action_eef`(7, robosuite OSC_POSE delta) columns and slice the output to 7. Default False
     # keeps the DROID-8D joint-velocity layout (for a future real-world checkpoint).
     eef_action: bool = False
+    # One-phase co-train arms: MolmoBot-style photometric augmentation on SIM frames only,
+    # gated on frame geometry inside the transform -- see policies/sim_image_aug.py.
+    sim_image_aug: bool = False
 
     @override
     def norm_stats_dir(self, assets_dirs: pathlib.Path) -> epath.Path | None:
@@ -803,8 +806,14 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
         # the tag TWICE ("...\nQuality: 5\nQuality: 5"): in range, tokenizable, unmatched by any
         # eval-time prompt, and silent. So the repack group stays exactly the control's, with and
         # without an artifact -- asserted in config_cfg_arm_test.py.
+        aug_inputs: list = []
+        if self.sim_image_aug:
+            from openpi.policies import sim_image_aug as _sim_aug
+
+            aug_inputs = [_sim_aug.SimImageAug()]
         repack_transform = _transforms.Group(
             inputs=[
+                *aug_inputs,
                 _transforms.RepackTransform(
                     {
                         "base_0_rgb": "observation.images.third_person",
@@ -1340,6 +1349,9 @@ def _axis_pretrain_config(
     save_interval: int | None = None, keep_period: int | None = None,
     freeze_vision: bool = False,
     lora: bool = False,
+    droid_assets: bool = False,
+    warmup_override: int | None = None,
+    sim_image_aug: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1477,6 +1489,13 @@ def _axis_pretrain_config(
             # 640x360 corpora only; a no-op on square frames. Declared per config so a corpus
             # swap cannot change what an existing config means -- see _center_crop_square.
             image_center_crop=center_crop,
+            sim_image_aug=sim_image_aug,
+            # One-phase co-train: the droid stage-2 baseline's OWN stats and asset id, resolved
+            # through OPENPI_DATA_HOME's cache -- byte-identical normalisation to the recipe the
+            # arm is measured against. Composes with own_norm_stats=True (norm_stats_from=None).
+            **({"assets": AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid")} if droid_assets else {}),
             # Schedule arms (name given) never take AWR weights from the environment; see the
             # docstring's `name` paragraph.
             awr_weights=None if name else os.environ.get("AXIS_PRETRAIN_AWR_WEIGHTS"),
@@ -1514,7 +1533,8 @@ def _axis_pretrain_config(
             )
             if paper
             else _optimizer.CosineDecaySchedule(
-                warmup_steps=max(1000, num_train_steps // 20),
+                warmup_steps=(warmup_override if warmup_override is not None
+                              else max(1000, num_train_steps // 20)),
                 peak_lr=2.5e-5,
                 decay_steps=num_train_steps,
                 decay_lr=2.5e-6,
@@ -1872,8 +1892,36 @@ _CONFIGS = [
         batch_size=64, num_train_steps=20_000, center_crop=True,
         name="pi05_axis_realign_lora_cfg", lora=True, freeze_vision=True,
         quality_required=True,
-        own_norm_stats=True, action_horizon=15,
+        norm_stats_from_name="pi05_axis_realign_lora_bc", action_horizon=15,
         save_interval=5_000,
+    ),
+    # ONE-PHASE CO-TRAIN (2026-09-08). The droid stage-2 recipe byte-for-byte -- pi05_droid init,
+    # DROID norm stats (gs assets via the OPENPI_DATA_HOME cache), LoRA adapters, vision UNFROZEN,
+    # batch 64, cosine 2.5e-5 -> 2.5e-6 with the finetune's literal 1600 warmup, EMA off, horizon
+    # 15 -- with the real 10-task demos as the 48/64 batch anchor and the graft sim corpus as the
+    # 16/64 auxiliary. 21,333 steps puts real draws at 21,333 x 48 = 1,023,984 = the 16k x 64
+    # baseline's exposure, so "worse than baseline" can never mean "less real training".
+    # PURE CONDITIONING, no dropout (pi0.7-style): the cfg arm's artifact tags EVERY trainable
+    # row -- real "Domain: real\nQuality: 5", sim "Domain: sim\nQuality: <quintile>" -- and
+    # declares meta.pure_conditioning. Serve by appending "\nDomain: real\nQuality: 5", w=0.
+    # The bc twin replays the SAME schedule untagged; both arms apply MolmoBot-style photometric
+    # augmentation to SIM frames only (policies/sim_image_aug.py), so between the two arms the
+    # prompt text is once again the entire treatment.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_bc", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True,
+        schedule_required=True, expected_mode="cotrain",
+        save_interval=2_000, keep_period=2_000,
+    ),
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_cfg", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True,
+        schedule_required=True, expected_mode="cotrain", quality_required=True,
+        save_interval=2_000, keep_period=2_000,
     ),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
     # measured against the full-data baseline it changes two things at once -- which rows, and how

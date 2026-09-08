@@ -765,7 +765,10 @@ def create_torch_data_loader(
         # RAISES on overflow. PaligemmaTokenizer truncates from the right with only a warning, and
         # what it truncates is the `Action:` marker -- for this arm only, because only this arm
         # lengthens the prompt.
-        margin = quality_conditioning.check_token_budget(tags.prompts, model_config.max_token_len)
+        margin = quality_conditioning.check_token_budget(
+            tags.prompts, model_config.max_token_len,
+            # "real" is the longer spelling of the two, so the bound covers both domains.
+            domain=("real" if getattr(tags, "domain", None) is not None else None))
         dataset = quality_conditioning.wrap_and_transform(
             dataset, tags, training_transforms(data_config, skip_norm_stats=skip_norm_stats)
         )

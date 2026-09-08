@@ -55,12 +55,19 @@ from typing_extensions import override
 
 from openpi.training.slb_cfg import INFER_QUALITY
 from openpi.training.slb_cfg import QUALITY_KEY as _PROMPT_TAG_KEY
+from openpi.training.slb_cfg import DOMAIN_REAL
+from openpi.training.slb_cfg import DOMAIN_SIM
 from openpi.training.slb_cfg import apply_metadata
 import openpi.transforms as _transforms
 
 # The key the wrapper injects and the transform consumes. Not in RepackTransform's map: the
 # transform runs first and rewrites `prompt`, after which the key has done its job.
 QUALITY_KEY = "quality"
+
+# The sibling key for the one-phase co-train arm's per-row domain bit (0=sim, 1=real), injected
+# by QualityTaggedDataset only when the artifact carries a `domain` array, and dropped by
+# RepackTransform after AxisQualityConditioning has rendered it into the prompt.
+DOMAIN_ROW_KEY = "domain_bin"
 
 # The exact prefix `apply_metadata` puts in front of the bin, and the only trace the tag leaves in
 # a sample. Built from slb_cfg's own key rather than spelled out, so the two cannot drift; pinned
@@ -132,6 +139,9 @@ class QualityTags:
             self.tag = np.asarray(z["tag"])
             self.prompts = [str(s) for s in z["prompts"]]
             self.meta = json.loads(str(z["meta"]))
+            # One-phase co-train: optional dense per-row domain (0=sim, 1=real). Absent on every
+            # earlier artifact; presence turns on the "Domain: ..." prompt line.
+            self.domain = np.asarray(z["domain"]) if "domain" in z.files else None
         if self.tag.ndim != 1 or self.tag.dtype != np.uint8:
             # Not cast: a float or int64 array reads through `int()` without complaint, and a
             # truncated tag is a WRONG tag that is indistinguishable from a right one. Same
@@ -139,6 +149,14 @@ class QualityTags:
             raise ValueError(
                 f"quality artifact {self.path} has tag shape {self.tag.shape} dtype "
                 f"{self.tag.dtype}; expected 1-D uint8 dense over the corpus row space"
+            )
+        if self.domain is not None and (
+                self.domain.shape != self.tag.shape or self.domain.dtype != np.uint8):
+            raise ValueError(
+                f"quality artifact {self.path} carries a domain array of shape "
+                f"{self.domain.shape} dtype {self.domain.dtype}; expected uint8 with the tag "
+                f"array's own shape {self.tag.shape} -- a mismatch means the two describe "
+                f"different corpora."
             )
         if not self.prompts:
             raise ValueError(
@@ -173,7 +191,11 @@ class QualityTags:
                 f"covers. Rebuild it with axis.dataset.build_quality_labels."
             )
         self._check_bin_count()
-        if not bool((self.tag == NO_TAG).any()):
+        # `pure_conditioning` (one-phase co-train): EVERY trainable row is tagged, π0.7-style.
+        # There is deliberately no unconditional branch -- serving is w=0 conditioning only, and
+        # an artifact that declares this in its meta is exempt from the NO_TAG requirement below
+        # (which exists to keep GUIDED serving well-defined).
+        if not bool(self.meta.get("pure_conditioning")) and not bool((self.tag == NO_TAG).any()):
             # DROP_WHOLE=0 (or a dropout that misfired) leaves every trainable row tagged, so the
             # model never sees the bare prompt, never learns p(a | no tag), and guidance at
             # inference -- which subtracts an unconditional forward pass -- is undefined. Nothing
@@ -308,6 +330,9 @@ class QualityTaggedDataset:
         q = self._tags.tag_for_row(index)
         item = dict(self._dataset[index])
         item[QUALITY_KEY] = q
+        if self._tags.domain is not None:
+            # Bounds were checked by tag_for_row above; the arrays are same-shape by __init__.
+            item[DOMAIN_ROW_KEY] = int(self._tags.domain[index])
         return item
 
 
@@ -375,9 +400,20 @@ class AxisQualityConditioning(_transforms.DataTransformFn):
                 f"{NOT_TRAINABLE} is the not-trainable sentinel and must never reach the prompt; "
                 f"any other value means the artifact was built with a different bin count."
             )
+        domain_txt = None
+        if DOMAIN_ROW_KEY in data:
+            d = int(np.asarray(data[DOMAIN_ROW_KEY]).reshape(-1)[0])
+            if d not in (0, 1):
+                raise ValueError(
+                    f"domain bin {d} is neither 0 (sim) nor 1 (real); the artifact's domain "
+                    f"array was built with a different encoding than this transform renders."
+                )
+            domain_txt = DOMAIN_REAL if d else DOMAIN_SIM
         if q == NO_TAG:
-            return data
-        return {**data, "prompt": apply_metadata(data["prompt"], q, None)}
+            if domain_txt is None:
+                return data
+            return {**data, "prompt": apply_metadata(data["prompt"], None, None, domain=domain_txt)}
+        return {**data, "prompt": apply_metadata(data["prompt"], q, None, domain=domain_txt)}
 
 
 # The worst-case discrete state: pi0.5 serialises 32 digitized ints into the prompt
@@ -408,6 +444,7 @@ def check_token_budget(
     *,
     state_dim: int = 32,
     q: int | None = 5,
+    domain: str | None = None,
     tokenizer=None,
 ) -> int:
     """Tokenize every corpus prompt WITH the tag and RAISE if any exceeds `max_token_len`.
@@ -450,7 +487,7 @@ def check_token_budget(
     margin = max_token_len
     worst = prompts[0]
     for prompt in prompts:
-        text = prompt if q is None else apply_metadata(prompt, int(q), None)
+        text = prompt if q is None else apply_metadata(prompt, int(q), None, domain=domain)
         _, mask = probe.tokenize(text, state=state)
         n = int(np.asarray(mask).sum())
         if n >= probe_max_len:
