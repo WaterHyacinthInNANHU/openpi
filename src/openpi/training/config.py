@@ -4026,6 +4026,28 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="Devon018/Franka-Datasets-v2"),
         ),
     ),
+    TrainConfig(
+        # serve-only config for the AXIS ONE-PHASE co-train ckpts (branch
+        # box/cotrain-vfz-resume-20260902, configs pi05_axis_onephase_{bc,cfg}, 2026-09-08):
+        # pi05_droid init + LoRA, horizon 15, 48 real : 16 sim, centre-cropped frames, and --
+        # unlike cotrain/realign -- the stock DROID norm stats (<ckpt>/assets/droid/norm_stats.json,
+        # byte-identical to pi05_droid's). So: same as pi05_cotrain_franka_serve except asset_id.
+        # The cfg twin was trained with EVERY real prompt ending "\nDomain: real\nQuality: 5";
+        # the dashboard's CFG box with "Domain: real" ticked appends exactly that; guidance 0.
+        name="pi05_onephase_franka_serve",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfPbcDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="droid"),
+        ),
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
