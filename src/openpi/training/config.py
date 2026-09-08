@@ -2713,6 +2713,23 @@ _CONFIGS = [
         roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
         ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
     ),
+    # CFG-pretrain + PLAIN finetune (owner request 2026-09-09): completes the 2x2 attribution
+    # design {pretrain: bc,cfg} x {finetune: plain,tagged}. bc+plain = the bc baseline;
+    # bc+tagged = the bct control; cfg+tagged = cfgpt. THIS arm (cfg+plain) isolates whether
+    # conditioned pretraining deposits value that survives WITHOUT the tag protocol downstream --
+    # i.e. the value of pretraining-phase tagging alone. Identical to qual_v2_cfg except
+    # quality_tag=None (plain prompts); served bare.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgnp",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/libero5k_d8_cfg_phase/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
     _axis_heldout_multitask_config(
         num_train_steps=heldout_epoch_steps(
             5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
