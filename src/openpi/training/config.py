@@ -3485,24 +3485,24 @@ _CONFIGS = [
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2",
     ),
-    # DURATION-quality CFG ablation ("is time duration the quality?"). Byte-parallel to the
-    # cfgpt_s43 twin above EXCEPT the init, which names the quality_dur.npz pretrain
-    # (libero5k_d8_cfg_dur: episode tag = global quintile of INVERSE trainable duration,
-    # H(q|task)/H(q)=0.692, same seed-0 dropout stream as quality_phase.npz -- parity-checked).
-    # Same tagged-twin convention: quality_tag=5, norm stats pinned to the untagged qual_v2
-    # twin (a tagged config must not run compute_norm_stats). Default seed 42, matching the
-    # original cfgpt arm rather than the s43 repeat.
+    # DURATION-quality CFG ablation ("is time duration the quality?"), SERVER-2 twin. Same
+    # tagged-twin convention as bct_s43 above (quality_tag=5, norm stats pinned to the
+    # untagged qual_v2 twin -- a tagged config must not run compute_norm_stats), but the
+    # init names the quality_dur.npz pretrain (libero5k_d8_cfg_dur: episode tag = global
+    # quintile of INVERSE trainable duration, H(q|task)/H(q)=0.692, same enumeration and
+    # seed-0 dropout stream as quality_phase.npz -- parity-checked on s2). Default seed 42,
+    # matching the original cfgpt arm rather than the s43 repeat.
     _axis_heldout_multitask_config(
         num_train_steps=heldout_epoch_steps(
-            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
-        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
         name="pi05_axis_heldout_qual_v2_cfgdur",
         eef_action=False,
         freeze_vision=False,
-        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
                   "libero5k_d8_cfg_dur/20604/params",
-        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
-        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2",
     ),
