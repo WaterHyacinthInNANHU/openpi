@@ -2497,6 +2497,28 @@ _CONFIGS = [
         init_base=True,
         save_interval=2_000, keep_period=2_000,
     ),
+    # REALALIGN-FIXED two-phase arms (2026-09-09). Stage 1 of the drag recipe on the FIXED
+    # re-aligned sim corpus, from pi05_base -- the same init as the base_realonly baseline, so
+    # the three-model comparison (none / BC-sim / CFG-sim pretrain) differs ONLY in stage 1.
+    # DROID norm stats via droid_assets: all three models and both stages share the baseline's
+    # exact normalisation (gate: measure fixed-corpus saturation before launch; the fallback is
+    # own stats carried through both stages). Vision frozen in stage 1 only; MolmoBot
+    # photometric aug on the 16:9 renders; cfg = phase-reward rank quintiles, PURE conditioning
+    # (no dropout, serve "\nQuality: 5" w=0).
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=20_000, center_crop=True,
+        name="pi05_axis_realignfx_lora_bc", lora=True, freeze_vision=True,
+        init_base=True, droid_assets=True, own_norm_stats=True,
+        action_horizon=15, sim_image_aug=True,
+        save_interval=5_000,
+    ),
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=20_000, center_crop=True,
+        name="pi05_axis_realignfx_lora_cfg", lora=True, freeze_vision=True,
+        init_base=True, droid_assets=True, own_norm_stats=True,
+        action_horizon=15, sim_image_aug=True, quality_required=True,
+        save_interval=5_000,
+    ),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
     # measured against the full-data baseline it changes two things at once -- which rows, and how
     # many. This arm keeps the SAME NUMBER of rows drawn uniformly at random, so the only remaining
@@ -4469,6 +4491,66 @@ _CONFIGS = [
         save_interval=2_000,
         keep_period=2_000,
         log_interval=100,
+    ),
+    # REALALIGN-FIXED stage-2 twins: byte-identical to the base_realonly / realign ft recipe,
+    # initialised from the FIXED stage-1 finals. DROID norm stats (gs assets, cache-resolved)
+    # keep train/serve normalisation identical to the baseline's.
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_bc",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_bc/realignfx_lora_bc/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_cfg",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+            quality_tag=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_cfg/realignfx_lora_cfg/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
