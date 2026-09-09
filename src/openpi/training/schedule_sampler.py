@@ -4,11 +4,13 @@ ONLINE TIER. There is deliberately NO randomness here: the arm's sampling was de
 (`axis.dataset.build_index_schedule`), so "what did step k train on?" is answered by reading row k
 of a file, and samples-seen is a fact on disk rather than a reconstruction from RNG state.
 
-That makes an exact resume EXPRESSIBLE (`rows_for_step(k)`) but does not by itself deliver one:
-openpi checkpoints no data-loader position (`checkpoints.restore_state` drops its `data_loader`
-argument), so a resumed run replays the schedule from row 0 while the optimiser continues. Until
-a start offset is plumbed through `create_data_loader`, a died arm is restarted clean -- which is
-already what conf/experiments/onelayer_v3_stage1_arms.toml tells you to do, for the same reason.
+That makes an exact resume EXPRESSIBLE (`rows_for_step(k)`), and feat/loader-resume now DELIVERS
+one: `state_dict`/`load_state_dict` below persist the consumed flat offset (= step*batch) into a
+JSON sidecar next to the orbax checkpoint (`checkpoints.save_loader_state`), and a resume with that
+sidecar continues the replay at the exact offset instead of restarting at row 0. WITHOUT a sidecar
+(old checkpoints) `data_loader._check_schedule_resume` still refuses the resume, so a died arm
+lacking one is restarted clean -- which is what conf/experiments/onelayer_v3_stage1_arms.toml tells
+you to do, for the same reason.
 
 The artifact holds an int64 `(total_steps, batch)` block of flat dataset indices plus a JSON
 `meta` string. Row t IS the batch trained at step t, which is why this class is itself the torch
@@ -33,6 +35,11 @@ class ScheduleSampler(torch.utils.data.Sampler[int]):
 
     def __init__(self, path: str | pathlib.Path):
         self.path = pathlib.Path(path)
+        # `_consumed` is the number of flat rows yielded so far (= step * batch); `_resume_skip`
+        # is the one-shot offset a resume installs. Both stay 0 for an un-resumed run, so its
+        # emitted sequence is byte-identical to before. See loader_resume_test.py.
+        self._consumed = 0
+        self._resume_skip = 0
         with np.load(self.path, allow_pickle=False) as z:
             rows = z["rows"]
             if not np.issubdtype(rows.dtype, np.integer):
@@ -160,5 +167,50 @@ class ScheduleSampler(torch.utils.data.Sampler[int]):
         return self.total_steps * self.batch
 
     def __iter__(self):
-        # Row-major, no generator, no epoch counter: the order is the artifact's.
-        yield from self._rows.reshape(-1).tolist()
+        # Row-major, no generator, no epoch counter: the order is the artifact's. A resume skips
+        # the first `_resume_skip` rows (the step*batch already trained) so it continues the flat
+        # sequence at the exact consumed offset instead of replaying the schedule from row 0.
+        flat = self._rows.reshape(-1).tolist()
+        skip = self._resume_skip
+        self._resume_skip = 0  # one-shot: only the first pass after a resume is skipped into
+        self._consumed = skip
+        for r in flat[skip:]:
+            self._consumed += 1
+            yield r
+
+    def checkpoint_state(self, consumed_rows: int) -> dict:
+        """The sidecar for a run that has consumed exactly `consumed_rows` flat rows (= step*batch).
+
+        Takes the count as an argument so `checkpoints.save_loader_state` can pass the
+        AUTHORITATIVE `step * batch` rather than this sampler's yield count, which prefetching
+        workers run ahead of. `total_steps`/`batch`/`n_rows` bind the sidecar to THIS artifact so a
+        resume onto a different schedule raises rather than replaying the wrong rows."""
+        return {
+            "kind": "schedule",
+            "total_steps": int(self.total_steps),
+            "batch": int(self.batch),
+            "n_rows": int(self._rows.size),
+            "consumed": int(consumed_rows),
+        }
+
+    def state_dict(self) -> dict:
+        """The LIVE position from this sampler's own yield count (`consumed` = rows yielded)."""
+        return self.checkpoint_state(self._consumed)
+
+    def load_state_dict(self, state) -> None:
+        """Restore the flat offset so the next `__iter__` resumes at `consumed` rather than row 0.
+
+        The schedule IS the experiment's record of what was seen, so a sidecar whose shape does not
+        match this artifact is refused: it was written against a different (steps, batch) block and
+        its `consumed` offset would land on the wrong rows."""
+        if str(state.get("kind")) != "schedule":
+            raise ValueError(f"ScheduleSampler.load_state_dict got a {state.get('kind')!r} sidecar, not 'schedule'")
+        for key, mine in (("total_steps", self.total_steps), ("batch", self.batch), ("n_rows", self._rows.size)):
+            if int(state[key]) != int(mine):
+                raise ValueError(
+                    f"loader_state {key}={int(state[key])} != this schedule's {int(mine)}; the "
+                    f"sidecar was written against a different artifact and its consumed offset "
+                    f"would replay the wrong rows."
+                )
+        self._resume_skip = int(state["consumed"])
+        self._consumed = int(state["consumed"])

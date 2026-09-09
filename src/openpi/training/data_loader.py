@@ -280,6 +280,7 @@ def create_data_loader(
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
     resuming: bool = False,
+    loader_state: dict | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -292,9 +293,14 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
         resuming: Whether this run is actually resuming from a checkpoint (not merely
             `config.resume` -- see scripts/train.py's `initialize_checkpoint_dir`, which also
-            covers the "resume requested but no checkpoint exists yet" case). Only consulted by
-            the index-schedule path, which must refuse to resume: see ScheduleSampler's module
-            docstring and `_check_schedule_resume`.
+            covers the "resume requested but no checkpoint exists yet" case). Consulted by the
+            index-schedule path and the CFG (quality) path, which refuse to resume UNLESS a
+            `loader_state` sidecar is supplied -- see `_check_schedule_resume` /
+            `_check_quality_resume`.
+        loader_state: the dataloader-position sidecar restored from the resumed checkpoint
+            (`checkpoints.load_loader_state`), or None. When present it both UNLOCKS the resume
+            guards and is applied to the sampler so the row permutation continues at the exact
+            consumed offset instead of restarting at epoch 0 (feat/loader-resume).
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
@@ -324,6 +330,7 @@ def create_data_loader(
         framework=framework,
         num_train_steps=config.num_train_steps,
         resuming=resuming,
+        loader_state=loader_state,
     )
 
 
@@ -430,7 +437,9 @@ def _bin_row_share(meta: dict) -> dict:
     return {str(b): round(int(c) / total, 4) for b, c in sorted(counts.items(), key=lambda kv: int(kv[0]))}
 
 
-def _check_quality_resume(quality_path: str, resuming: bool) -> None:
+def _check_quality_resume(
+    quality_path: str, resuming: bool, loader_state: dict | None = None, *, seed: int | None = None
+) -> None:
     """A resume restarts the row permutation at epoch 0 while the optimiser continues from step k.
 
     The CFG arm's ONLY claim is coverage neutrality: it draws exactly the rows the round-1 control
@@ -449,18 +458,41 @@ def _check_quality_resume(quality_path: str, resuming: bool) -> None:
     Note this is a DIFFERENT mechanism from `_check_schedule_resume`'s -- the schedule arms replay
     an artifact, this arm draws a permutation -- but the same consequence and the same cause: no
     loader position is checkpointed. Both refuse rather than warn.
+
+    THE HINGE (feat/loader-resume). A resume is now ALLOWED, but ONLY when a `loader_state` sidecar
+    written next to the resumed checkpoint is present AND belongs to this run. `RowSampler` gained
+    `state_dict`/`load_state_dict`, and the permutation is a pure function of (seed, epoch), so a
+    sidecar recording `{seed, epoch, consumed_in_epoch}` reconstructs the exact remaining row
+    sequence -- coverage stays byte-identical to the control's. The sidecar's seed is checked
+    against the config's here (a different seed is a different permutation); its row count is
+    checked against the actual row plan later, in `RowSampler.load_state_dict`. With NO sidecar
+    (old checkpoints) the original refusal stands, so nothing silently regresses to the epoch-0
+    restart.
     """
-    if resuming:
+    if not resuming:
+        return
+    if loader_state is None:
         raise ValueError(
-            f"config.resume is set together with pretrain_quality_path={quality_path!r}, but "
-            f"openpi checkpoints do not save data-loader position (checkpoints.restore_state "
-            f"drops its data_loader argument): RowSampler restarts its epoch counter at 0, so a "
-            f"resume at step k over an N-step budget would draw perm[0:k*B] and then "
-            f"perm[0:(N-k)*B] -- a union of max(k, N-k)*B unique rows instead of N*B. A resume at "
-            f"the midpoint halves this arm's corpus coverage to ~50% while its whole claim is "
-            f"that coverage is IDENTICAL to the round-1 control's. Restart the run clean instead "
-            f"of resuming -- the same standing instruction the schedule arms carry in "
-            f"conf/experiments/onelayer_v3_round2_cfg_arms.toml."
+            f"config.resume is set together with pretrain_quality_path={quality_path!r}, but no "
+            f"loader_state sidecar was found next to the resumed checkpoint. Without it openpi "
+            f"restores no data-loader position: RowSampler would restart its epoch counter at 0, "
+            f"so a resume at step k over an N-step budget draws perm[0:k*B] and then "
+            f"perm[0:(N-k)*B] -- a union of max(k, N-k)*B unique rows instead of N*B, halving this "
+            f"arm's corpus coverage at the midpoint while its whole claim is that coverage is "
+            f"IDENTICAL to the round-1 control's. Either resume a checkpoint that carries a "
+            f"loader_state.json (feat/loader-resume writes one at every save), or restart clean "
+            f"per conf/experiments/onelayer_v3_round2_cfg_arms.toml."
+        )
+    if str(loader_state.get("kind")) != "row":
+        raise ValueError(
+            f"loader_state sidecar next to the resumed checkpoint is kind={loader_state.get('kind')!r}, "
+            f"but the CFG arm draws a RowSampler ('row'). The sidecar belongs to a different arm."
+        )
+    if seed is not None and int(loader_state.get("seed")) != int(seed):
+        raise ValueError(
+            f"loader_state seed {int(loader_state.get('seed'))} != this run's config seed {int(seed)}. "
+            f"The row permutation is a pure function of (seed, epoch), so resuming under a different "
+            f"seed would continue a DIFFERENT permutation and void the arm's coverage-identity claim."
         )
 
 
@@ -509,7 +541,7 @@ def _check_stage2_quality_resume(resuming: bool) -> None:
         )
 
 
-def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
+def _check_schedule_resume(schedule_path: str, resuming: bool, loader_state: dict | None = None) -> None:
     """A resume replays the schedule from row 0 while the optimiser continues from step k.
 
     openpi checkpoints no data-loader position (`checkpoints.restore_state` drops its
@@ -517,18 +549,32 @@ def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
     whose ramp only starts at `ramp_start_step ~= 0.85 * num_train_steps`, any resume before the
     last ~15% of training means the ramp is never reached and the arm silently degenerates into
     the uniform control.
+
+    THE HINGE (feat/loader-resume). A resume is now ALLOWED, but ONLY when a `loader_state` sidecar
+    is present next to the resumed checkpoint. `ScheduleSampler` gained `state_dict`/
+    `load_state_dict`, and because its replay is a deterministic flat sequence, a sidecar recording
+    `consumed` (= step*batch) lets the resumed run continue at the exact offset -- so the anneal
+    ramp IS reached. The sidecar's (total_steps, batch, n_rows) are checked against the artifact in
+    `ScheduleSampler.load_state_dict`. With NO sidecar the original refusal stands.
     """
-    if resuming:
+    if not resuming:
+        return
+    if loader_state is None:
         raise ValueError(
-            f"config.resume is set together with pretrain_schedule_path={schedule_path!r}, but "
-            f"openpi checkpoints do not save data-loader position (checkpoints.restore_state "
-            f"drops its data_loader argument): a resume at step k would replay the schedule from "
-            f"row 0 while the optimiser continues from k. For the anneal arm "
-            f"(ramp_start_step ~= 0.85 * num_train_steps) this means the high-quality ramp is "
-            f"never reached unless the resume happens in the last ~15% of training, silently "
-            f"degenerating the arm into the plain control. Restart the run clean instead of "
-            f"resuming -- this is the same standing instruction round 1 gives in "
-            f"conf/experiments/onelayer_v3_stage1_arms.toml."
+            f"config.resume is set together with pretrain_schedule_path={schedule_path!r}, but no "
+            f"loader_state sidecar was found next to the resumed checkpoint. Without it a resume at "
+            f"step k replays the schedule from row 0 while the optimiser continues from k. For the "
+            f"anneal arm (ramp_start_step ~= 0.85 * num_train_steps) the high-quality ramp is then "
+            f"never reached unless the resume is in the last ~15% of training, silently "
+            f"degenerating the arm into the plain control. Either resume a checkpoint that carries "
+            f"a loader_state.json (feat/loader-resume writes one at every save), or restart clean "
+            f"per conf/experiments/onelayer_v3_stage1_arms.toml."
+        )
+    if str(loader_state.get("kind")) != "schedule":
+        raise ValueError(
+            f"loader_state sidecar next to the resumed checkpoint is kind={loader_state.get('kind')!r}, "
+            f"but a schedule arm replays a ScheduleSampler ('schedule'). The sidecar belongs to a "
+            f"different arm."
         )
 
 
@@ -620,6 +666,7 @@ def create_torch_data_loader(
     framework: str = "jax",
     num_train_steps: int | None = None,
     resuming: bool = False,
+    loader_state: dict | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -733,10 +780,12 @@ def create_torch_data_loader(
         # `repack_transforms.inputs`, so an entry there too would tag twice.
         from openpi.training import quality_conditioning
 
-        # RAISES. The row permutation this arm shares with the control restarts at epoch 0 on a
-        # resume while the optimiser continues from step k, so a mid-run resume silently halves
-        # the coverage the arm's entire claim rests on. Checked first, before anything expensive.
-        _check_quality_resume(quality_path, resuming)
+        # RAISES on a resume WITHOUT a loader_state sidecar. The row permutation this arm shares
+        # with the control restarts at epoch 0 on such a resume while the optimiser continues from
+        # step k, silently halving coverage. WITH a valid sidecar (seed matches here, row count
+        # matches at RowSampler.load_state_dict) the resume is allowed and the permutation is
+        # continued at the exact offset. Checked first, before anything expensive.
+        _check_quality_resume(quality_path, resuming, loader_state, seed=seed)
         tags = quality_conditioning.QualityTags(quality_path)
         # The filename is the only thing separating cfg_v2 from cfg_phase: one config name, one
         # artifact structure, two rewards. Checked before anything expensive happens.
@@ -850,10 +899,11 @@ def create_torch_data_loader(
                         f"({weights_path}) are configured; the schedule already encodes the "
                         f"supervision, so this run would be two arms at once"
                     )
-                # openpi checkpoints no loader position (checkpoints.restore_state drops its
-                # data_loader argument), so a resume at step k would replay the schedule from
-                # row 0 while the optimiser continues from k -- see `_check_schedule_resume`.
-                _check_schedule_resume(schedule_path, resuming)
+                # RAISES on a resume WITHOUT a loader_state sidecar (a resume at step k would then
+                # replay the schedule from row 0 while the optimiser continues from k). WITH a
+                # valid sidecar the resume is allowed and applied below -- see
+                # `_check_schedule_resume`.
+                _check_schedule_resume(schedule_path, resuming, loader_state)
                 sampler = ScheduleSampler(schedule_path)
                 # Bind the artifact's own content to the arm this config's NAME promises: nothing
                 # else ties `pi05_axis_drop`/`pi05_axis_anneal` to the file handed to them at
@@ -871,6 +921,16 @@ def create_torch_data_loader(
                 sampler.check_dataset_rows(len(dataset), data_config.pretrain_roots_index)
                 if num_train_steps is not None:
                     sampler.check_num_train_steps(num_train_steps)
+                # Resume: continue the flat replay at the checkpointed offset. Applied AFTER the
+                # artifact-binding checks so a mismatched schedule is caught before the offset is
+                # trusted; load_state_dict itself refuses a sidecar of a different shape.
+                if loader_state is not None:
+                    sampler.load_state_dict(loader_state)
+                    logging.info(
+                        "index schedule resume: continuing at consumed=%d rows (step=%d at batch %d)",
+                        int(loader_state["consumed"]), int(loader_state["consumed"]) // sampler.batch,
+                        sampler.batch,
+                    )
                 logging.info(
                     "index schedule %s: mode=%s reward=%s steps=%d batch=%d keep_fraction=%s "
                     "unique_episodes=%s unique_frames=%s epochs=%.2f seed=%s config_hash=%s",
@@ -904,6 +964,18 @@ def create_torch_data_loader(
             if not schedule_path:
                 # The schedule IS the sampler; only the uniform arms plan their own rows.
                 sampler = slb_variant_sampler.RowSampler(rows, seed=seed)
+                # Resume (CFG arm, and any uniform pretrain arm that carries a sidecar): continue
+                # the (seed, epoch) permutation at the exact consumed offset. load_state_dict
+                # validates seed + row count against this plan, so a sidecar from a different run
+                # or corpus raises rather than resuming onto the wrong rows.
+                if loader_state is not None:
+                    sampler.load_state_dict(loader_state)
+                    logging.info(
+                        "pretrain row resume: continuing seed=%d epoch=%d at consumed_in_epoch=%d "
+                        "(of %d rows)",
+                        int(loader_state["seed"]), int(loader_state["epoch"]),
+                        int(loader_state["consumed_in_epoch"]), len(rows),
+                    )
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
@@ -1119,6 +1191,23 @@ class RLDSDataLoader:
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
+def resumable_sampler(data_loader: DataLoader):
+    """The torch Sampler backing `data_loader` IF it supports checkpoint/resume, else None.
+
+    Only the two coverage-critical samplers this project builds -- `slb_variant_sampler.RowSampler`
+    (CFG + uniform pretrain) and `schedule_sampler.ScheduleSampler` (drop/anneal) -- expose
+    `checkpoint_state`/`load_state_dict`. Every other data path (RLDS, plain shuffle, the SLB
+    variant/AWR sampler, stage-2's PresentationSampler) returns None, so the sidecar machinery
+    no-ops for them and their behaviour is unchanged."""
+    inner = getattr(data_loader, "_data_loader", None)
+    if not isinstance(inner, TorchDataLoader):
+        return None
+    sampler = inner.torch_loader.sampler
+    if hasattr(sampler, "checkpoint_state") and hasattr(sampler, "load_state_dict"):
+        return sampler
+    return None
+
+
 class DataLoaderImpl(DataLoader):
     def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
         self._data_config = data_config
@@ -1126,6 +1215,14 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    @property
+    def local_batch_size(self) -> int | None:
+        """Rows the sampler emits per training step, for the exact step*batch sidecar offset."""
+        inner = self._data_loader
+        if isinstance(inner, TorchDataLoader):
+            return int(inner.torch_loader.batch_size)
+        return None
 
     def __iter__(self):
         for batch in self._data_loader:

@@ -255,11 +255,21 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # Dataloader-position resume (feat/loader-resume). Read the sidecar written next to the
+    # resumed checkpoint BEFORE building the loader: it both unlocks the CFG/schedule resume guards
+    # and is applied to the sampler so the row permutation continues at the exact consumed offset
+    # instead of restarting at epoch 0. None (no sidecar / not resuming) keeps the original
+    # behaviour -- the guards still refuse a resume of those arms, nothing else is affected.
+    loader_state = _checkpoints.load_loader_state(checkpoint_manager, None) if resuming else None
+    if loader_state is not None:
+        logging.info(f"Restoring dataloader position from sidecar: {loader_state}")
+
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
         resuming=resuming,
+        loader_state=loader_state,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)

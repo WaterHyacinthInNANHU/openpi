@@ -163,22 +163,104 @@ class RowSampler(torch.utils.data.Sampler[int]):
         self._rows = torch.as_tensor(np.asarray(rows), dtype=torch.long)
         self._num_samples = int(num_samples) if num_samples is not None else len(self._rows)
         self._seed = int(seed)
+        # `_epoch` is the epoch index the NEXT `__iter__` will draw (epoch e uses seed+e). It is
+        # NOT incremented before the draw the way the pre-resume code did: keeping it stable until
+        # the iterator actually starts lets `state_dict` report the epoch currently being consumed
+        # even when called between `__iter__` calls. `_cur_epoch`/`_consumed_in_epoch` track the
+        # LIVE position (the one a mid-run checkpoint must capture), and `_resume_skip` is the
+        # one-shot mid-epoch skip a resume installs. See loader_resume_test.py.
         self._epoch = 0
+        self._cur_epoch = 0
+        self._consumed_in_epoch = 0
+        self._resume_skip = 0
 
     def __len__(self) -> int:
         return self._num_samples
 
-    def __iter__(self):
+    def _sequence_for_epoch(self, epoch: int) -> list[int]:
+        """Epoch `epoch`'s row sequence -- the pre-resume `__iter__` body, factored out unchanged.
+
+        A pure function of (seed, epoch, rows): `torch.randperm` under a manual-seeded generator is
+        deterministic, which is exactly why a resumed run can reconstruct any epoch's permutation
+        from the checkpointed (seed, epoch) alone, with no hidden RNG state to carry.
+        """
         gen = torch.Generator()
-        gen.manual_seed(self._seed + self._epoch)
-        self._epoch += 1
+        gen.manual_seed(self._seed + int(epoch))
         perm = torch.randperm(len(self._rows), generator=gen)
         if self._num_samples > len(perm):
             extra = torch.randint(len(self._rows), (self._num_samples - len(perm),), generator=gen)
             pos = torch.cat([perm, extra])
         else:
             pos = perm[: self._num_samples]
-        yield from self._rows[pos].tolist()
+        return self._rows[pos].tolist()
+
+    def __iter__(self):
+        epoch = self._epoch
+        self._cur_epoch = epoch
+        skip = self._resume_skip
+        self._resume_skip = 0  # one-shot: only the first epoch after a resume is skipped into
+        seq = self._sequence_for_epoch(epoch)
+        # Advance so the NEXT `__iter__` (the loader re-iters per epoch) draws epoch+1. Done before
+        # yielding so a fully-consumed epoch leaves `_epoch` pointing at the next one regardless of
+        # how the caller stops iterating.
+        self._epoch = epoch + 1
+        self._consumed_in_epoch = skip
+        for r in seq[skip:]:
+            self._consumed_in_epoch += 1
+            yield r
+
+    def checkpoint_state(self, consumed_rows: int) -> dict:
+        """The sidecar for a run that has consumed exactly `consumed_rows` rows total.
+
+        Split into (epoch, consumed_in_epoch) here so the caller can pass an AUTHORITATIVE count
+        -- `step * batch` -- rather than this sampler's own yield count, which with prefetching
+        workers runs ahead of the trained step. `checkpoints.save_loader_state` uses the step so
+        the persisted position is exact regardless of `num_workers`, and the crashed-run salvage
+        reconstructs it analytically from the same arithmetic. `state_dict` below is the counting
+        path the isolated coverage test drives."""
+        L = int(self._num_samples)
+        c = int(consumed_rows)
+        return {
+            "kind": "row",
+            "seed": int(self._seed),
+            "n_rows": int(len(self._rows)),
+            "num_samples": L,
+            "epoch": c // L,
+            "consumed_in_epoch": c % L,
+        }
+
+    def state_dict(self) -> dict:
+        """The LIVE dataloader position from this sampler's own yield count.
+
+        `epoch`+`consumed_in_epoch` name the point mid-permutation; `seed`+`n_rows`+`num_samples`
+        bind the sidecar to the run it was written for (`load_state_dict` refuses a mismatch).
+        Assumes every earlier epoch was fully consumed (`num_samples` rows), which the training
+        loader guarantees -- it iterates each epoch to exhaustion before re-`__iter__`-ing."""
+        return self.checkpoint_state(self._cur_epoch * int(self._num_samples) + self._consumed_in_epoch)
+
+    def load_state_dict(self, state: Mapping) -> None:
+        """Restore the position so the NEXT `__iter__` resumes mid-epoch instead of at epoch 0.
+
+        Validates the sidecar belongs to THIS run: a wrong seed draws a DIFFERENT permutation (so
+        the coverage-identity claim silently breaks), and a wrong row count means the permutation
+        indexes a different corpus. Both raise rather than resume onto the wrong rows."""
+        if str(state.get("kind")) != "row":
+            raise ValueError(f"RowSampler.load_state_dict got a {state.get('kind')!r} sidecar, not 'row'")
+        if int(state["seed"]) != self._seed:
+            raise ValueError(
+                f"loader_state seed {int(state['seed'])} != this run's seed {self._seed}; the "
+                f"permutation is a pure function of (seed, epoch), so a different seed would resume "
+                f"onto a DIFFERENT row order and void the coverage-identity claim."
+            )
+        if int(state["n_rows"]) != len(self._rows):
+            raise ValueError(
+                f"loader_state row count {int(state['n_rows'])} != this run's {len(self._rows)}; "
+                f"the checkpointed permutation indexes a different corpus."
+            )
+        self._epoch = int(state["epoch"])
+        self._cur_epoch = int(state["epoch"])
+        self._resume_skip = int(state["consumed_in_epoch"])
+        self._consumed_in_epoch = int(state["consumed_in_epoch"])
 
 
 def row_weight_map(rows: np.ndarray, weights: np.ndarray) -> dict[int, float]:

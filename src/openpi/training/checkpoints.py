@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import json
 import logging
 from typing import Protocol
 
@@ -15,6 +16,13 @@ from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+# The dataloader-position sidecar, written next to each orbax checkpoint (feat/loader-resume). It
+# is a plain JSON file in the step directory, deliberately OUTSIDE the orbax item tree: orbax
+# restores by named item, so a loose file alongside is invisible to it, and this keeps the resume
+# machinery from depending on orbax internals. Absent for every checkpoint written before this
+# feature, which is exactly the signal the resume guards use to fall back to their refusal.
+LOADER_STATE_FILENAME = "loader_state.json"
 
 
 def initialize_checkpoint_dir(
@@ -84,6 +92,65 @@ def save_state(
         "params": {"params": params},
     }
     checkpoint_manager.save(step, items)
+    save_loader_state(checkpoint_manager, data_loader, step)
+
+
+def save_loader_state(
+    checkpoint_manager: ocp.CheckpointManager,
+    data_loader: _data_loader.DataLoader,
+    step: int,
+) -> None:
+    """Persist the dataloader position as a JSON sidecar next to the step's orbax checkpoint.
+
+    No-ops unless the loader is backed by a resumable sampler (RowSampler / ScheduleSampler); every
+    other config writes nothing, so nothing about them changes. The offset stored is the
+    AUTHORITATIVE `step * local_batch_size`, NOT the sampler's own yield count -- with prefetching
+    workers the sampler runs ahead of the trained step, and taking the step makes the resumed
+    position exact for any `num_workers`.
+
+    Best-effort: a failure to write the sidecar is logged and swallowed rather than crashing
+    training, because the only consequence is that a later resume falls back to the guard's refusal
+    (the safe default), never a silent wrong-offset resume.
+    """
+    if jax.process_index() != 0:
+        return
+    sampler = _data_loader.resumable_sampler(data_loader)
+    if sampler is None:
+        return
+    batch = getattr(data_loader, "local_batch_size", None)
+    if not batch:
+        logging.warning("save_loader_state: loader exposes no local_batch_size; skipping sidecar")
+        return
+    state = sampler.checkpoint_state(int(step) * int(batch))
+    try:
+        directory = epath.Path(checkpoint_manager.directory) / str(step)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / LOADER_STATE_FILENAME).write_text(json.dumps(state, indent=2, sort_keys=True))
+        logging.info("save_loader_state: wrote %s for step %d: %s", LOADER_STATE_FILENAME, step, state)
+    except OSError as e:
+        logging.warning("save_loader_state: could not write loader sidecar for step %d: %s", step, e)
+
+
+def load_loader_state(checkpoint_manager: ocp.CheckpointManager, step: int | None) -> dict | None:
+    """Read the dataloader-position sidecar for `step`, or None if the checkpoint has none.
+
+    A missing file is the expected case for any checkpoint written before feat/loader-resume, and
+    it MUST read as None (not an error) so the resume guards can keep refusing on old checkpoints.
+    Distinguishes "absent" (FileNotFoundError -> None) from a genuinely unreadable file (any other
+    OSError propagates) -- the EACCES-swallow defect class this repo has been bitten by seven
+    times: a permission error must not masquerade as "no sidecar", which would silently unblock a
+    fallback resume onto the wrong rows.
+    """
+    if step is None:
+        step = checkpoint_manager.latest_step()
+    if step is None:
+        return None
+    path = epath.Path(checkpoint_manager.directory) / str(step) / LOADER_STATE_FILENAME
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    return json.loads(text)
 
 
 def restore_state(
