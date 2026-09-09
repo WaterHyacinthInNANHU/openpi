@@ -4049,6 +4049,105 @@ _CONFIGS = [
         ),
     ),
     #
+    # REALALIGN LoRA-drag stage 2 (bc lane, 2026-09-07). Same recipe as
+    # pi05_cotrain_franka_lora_10task_pbc_v2 except: init = the stage-1 LoRA-drag checkpoint
+    # (adapters continue on real data; vision unfreezes via get_freeze_filter), norm stats =
+    # the stage-1 corpus's own (shared bc/cfg by construction).
+    TrainConfig(
+        name="pi05_realign_lora_franka_10task_bc",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                filter_dict_path=COTRAIN_FILTER_JSON,
+            ),
+            assets=AssetsConfig(
+                assets_dir="/localdisk/dihong_workspace/openpi/assets/pi05_axis_realign_lora_bc",
+                asset_id="Devon018/Franka-Datasets-v2",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realign_lora_bc/realign_lora_bc/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600,
+            peak_lr=2.5e-5,
+            decay_steps=16_000,
+            decay_lr=2.5e-6,
+        ),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000,
+        keep_period=2_000,
+        log_interval=100,
+    ),
+    #
+    # REALALIGN LoRA-drag stage 2 (cfg lane, 2026-09-07). Same recipe as
+    # pi05_cotrain_franka_lora_10task_pbc_v2 except: init = the stage-1 LoRA-drag checkpoint
+    # (adapters continue on real data; vision unfreezes via get_freeze_filter), norm stats =
+    # the stage-1 corpus's own (shared bc/cfg by construction) , and quality_tag=5.
+    TrainConfig(
+        name="pi05_realign_lora_franka_10task_cfg",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                filter_dict_path=COTRAIN_FILTER_JSON,
+            ),
+            assets=AssetsConfig(
+                assets_dir="/localdisk/dihong_workspace/openpi/assets/pi05_axis_realign_lora_bc",
+                asset_id="Devon018/Franka-Datasets-v2",
+            ),
+            quality_tag=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realign_lora_cfg/realign_lora_cfg/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600,
+            peak_lr=2.5e-5,
+            decay_steps=16_000,
+            decay_lr=2.5e-6,
+        ),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000,
+        keep_period=2_000,
+        log_interval=100,
+    ),
+    #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
     TrainConfig(
