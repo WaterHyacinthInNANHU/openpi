@@ -31,7 +31,12 @@ import torch
 class ScheduleSampler(torch.utils.data.Sampler[int]):
     """The offline schedule, replayed verbatim as a torch row sampler."""
 
-    def __init__(self, path: str | pathlib.Path):
+    def __init__(self, path: str | pathlib.Path, *, start_step: int = 0):
+        # Exact-resume support: yield from step `start_step` onward. Row t IS step t's batch
+        # (see module docstring), so the fast-forward is the entire data-side of a resume.
+        # Bounds are enforced by rows_for_step at the data_loader call site, which also logs
+        # the resumed batch fingerprint.
+        self.start_step = int(start_step)
         self.path = pathlib.Path(path)
         with np.load(self.path, allow_pickle=False) as z:
             rows = z["rows"]
@@ -157,8 +162,9 @@ class ScheduleSampler(torch.utils.data.Sampler[int]):
         return self._rows[t]
 
     def __len__(self) -> int:
-        return self.total_steps * self.batch
+        return (self.total_steps - self.start_step) * self.batch
 
     def __iter__(self):
-        # Row-major, no generator, no epoch counter: the order is the artifact's.
-        yield from self._rows.reshape(-1).tolist()
+        # Row-major, no generator, no epoch counter: the order is the artifact's, from
+        # start_step onward (0 in a fresh run).
+        yield from self._rows[self.start_step:].reshape(-1).tolist()

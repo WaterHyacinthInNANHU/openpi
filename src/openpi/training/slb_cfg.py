@@ -268,6 +268,12 @@ def build_conditioning(
 QUALITY_KEY = "Quality"
 MISTAKE_KEY = "Mistake"
 MISTAKE_YES, MISTAKE_NO = "yes", "no"
+# One-phase co-train (2026-09-08): a third metadata line, "Domain: sim|real", rendered AHEAD of
+# Quality. Sim rows carry their quality quintile; real rows are pinned Quality 5; serving appends
+# f"{DOMAIN_KEY}: {INFER_DOMAIN}" + the quality line, guidance 0.
+DOMAIN_KEY = "Domain"
+DOMAIN_SIM, DOMAIN_REAL = "sim", "real"
+INFER_DOMAIN = DOMAIN_REAL
 INFER_QUALITY = 5          # π0.7 sets quality=max at inference
 INFER_MISTAKE = False
 
@@ -276,10 +282,15 @@ def metadata_enabled() -> bool:
     return os.environ.get("SLB_CFG_METADATA", "0") not in ("0", "", "false", "False")
 
 
-def apply_metadata(prompt, q_ep, mistake, *, drop_quality: bool = False, drop_mistake: bool = False) -> str:
+def apply_metadata(prompt, q_ep, mistake, *, domain: str | None = None,
+                   drop_quality: bool = False, drop_mistake: bool = False) -> str:
     """Append the π0.7 metadata tokens; a dropped component is omitted (its unconditional form).
-    A window that omits BOTH is the bare prompt -- the fully-unconditional branch for CFG."""
+    A window that omits BOTH is the bare prompt -- the fully-unconditional branch for CFG.
+    `domain` (one-phase co-train) precedes the quality line and has no dropout: the one-phase
+    arms are pure conditioning."""
     parts = [str(prompt)]
+    if domain is not None:
+        parts.append(f"{DOMAIN_KEY}: {domain}")
     if q_ep is not None and not drop_quality:
         parts.append(f"{QUALITY_KEY}: {int(q_ep)}")
     if mistake is not None and not drop_mistake:

@@ -343,6 +343,7 @@ def create_data_loader(
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
     resuming: bool = False,
+    start_step: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -387,6 +388,7 @@ def create_data_loader(
         framework=framework,
         num_train_steps=config.num_train_steps,
         resuming=resuming,
+        start_step=start_step,
     )
 
 
@@ -493,7 +495,8 @@ def _bin_row_share(meta: dict) -> dict:
     return {str(b): round(int(c) / total, 4) for b, c in sorted(counts.items(), key=lambda kv: int(kv[0]))}
 
 
-def _check_quality_resume(quality_path: str, resuming: bool) -> None:
+def _check_quality_resume(
+        quality_path: str, resuming: bool, *, exact_resume: bool = False) -> None:
     """A resume restarts the row permutation at epoch 0 while the optimiser continues from step k.
 
     The CFG arm's ONLY claim is coverage neutrality: it draws exactly the rows the round-1 control
@@ -512,7 +515,15 @@ def _check_quality_resume(quality_path: str, resuming: bool) -> None:
     Note this is a DIFFERENT mechanism from `_check_schedule_resume`'s -- the schedule arms replay
     an artifact, this arm draws a permutation -- but the same consequence and the same cause: no
     loader position is checkpointed. Both refuse rather than warn.
+
+    EXCEPTION -- `exact_resume`: when a ScheduleSampler drives the rows AND the loader was
+    fast-forwarded to the restored step, the loader position IS checkpointed (it is the step
+    number; the sampler is RNG-free and step-deterministic) and the quality wrapper itself is
+    stateless, so the refusal's premise does not hold. Gated by the caller to that case only;
+    the RowSampler arms can never set it.
     """
+    if exact_resume:
+        return
     if resuming:
         raise ValueError(
             f"config.resume is set together with pretrain_quality_path={quality_path!r}, but "
@@ -572,7 +583,8 @@ def _check_stage2_quality_resume(resuming: bool) -> None:
         )
 
 
-def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
+def _check_schedule_resume(
+        schedule_path: str, resuming: bool, *, exact_resume: bool = False) -> None:
     """A resume replays the schedule from row 0 while the optimiser continues from step k.
 
     openpi checkpoints no data-loader position (`checkpoints.restore_state` drops its
@@ -580,7 +592,14 @@ def _check_schedule_resume(schedule_path: str, resuming: bool) -> None:
     whose ramp only starts at `ramp_start_step ~= 0.85 * num_train_steps`, any resume before the
     last ~15% of training means the ramp is never reached and the arm silently degenerates into
     the uniform control.
+
+    EXCEPTION -- `exact_resume`: the sampler was fast-forwarded to the restored step, which for
+    a ScheduleSampler is a complete loader position (row t IS step t's batch, no RNG). The
+    anneal ramp is a property of the artifact's row order, so a fast-forwarded resume lands in
+    the ramp exactly where the uninterrupted run would be.
     """
+    if exact_resume:
+        return
     if resuming:
         raise ValueError(
             f"config.resume is set together with pretrain_schedule_path={schedule_path!r}, but "
@@ -648,6 +667,28 @@ def _check_schedule_reward_id(schedule_path: str, sampler_meta: dict) -> None:
     if stem.startswith("schedule_"):
         stem = stem[len("schedule_"):]
     if stem.split("_", 1)[0] not in _SCHEDULE_MODES:
+        # Co-train variants carry mode="cotrain_<variant>" and are published as
+        # `schedule_cotrain_<variant>_<reward>.npz`; bind that name the same way. The plain mix
+        # artifact (mode == "cotrain", e.g. schedule_cotrain_sim25.npz) makes no reward claim
+        # and stays a no-op -- keying on the "cotrain_" prefix of the META mode, not the
+        # filename, so the finished BC artifact is untouched.
+        meta_mode = sampler_meta.get("mode") or ""
+        if stem.startswith("cotrain_") and meta_mode.startswith("cotrain_"):
+            reward_id = sampler_meta.get("reward_id")
+            if reward_id is None:
+                raise ValueError(
+                    f"schedule {schedule_path} carries co-train variant mode {meta_mode!r} but "
+                    f"no 'reward_id' in its meta; rebuild it with "
+                    f"scripts/build_cotrain_schedule_v2.py, which stamps the ranking reward."
+                )
+            expected = f"{meta_mode}_{reward_id}"
+            if stem != expected:
+                raise ValueError(
+                    f"schedule {schedule_path} is named {stem!r} but its own meta reports "
+                    f"mode={meta_mode!r} and reward_id={reward_id!r}, i.e. {expected!r}. The "
+                    f"filename is the only thing separating the two rewards within one arm, so "
+                    f"this run would record itself as {stem!r} while training {expected!r}."
+                )
         return
     mode, reward_id = sampler_meta.get("mode"), sampler_meta.get("reward_id")
     if reward_id is None:
@@ -683,6 +724,7 @@ def create_torch_data_loader(
     framework: str = "jax",
     num_train_steps: int | None = None,
     resuming: bool = False,
+    start_step: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -799,7 +841,10 @@ def create_torch_data_loader(
         # RAISES. The row permutation this arm shares with the control restarts at epoch 0 on a
         # resume while the optimiser continues from step k, so a mid-run resume silently halves
         # the coverage the arm's entire claim rests on. Checked first, before anything expensive.
-        _check_quality_resume(quality_path, resuming)
+        _check_quality_resume(
+            quality_path, resuming,
+            exact_resume=bool(start_step)
+            and bool(getattr(data_config, "pretrain_schedule_path", None)))
         tags = quality_conditioning.QualityTags(quality_path)
         # The filename is the only thing separating cfg_v2 from cfg_phase: one config name, one
         # artifact structure, two rewards. Checked before anything expensive happens.
@@ -812,7 +857,10 @@ def create_torch_data_loader(
         # RAISES on overflow. PaligemmaTokenizer truncates from the right with only a warning, and
         # what it truncates is the `Action:` marker -- for this arm only, because only this arm
         # lengthens the prompt.
-        margin = quality_conditioning.check_token_budget(tags.prompts, model_config.max_token_len)
+        margin = quality_conditioning.check_token_budget(
+            tags.prompts, model_config.max_token_len,
+            # "real" is the longer spelling of the two, so the bound covers both domains.
+            domain=("real" if getattr(tags, "domain", None) is not None else None))
         dataset = quality_conditioning.wrap_and_transform(
             dataset, tags, training_transforms(data_config, skip_norm_stats=skip_norm_stats)
         )
@@ -908,16 +956,82 @@ def create_torch_data_loader(
                 from openpi.training.schedule_sampler import ScheduleSampler
 
                 if weights_path:
-                    raise ValueError(
-                        f"both an index schedule ({schedule_path}) and AWR weights "
-                        f"({weights_path}) are configured; the schedule already encodes the "
-                        f"supervision, so this run would be two arms at once"
+                    # Allowed for a COTRAIN schedule only: there the schedule encodes the
+                    # sim/real mixture (the control's own sampler, shared by both arms) and the
+                    # weights are the treatment. For drop/anneal the schedule IS the supervision
+                    # and the refusal below stands. The mode read here is the artifact's OWN
+                    # meta -- not the config's claim -- so a drop artifact cannot smuggle
+                    # weights in under a cotrain config name or vice versa.
+                    from openpi.training.schedule_sampler import ScheduleSampler as _SS
+
+                    _mode = _SS(schedule_path).meta.get("mode")
+                    if _mode != "cotrain":
+                        raise ValueError(
+                            f"both an index schedule ({schedule_path}, mode={_mode!r}) and AWR "
+                            f"weights ({weights_path}) are configured; the schedule already "
+                            f"encodes the supervision, so this run would be two arms at once"
+                        )
+                    # Bind the FILENAME to the artifact's own reward and role, mirroring the
+                    # schedule check: `awr_weights_cotrain_<reward>.json` is the only thing
+                    # separating the v2 and phase arms under this one config name, and the RAW
+                    # `*_rank` twin (ranking input for the other builders) must never reach the
+                    # loss. Names making no claim (a staging path) are not checked.
+                    import json as _json
+                    import pathlib as _pathlib
+
+                    _wp = _json.loads(_pathlib.Path(weights_path).read_text())
+                    _prov = _wp.get("provenance") or {}
+                    _role = (_prov.get("cotrain") or {}).get("role")
+                    if _role and _role != "loss_weights_normalised":
+                        raise ValueError(
+                            f"AWR weights {weights_path} carry role={_role!r}; the arm must "
+                            f"train on the sim-mean-NORMALISED artifact, not the ranking twin. "
+                            f"Pass the file without the _rank suffix."
+                        )
+                    _stem = _pathlib.Path(weights_path).stem
+                    _rid = _prov.get("reward_id")
+                    if _stem.startswith("awr_weights_cotrain_") and _rid is not None:
+                        _claim = _stem[len("awr_weights_cotrain_"):]
+                        if _claim != str(_rid):
+                            raise ValueError(
+                                f"AWR weights {weights_path} are named for reward {_claim!r} "
+                                f"but were built from reward_id={_rid!r}. The filename is the "
+                                f"only thing separating the v2 and phase arms under one config "
+                                f"name; this run would record itself as {_claim!r} while "
+                                f"training {_rid!r}."
+                            )
+                    _rows_w, _weights_w = pretrain_dataset.plan_rows_and_weights_from_roots(
+                        data_config.pretrain_roots_index,
+                        data_config.pretrain_ranges_path,
+                        weights_path,
                     )
+                    # Dense over the WHOLE flat space; NaN where the schedule never goes, so a
+                    # row outside the planned pool raises rather than training unweighted --
+                    # the same strictness as the round-1 AWR path.
+                    _dense = np.full(len(dataset), np.nan, dtype=np.float32)
+                    _dense[_rows_w] = _weights_w
+                    logging.info(
+                        "cotrain phase weights from %s: n_rows=%d mean=%.4f at_one=%.1f%%",
+                        weights_path, len(_weights_w), float(_weights_w.mean()),
+                        100.0 * float(np.mean(_weights_w == 1.0)),
+                    )
+                    dataset = slb_variant_sampler.StrictWeightedRowDataset(dataset, _dense)
                 # openpi checkpoints no loader position (checkpoints.restore_state drops its
                 # data_loader argument), so a resume at step k would replay the schedule from
                 # row 0 while the optimiser continues from k -- see `_check_schedule_resume`.
-                _check_schedule_resume(schedule_path, resuming)
-                sampler = ScheduleSampler(schedule_path)
+                _check_schedule_resume(schedule_path, resuming,
+                                       exact_resume=bool(start_step))
+                sampler = ScheduleSampler(schedule_path, start_step=start_step)
+                if start_step and start_step < sampler.total_steps:
+                    import hashlib as _hashlib
+
+                    _fp = sampler.rows_for_step(start_step)
+                    logging.info(
+                        "EXACT RESUME: schedule fast-forwarded to step %d; first batch rows "
+                        "sha256=%s head=%s",
+                        start_step, _hashlib.sha256(_fp.tobytes()).hexdigest()[:16],
+                        _fp[:4].tolist(),
+                    )
                 # Bind the artifact's own content to the arm this config's NAME promises: nothing
                 # else ties `pi05_axis_drop`/`pi05_axis_anneal` to the file handed to them at
                 # launch, so a mismatched artifact would otherwise train silently under the wrong

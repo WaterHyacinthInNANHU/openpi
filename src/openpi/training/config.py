@@ -673,8 +673,8 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # fails loudly instead of quietly training the plain control under the arm's name (the only
     # symptom would otherwise be the ABSENCE of the "index schedule" log line).
     schedule_required: bool = False
-    # A named loss-reweighting arm that forgets --data.awr_weights trains the plain BC control
-    # under the arm's name -- which is precisely what happened to the 5k eef awr arms. Fail loud.
+    # Same idiom for the weights artifact: a phase-reward arm that forgets --data.awr_weights
+    # trains the plain-BC co-train under the phase arm's name, silently. Fail at create() instead.
     awr_required: bool = False
     # "drop" / "anneal" for a named schedule arm, or None otherwise. Reaches DataConfig as
     # `pretrain_expected_mode` and is checked against the artifact's own `meta["mode"]` in
@@ -726,6 +726,9 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
     # Emit 9-D joint-position actions (7 joint targets + 2 finger widths) instead of the 8-D DROID
     # velocity slice. Must match the action space the eval controller is run in.
     joint9_action: bool = False
+    # One-phase co-train arms: MolmoBot-style photometric augmentation on SIM frames only,
+    # gated on frame geometry inside the transform -- see policies/sim_image_aug.py.
+    sim_image_aug: bool = False
 
     @override
     def norm_stats_dir(self, assets_dirs: pathlib.Path) -> epath.Path | None:
@@ -763,11 +766,24 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
                 "concatenated pretrain dataset, so it is meaningless without one "
                 "(set $AXIS_PRETRAIN_ROOTS_INDEX)."
             )
-        if self.schedule_path and self.awr_weights:
+        if self.schedule_path and self.awr_weights and self.expected_mode != "cotrain":
+            # For drop/anneal the schedule IS the supervision, so weights on top are two arms at
+            # once and stay refused. A COTRAIN schedule encodes the sim/real MIXTURE -- the
+            # control's own sampler, shared by both arms -- and the weights are the treatment.
+            # The loader still binds expected_mode to the artifact's own meta["mode"], so a
+            # drop artifact under this config, or weights under a drop config, both refuse.
             raise ValueError(
                 "schedule_path and awr_weights are both set. The schedule already encodes the "
                 "supervision (which rows, in what order); combining it with loss reweighting "
-                "would make this run two arms at once."
+                "would make this run two arms at once. (A cotrain-mode schedule is the one "
+                "exception: there the schedule encodes the mixture, not the supervision.)"
+            )
+        if self.awr_required and not self.awr_weights:
+            raise ValueError(
+                "this is a named loss-reweighting arm but awr_weights is not set. Pass "
+                "--data.awr_weights=<artifact path> at launch (built by "
+                "scripts/build_cotrain_phase_weights.py); otherwise this run trains the plain "
+                "BC co-train under the phase arm's name."
             )
         if self.awr_required and not self.awr_weights:
             raise ValueError(
@@ -795,13 +811,21 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
                 "(set $AXIS_PRETRAIN_ROOTS_INDEX)."
             )
         if self.quality_path and self.schedule_path:
-            raise ValueError(
-                "quality_path and schedule_path are both set. CFG's distinguishing property is "
-                "coverage neutrality -- it draws exactly the rows the round-1 control draws, in "
-                "the same order -- and a schedule replaces that draw entirely. Combining them "
-                "would silently give up the one thing that makes this arm comparable to the "
-                "control, and would make the run two arms at once."
-            )
+            # ... unless this is the CO-TRAIN cfg arm. There the mix schedule IS the
+            # control's draw -- the BC baseline replays the same artifact -- so carrying it
+            # PRESERVES the coverage-neutrality this guard protects rather than giving it up:
+            # batches stay byte-identical to the control and the prompt tag is the entire
+            # treatment. The loader still binds expected_mode to the artifact's own meta, so a
+            # drop/anneal artifact under this config refuses as before.
+            if self.expected_mode != "cotrain":
+                raise ValueError(
+                    "quality_path and schedule_path are both set. CFG's distinguishing property "
+                    "is coverage neutrality -- it draws exactly the rows the round-1 control "
+                    "draws, in the same order -- and a schedule replaces that draw entirely. "
+                    "Combining them would silently give up the one thing that makes this arm "
+                    "comparable to the control, and would make the run two arms at once. (The "
+                    "co-train cfg arm is the exception: its schedule IS the control's draw.)"
+                )
         if self.quality_path and self.awr_weights:
             raise ValueError(
                 "quality_path and awr_weights are both set; conditioning and loss reweighting "
@@ -850,9 +874,17 @@ class AxisFrankaPretrainDataConfig(DataConfigFactory):
             quality_inputs = [
                 quality_conditioning.LiberoQualityConditioning(q_ep=int(self.quality_tag))
             ]
+        # One-phase co-train arms: sim-only photometric augmentation, geometry-gated inside
+        # the transform (real square frames pass through untouched).
+        aug_inputs: list = []
+        if self.sim_image_aug:
+            from openpi.policies import sim_image_aug as _sim_aug
+
+            aug_inputs = [_sim_aug.SimImageAug()]
         repack_transform = _transforms.Group(
             inputs=[
                 *quality_inputs,
+                *aug_inputs,
                 _transforms.RepackTransform(
                     {
                         "base_0_rgb": "observation.images.third_person",
@@ -1230,30 +1262,6 @@ def _slb_freeze_filter(freeze_vision: bool):
     if not freeze_vision:
         return base
     return nnx.Any(base, nnx_utils.PathRegex(".*img.*"))
-
-def _pretrain_freeze_filter(freeze_vision: bool):
-    """Freeze the SigLIP vision ENCODER for a full-weight pretrain arm (the `_vfz` twins).
-
-    Scope is MolmoBot-aligned: img/{Transformer,embedding,pos_embedding} freeze (412,442,352
-    params) while img/head -- the projector; their conversion maps it to multi_modal_projector
-    and their "vision_tower" freeze regex does not match it -- stays TRAINABLE (2,361,344
-    params). A bare `.*img.*` (the `_slb_freeze_filter` tower regex) would over-freeze the
-    projector, which is exactly the coverage difference this helper exists to encode.
-
-    Unlike `_slb_freeze_filter` there is no LoRA base here: with `freeze_vision` unset this
-    returns the `freeze_filter` field's default value (`nnx.Nothing()`), so a config built
-    through this helper resolves identically to one built before the kwarg existed (proven by
-    the before/after snapshot at patch time). That the matched params are actually nonzero is
-    asserted by the param-count tripwire in scripts/train.py at startup, and the driver's
-    bit-identity check asserts the complement: img/head MUST move -- a projector that never
-    moves means the filter over-matched again.
-    """
-    if not freeze_vision:
-        return nnx.Nothing()
-    import openpi.shared.nnx_utils as nnx_utils
-
-    return nnx_utils.PathRegex(".*img/(Transformer|embedding|pos_embedding).*")
-
 
 # Knowledge insulation (arXiv:2505.23705), shared by every KI arm so the DROID, AXIS-pretrain
 # and SLB twins are comparable. The FAST token budget is no longer a model field: the ids are
@@ -1781,13 +1789,55 @@ _AXIS_ROUND1_NAME = "pi05_axis_pretrain_eef_paper"
 _AXIS_PRETRAIN_REPO_ID = "Devon018/Franka-Datasets-v2"
 
 
+def _pretrain_freeze_filter(freeze_vision: bool, lora: bool = False):
+    """Freeze the SigLIP vision ENCODER for a full-weight pretrain arm (the `_vfz` twins).
+
+    Scope is MolmoBot-aligned: img/{Transformer,embedding,pos_embedding} freeze (412,442,352
+    params) while img/head -- the projector; their conversion maps it to multi_modal_projector
+    and their "vision_tower" freeze regex does not match it -- stays TRAINABLE (2,361,344
+    params). A bare `.*img.*` (the `_slb_freeze_filter` tower regex) would over-freeze the
+    projector, which is exactly the coverage difference this helper exists to encode.
+
+    With `freeze_vision` unset this returns the `freeze_filter` field's default value
+    (`nnx.Nothing()`), so a config built through this helper resolves identically to one built
+    before the kwarg existed. This box's train.py has no param-count tripwire, so the launch
+    driver must verify the freeze against checkpoints (bit-identity of the frozen subtree,
+    drift of img/head).
+    """
+    import openpi.shared.nnx_utils as nnx_utils
+
+    tower = nnx_utils.PathRegex(".*img/(Transformer|embedding|pos_embedding).*")
+    if lora:
+        # LoRA drag arms: openpi's own LoRA recipe freezes every non-LoRA LLM weight but
+        # leaves the SigLIP tower fully trainable (its params never match the llm freeze);
+        # with freeze_vision the tower is frozen on top. img/head stays trainable either
+        # way -- the same scope as the full-weight _vfz twins, verified by the same
+        # bit-identity proof.
+        base = pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter()
+        return nnx.Any(base, tower) if freeze_vision else base
+    if not freeze_vision:
+        return nnx.Nothing()
+    return tower
+
+
 def _axis_pretrain_config(
     *, num_train_steps: int = 100_000, batch_size: int = 32, knowledge_insulation: bool = False,
     eef: bool = False, paper: bool = False, name: str | None = None,
     schedule_required: bool = False, expected_mode: str | None = None,
     quality_required: bool = False, center_crop: bool = False,
-    norm_stats_from_name: str | None = None, awr_required: bool = False,
+    action_horizon: int | None = None, own_norm_stats: bool = False,
+    awr_required: bool = False, norm_stats_from_name: str | None = None,
+    save_interval: int | None = None, keep_period: int | None = None,
     freeze_vision: bool = False,
+    lora: bool = False,
+    droid_assets: bool = False,
+    warmup_override: int | None = None,
+    sim_image_aug: bool = False,
+    init_base: bool = False,
 ) -> TrainConfig:
     """FULL-WEIGHT pi0.5 pretraining over the whole AXIS Franka corpus on the 8xA100 box.
 
@@ -1887,7 +1937,16 @@ def _axis_pretrain_config(
         ),
         # Full weight: default (non-lora) gemma variants, no freeze_filter.
         model=pi0_config.Pi0Config(
-            pi05=True, action_dim=32, action_horizon=10 if paper else 16,
+            # `action_horizon` overrides the recipe default. The co-train arm sets 15 to match
+            # pi05_droid, the checkpoint it initialises FROM: training a horizon the init was not
+            # produced at is a silent recipe change, not an error. Left None everywhere else, so
+            # the paper arms keep Appendix F Table 10's literal 10.
+            pi05=True, action_dim=32,
+            action_horizon=action_horizon if action_horizon is not None else (10 if paper else 16),
+            # LoRA drag arms: adapters on both transformers; every non-LoRA weight is frozen by
+            # _pretrain_freeze_filter's lora branch. Not combined with knowledge insulation.
+            **({"paligemma_variant": "gemma_2b_lora",
+                "action_expert_variant": "gemma_300m_lora"} if lora else {}),
             **(_KI_MODEL_KWARGS if knowledge_insulation else {}),
         ),
         data=AxisFrankaPretrainDataConfig(
@@ -1903,20 +1962,26 @@ def _axis_pretrain_config(
             # computed over state_eef/action_eef -- EEF positions, axis-angles, OSC deltas. A
             # droid8 arm's columns are joint ANGLES (+-2.4 rad) and joint VELOCITIES (p95 0.39
             # rad/s); normalising the latter by the former is silent, converges, and scales the
-            # policy wrong. Every named config today passes eef=True, so this changes nothing
-            # that exists -- it only stops a droid8 arm from inheriting statistics for columns
-            # it does not have.
-            # An explicit source wins: the d8 mechanism arms share the d8 BASELINE's stats
-            # for the same reason the eef schedule arms share round 1's -- the comparison
-            # requires identical normalisation, and per-arm stats would be a second
-            # uncontrolled difference.
+            # policy wrong. So a named arm inherits round 1's stats only when eef=True.
+            # `own_norm_stats` opts out for an arm whose DISTRIBUTION differs (the co-train
+            # mixture, the one-phase arms with their DROID `assets` override); an explicit
+            # `norm_stats_from_name` always wins -- the comparison arms must share identical
+            # normalisation, and per-arm stats would be a second uncontrolled difference.
             norm_stats_from=(norm_stats_from_name if norm_stats_from_name
-                             else (_AXIS_ROUND1_NAME if (name and eef) else None)),
+                             else (None if own_norm_stats
+                                   else (_AXIS_ROUND1_NAME if (name and eef) else None))),
             roots_index=os.environ.get("AXIS_PRETRAIN_ROOTS_INDEX"),
             ranges_path=os.environ.get("AXIS_PRETRAIN_RANGES"),
             # 640x360 corpora only; a no-op on square frames. Declared per config so a corpus
             # swap cannot change what an existing config means -- see _center_crop_square.
             image_center_crop=center_crop,
+            sim_image_aug=sim_image_aug,
+            # One-phase co-train: the droid stage-2 baseline's OWN stats and asset id, resolved
+            # through OPENPI_DATA_HOME's cache -- byte-identical normalisation to the recipe the
+            # arm is measured against. Composes with own_norm_stats=True (norm_stats_from=None).
+            **({"assets": AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid")} if droid_assets else {}),
             # Schedule arms (name given) never take AWR weights from the environment; see the
             # docstring's `name` paragraph.
             awr_weights=None if name else os.environ.get("AXIS_PRETRAIN_AWR_WEIGHTS"),
@@ -1941,7 +2006,9 @@ def _axis_pretrain_config(
         # EEF variant inits from pi05_base (its EEF control-mode head); the joint variant from
         # pi05_droid (DROID-8D joint-velocity). Only weights are reused; norm stats are ours.
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            f"gs://openpi-assets/checkpoints/{'pi05_base' if eef else 'pi05_droid'}/params"
+            # `init_base` (one-phase base-init trio): swap ONLY the init to the pre-DROID
+            # generalist; everything else (incl. DROID norm stats) stays the droid recipe's.
+            f"gs://openpi-assets/checkpoints/{'pi05_base' if (eef or init_base) else 'pi05_droid'}/params"
         ),
         num_train_steps=num_train_steps,
         lr_schedule=(
@@ -1954,13 +2021,19 @@ def _axis_pretrain_config(
             )
             if paper
             else _optimizer.CosineDecaySchedule(
-                warmup_steps=max(1000, num_train_steps // 20),
+                warmup_steps=(warmup_override if warmup_override is not None
+                              else max(1000, num_train_steps // 20)),
                 peak_lr=2.5e-5,
                 decay_steps=num_train_steps,
                 decay_lr=2.5e-6,
             )
         ),
         batch_size=batch_size,   # GLOBAL; per-GPU = batch_size / fsdp_devices
+        # Retention is part of the ARM, not of the launch command: a run whose kept checkpoints
+        # depend on a flag someone remembered is a run whose artefacts cannot be reconstructed
+        # from its config. Left at TrainConfig's defaults when unset.
+        **({"save_interval": save_interval} if save_interval is not None else {}),
+        **({"keep_period": keep_period} if keep_period is not None else {}),
         fsdp_devices=8,          # 8x A100-80GB single node
         num_workers=8,
         # Appendix G initialises stage 2 from the EMA-SMOOTHED params, and openpi's
@@ -1969,8 +2042,8 @@ def _axis_pretrain_config(
         ema_decay=0.999 if paper else None,
         # Default: NO freeze_filter -> all params trainable (full weight). The `_vfz`
         # twins pass freeze_vision=True to freeze ONLY the SigLIP tower on top of the
-        # otherwise-identical full-weight recipe; see _pretrain_freeze_filter.
-        freeze_filter=_pretrain_freeze_filter(freeze_vision),
+        # otherwise-identical recipe; see _pretrain_freeze_filter.
+        freeze_filter=_pretrain_freeze_filter(freeze_vision, lora=lora),
     )
 
 
@@ -2174,6 +2247,256 @@ _CONFIGS = [
     _axis_pretrain_config(eef=True, paper=True, batch_size=64, num_train_steps=20_605,
                           center_crop=True, name="pi05_axis_drop_top", schedule_required=True,
                           expected_mode="drop_top"),
+    #
+    # ================= AXIS x DROID CO-TRAINING =================
+    #
+    # One concat dataset over BOTH corpora -- the 684 AXIS `__droid8d` task roots plus the
+    # converted DROID roots, named together in one roots index -- with the 25/75 mixture decided
+    # OFFLINE and replayed verbatim by `ScheduleSampler`. The mixture is an artifact, not an RNG
+    # outcome, for the same reason the round-2 arms are: a checkpoint's composition has to be
+    # readable off the run record rather than reconstructed from a seed.
+    #
+    # WHY BOTH HALVES CAN SHARE ONE INDEX SPACE. Both land in the DROID-8D layout -- state =
+    # 7 joint angles + gripper closedness in [0,1], action = 7 joint velocities (rad/s, clipped
+    # to the +-1 rad/s bound DROID's own controller enforces) + closedness. Verified numerically
+    # against the released pi05_droid norm stats: the AXIS gripper channel's std is 0.441 against
+    # DROID's 0.441, and the joint-velocity scales agree to within 0.6-1.2x. The two corpora are
+    # the same variable measured on two robots, not two variables sharing a tensor.
+    #
+    # WHY 25% AND NOT THE 35.3% THE FRAME COUNTS GIVE. Frames overstate what the sim half
+    # contributes: AXIS is 684 tasks x ~40 near-duplicate episodes (4,600 frames per distinct
+    # instruction), DROID is ~57,774 distinct real situations (120 frames per instruction) -- a
+    # 38x difference in redundancy. Sampling the natural ratio would spend a third of the gradient
+    # budget on a much narrower distribution. 25% is the deliberate first point, chosen to be
+    # raised rather than lowered: over-weighting sim pulls a REAL-robot checkpoint toward
+    # simulated visuals and dynamics, which is the one failure this run cannot afford.
+    #
+    # WHAT MUST EXIST BEFORE THIS NAME CAN LAUNCH (`create()` raises if the schedule is absent):
+    #   AXIS_PRETRAIN_ROOTS_INDEX  both corpora's roots, AXIS ids as-is, DROID shards above them
+    #   AXIS_PRETRAIN_RANGES       non-idle sample ranges covering both
+    #   data.schedule_path         the cotrain artifact, meta["mode"] == "cotrain"
+    #   assets                     OWN norm stats over the MIXTURE
+    #                              (scripts/compute_norm_stats.py --config-name pi05_axis_droid_cotrain)
+    #
+    # NORM STATS ARE THE MIXTURE'S OWN, NOT pi05_droid's, and that is a reversal worth stating.
+    # `pi05_droid_finetune` upstream says to reuse DROID's stats, and for a pure DROID fine-tune
+    # that is right. Here the sampled distribution is a 25/75 blend whose state half is visibly
+    # different -- the AXIS wrist sits ~1.7 rad from DROID's on joint 7 and pegs its limit on
+    # 3.7% of frames -- so DROID's stats would normalise one quarter of the batch against
+    # statistics it does not have. `AxisFrankaPretrainDataConfig` already made this call once for
+    # the same reason; this keeps it.
+    #
+    # BUDGET. At GLOBAL batch 64 the mixture draws 64 rows/step, 16 of them AXIS. 200,000 steps =
+    # 12.8M draws: 3.2M AXIS (0.44 epochs of the 7.34M non-idle rows) and 9.6M DROID (0.69 epochs
+    # of 13.95M). Still under one pass of either half, so the schedule draws WITHOUT replacement
+    # and no frame is seen twice. ~55 h at the measured 1.0 s/it.
+    #
+    # THE SCHEDULE ARTIFACT MUST MATCH. `ScheduleSampler.check_num_train_steps` refuses a budget
+    # longer than the artifact -- the torch loader would restart an exhausted sampler from row 0
+    # and quietly grant an extra pass. Changing this number means rebuilding
+    # `schedule_cotrain_sim25.npz` at the same --steps.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain", schedule_required=True, expected_mode="cotrain",
+        # Its own stats, over the 25/75 mixture. See the paragraph above on why this reverses
+        # both the named-arm default and `pi05_droid_finetune`'s advice.
+        own_norm_stats=True,
+        # 15, NOT the paper arms' 10: this run initialises from pi05_droid, which was produced at
+        # 15, and a horizon the init was not trained at changes what the checkpoint means without
+        # anything raising. `pi05_droid_finetune` upstream uses 16 for the same reason it uses a
+        # different budget -- it is a fine-tune of the released model, not a co-train beside it.
+        action_horizon=15,
+        # RETENTION. `max_to_keep=1` is hardcoded in `initialize_checkpoint_dir`, so each new save
+        # REPLACES the previous one and disk stays flat; `keep_period` is the exception list --
+        # every 50,000th step is retained permanently (50k, 100k). Saving every 10k therefore costs
+        # one rolling checkpoint plus the milestones, not ten.
+        #
+        # The saved `train_state` item carries `opt_state` and `ema_params` (`_split_params` moves
+        # only the inference params out), so a resume continues the optimiser instead of restarting
+        # Adam's moments from zero. Gradients themselves are not state and are not saved -- they are
+        # recomputed from the batch at every step.
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # ================= AXIS x DROID CO-TRAIN, LOSS-REWEIGHTING (AWR) ARM =================
+    #
+    # The plain-BC co-train with ONE change: an AWR-style per-frame loss weight on the AXIS
+    # half, the neutral 1.0 on every DROID frame. ONE config name for BOTH rewards -- the
+    # repo-wide rule: the config names the MECHANISM, the artifact names the reward
+    # (`awr_weights_cotrain_v2.json` / `awr_weights_cotrain_phase.json`), and the loader binds
+    # filename to the artifact's own reward_id at launch, so a v2 file cannot train under a
+    # phase name or vice versa. Everything else is inherited BY CONSTRUCTION, not convention:
+    #
+    #   same schedule artifact  -> byte-identical batches to the BC arm at every step
+    #   same init (pi05_droid), same horizon 15, same budget 200k x 64
+    #   same norm stats         -> norm_stats_from_name pins the BC arm's assets dir
+    #
+    # So `phase - bc` is attributable to the weighting and to nothing else. This is the round-1
+    # awr mechanism (loss reweighting, coverage- and order-neutral), not the round-2 one (row
+    # selection): the schedule already owns the rows, and the weights ride to the batch under
+    # their own key exactly as in the round-1 `elif weights_path` path.
+    #
+    # THE WEIGHTS ARTIFACT IS THE ARM. Built by scripts/build_cotrain_phase_weights.py, which
+    # (a) computes phase weights over the AXIS half, (b) assigns 1.0 to every DROID episode,
+    # (c) scales the sim half so its mean over the schedule's OWN drawn rows is exactly 1.0 --
+    # without (c), reweighting would also change the 25/75 effective gradient mixture, two
+    # treatments under one name. `awr_required=True` makes a launch that forgets the flag fail
+    # instead of training the BC control under this arm's name.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_awr", schedule_required=True, expected_mode="cotrain",
+        awr_required=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain",
+        action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # ---- the remaining co-train mechanisms. All four share the BC arm's init, horizon,
+    # budget and norm stats; each is identified by its artifact, bound by expected_mode and by
+    # the `schedule_cotrain_<variant>_<reward>` filename check in data_loader. The schedule
+    # artifacts come from scripts/build_cotrain_schedule_v2.py, which REPLAYS the BC mixture
+    # and re-decides only the sim slots -- the DROID half is asserted bit-identical at build.
+    #
+    # drop_top: sub-epoch budget makes this CLEANER than LIBERO's drop -- 16x200k draws fit in
+    # a single pass of both the full and the kept pool, so every drawn row appears at most once
+    # in BOTH arms and the comparison is pure selection, with no epoch-count confound.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_drop", schedule_required=True,
+        expected_mode="cotrain_drop_top",
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # drop_random: drop_top's control -- same cardinality, uniformly random keep. If drop_top
+    # does not beat this, the reward's ranking carries no signal at this keep fraction.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_drop_random", schedule_required=True,
+        expected_mode="cotrain_drop_random",
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # anneal: coverage-neutral -- same sim pool as BC, draw ORDER ramped toward high-weight
+    # rows late (index_schedule.lambda_at; ramp over the last 15% of 200k steps).
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_anneal", schedule_required=True,
+        expected_mode="cotrain_anneal",
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # cfg: the BC arm's OWN mix schedule (expected_mode "cotrain", byte-identical batches) plus
+    # a quality tag on sim prompts only; every DROID row is NO_TAG by the tag builder's
+    # construction. quality_required makes a launch that forgets the tags artifact fail rather
+    # than training the BC control under this name; the guard opening in create() admits the
+    # schedule+quality pair for expected_mode "cotrain" only.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_cfg", schedule_required=True, expected_mode="cotrain",
+        quality_required=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # cfg_vfz: the cfg arm with the SigLIP encoder frozen (MolmoBot-aligned scope). Same
+    # schedule, same tags artifact, same everything -- the freeze is the only difference, so
+    # cfg vs cfg_vfz isolates what vision adaptation contributes under the tag treatment.
+    # NOTE: the plain-BC co-train control trained UNFROZEN; a frozen-BC control is required
+    # before attributing cfg_vfz-vs-BC differences to the tag alone.
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_cfg_vfz", schedule_required=True, expected_mode="cotrain",
+        quality_required=True, freeze_vision=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # bc_vfz: the plain-BC co-train with the same SigLIP freeze -- the frozen pair's control.
+    # Same mix schedule, no quality tags; differs from pi05_axis_droid_cotrain ONLY in the
+    # freeze filter (and in reusing that arm's norm stats rather than recomputing them).
+    _axis_pretrain_config(
+        paper=True, batch_size=64, num_train_steps=200_000, center_crop=True,
+        name="pi05_axis_droid_cotrain_vfz", schedule_required=True, expected_mode="cotrain",
+        freeze_vision=True,
+        norm_stats_from_name="pi05_axis_droid_cotrain", action_horizon=15,
+        save_interval=10_000, keep_period=50_000,
+    ),
+    # ================= REALALIGN LoRA-DRAG STAGE 1 =================
+    # pi05_droid + LoRA adapters only, sim-only on the target-aligned REALALIGN corpus: drag
+    # the checkpoint toward the target environment without the capacity to forget the prior.
+    # Vision tower frozen (stage-1 only); OWN norm stats over the corpus (DROID's quantiles
+    # saturate 25-35% on four state dims, measured); fully-annealed cosine via paper=False;
+    # horizon 15 to match the pi05_droid init. No schedule: sim-only needs no mixture, and
+    # with no real half the quality tags are PURE quality bins -- the co-train tag's
+    # domain entanglement (Quality: 5 was 94% DROID rows) cannot exist here.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=20_000, center_crop=True,
+        name="pi05_axis_realign_lora_bc", lora=True, freeze_vision=True,
+        own_norm_stats=True, action_horizon=15,
+        save_interval=5_000,
+    ),
+    # cfg twin: identical plus the quality artifact; quality_required makes a launch that
+    # forgets --data.quality_path fail rather than train the bc arm under this name.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=20_000, center_crop=True,
+        name="pi05_axis_realign_lora_cfg", lora=True, freeze_vision=True,
+        quality_required=True,
+        norm_stats_from_name="pi05_axis_realign_lora_bc", action_horizon=15,
+        save_interval=5_000,
+    ),
+    # ONE-PHASE CO-TRAIN (2026-09-08). The droid stage-2 recipe byte-for-byte -- pi05_droid init,
+    # DROID norm stats (gs assets via the OPENPI_DATA_HOME cache), LoRA adapters, vision UNFROZEN,
+    # batch 64, cosine 2.5e-5 -> 2.5e-6 with the finetune's literal 1600 warmup, EMA off, horizon
+    # 15 -- with the real 10-task demos as the 48/64 batch anchor and the graft sim corpus as the
+    # 16/64 auxiliary. 21,333 steps puts real draws at 21,333 x 48 = 1,023,984 = the 16k x 64
+    # baseline's exposure, so "worse than baseline" can never mean "less real training".
+    # PURE CONDITIONING, no dropout (pi0.7-style): the cfg arm's artifact tags EVERY trainable
+    # row -- real "Domain: real\nQuality: 5", sim "Domain: sim\nQuality: <quintile>" -- and
+    # declares meta.pure_conditioning. Serve by appending "\nDomain: real\nQuality: 5", w=0.
+    # The bc twin replays the SAME schedule untagged; both arms apply MolmoBot-style photometric
+    # augmentation to SIM frames only (policies/sim_image_aug.py), so between the two arms the
+    # prompt text is once again the entire treatment.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_bc", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True,
+        schedule_required=True, expected_mode="cotrain",
+        save_interval=2_000, keep_period=2_000,
+    ),
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_cfg", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True,
+        schedule_required=True, expected_mode="cotrain", quality_required=True,
+        save_interval=2_000, keep_period=2_000,
+    ),
+    # BASE-INIT TRIO (2026-09-08): the same arms from pi05_base -- the pre-DROID generalist --
+    # to measure whether the AXIS sim data contributes more when the init carries no DROID
+    # prior. Norm stats stay DROID's (PI's own pi05_base->droid recipe pairs base init with
+    # DROID stats). base_realonly is the trio's baseline: the droid finetune recipe verbatim
+    # (16k x 64 over the real 10-task demos only, uniform row draw -- no schedule, no tags,
+    # no sim), so the sim contribution under base init is measured against its own reference.
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_base_bc", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True, init_base=True,
+        schedule_required=True, expected_mode="cotrain",
+        save_interval=2_000, keep_period=2_000,
+    ),
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=21_333, center_crop=True,
+        name="pi05_axis_onephase_base_cfg", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        sim_image_aug=True, init_base=True,
+        schedule_required=True, expected_mode="cotrain", quality_required=True,
+        save_interval=2_000, keep_period=2_000,
+    ),
+    _axis_pretrain_config(
+        batch_size=64, num_train_steps=16_000, center_crop=True,
+        name="pi05_axis_onephase_base_realonly", lora=True, action_horizon=15,
+        own_norm_stats=True, droid_assets=True, warmup_override=1_600,
+        init_base=True,
+        save_interval=2_000, keep_period=2_000,
+    ),
     # THE CONTROL `pi05_axis_drop_top` IS UNINTERPRETABLE WITHOUT. It trains on 30% of the rows, so
     # measured against the full-data baseline it changes two things at once -- which rows, and how
     # many. This arm keeps the SAME NUMBER of rows drawn uniformly at random, so the only remaining
