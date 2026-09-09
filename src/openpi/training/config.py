@@ -3454,6 +3454,26 @@ _CONFIGS = [
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2",
     ),
+    # cfgpt_s43_s2: SERVER-2 relocation of cfgpt_s43. The seed-43 cfg_phase pretrain finished
+    # on s3 (salvaged at 20604 after an ENOSPC final-write failure), but the owner reclaimed
+    # s3's GPUs for co-training, so the FT+eval run on s2 against the shipped params. Identical
+    # registration to cfgpt_s43 except every path resolves on s2; same tagged-twin convention
+    # (quality_tag=5, norm stats pinned to the untagged qual_v2 twin -- a tagged config must
+    # not run compute_norm_stats).
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgpt_s43_s2",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_s43/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
     # bc_s43: server-2 twin of pi05_axis_heldout_qual_v2_bc, init = the s2-local seed-43 bc
     # pretrain (libero5k_d8_bc_s43). Plain prompts, own norm stats (compute_norm_stats under
     # this name before training -- the qual_v2_bc convention).
