@@ -3428,6 +3428,63 @@ _CONFIGS = [
         quality_tag=5,
         norm_stats_from="pi05_axis_heldout_qual_v2",
     ),
+    # ---- SEED-43 FULL-PIPELINE REPEATS (training-seed controls for the three headline arms).
+    # Each twin is byte-identical to its original registration EXCEPT the init_path, which names
+    # the _s43 stage-1 checkpoint (the seed-43 repeat of the SAME pretrain recipe); the finetunes
+    # themselves pass --seed=43 on the CLI. Norm-stats provenance is deliberately UNCHANGED from
+    # the originals so seed is the only variable: the tagged twins pin the untagged
+    # pi05_axis_heldout_qual_v2 stats (a tagged config must not run compute_norm_stats -- its
+    # conditioning transform raises outside the training loader), and the plain bc twin computes
+    # its own stats under its own name exactly as qual_v2_bc did (deterministic over identical
+    # data, so byte-equal to the original's).
+    #
+    # cfgpt_s43: server-3 twin of pi05_axis_heldout_qual_v2_cfgpt_s3, init = the s3-local
+    # seed-43 cfg_phase pretrain (libero5k_d8_cfg_phase_s43).
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_cfgpt_s43",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/home/mqd/axis/libero_5k_v2/ckpts/pi05_axis_cfg_d8/"
+                  "libero5k_d8_cfg_phase_s43/20604/params",
+        roots_index="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.s3.roots.json",
+        ranges_path="/home/mqd/axis/heldout_ft/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
+    # bc_s43: server-2 twin of pi05_axis_heldout_qual_v2_bc, init = the s2-local seed-43 bc
+    # pretrain (libero5k_d8_bc_s43). Plain prompts, own norm stats (compute_norm_stats under
+    # this name before training -- the qual_v2_bc convention).
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bc_s43",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_s43/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+    ),
+    # bct_s43: server-2 twin of pi05_axis_heldout_qual_v2_bct (constant quality_tag=5) on the
+    # same seed-43 bc pretrain init as bc_s43.
+    _axis_heldout_multitask_config(
+        num_train_steps=heldout_epoch_steps(
+            5, "/disk/axis/render/splits_eef/qual_v2.ranges.json", HELDOUT_GATE_BATCH)
+        if os.path.exists("/disk/axis/render/splits_eef/qual_v2.ranges.json") else 1,
+        name="pi05_axis_heldout_qual_v2_bct_s43",
+        eef_action=False,
+        freeze_vision=False,
+        init_path="/disk/axis/libero_5k_v2/ckpts/pi05_axis_pretrain_d8_paper_5k/"
+                  "libero5k_d8_bc_s43/20604/params",
+        roots_index="/disk/axis/render/splits_eef/qual_v2.roots.json",
+        ranges_path="/disk/axis/render/splits_eef/qual_v2.ranges.json",
+        quality_tag=5,
+        norm_stats_from="pi05_axis_heldout_qual_v2",
+    ),
     # Vision-freeze A/B test: frozen SigLIP tower at a 7369-step (150-epoch) budget, matched
     # to the earlier UNFROZEN 7369-step vanilla (2/20) so the only difference is the frozen
     # image tower. If this lifts success well above 2/20, vision-tower overfitting on the
