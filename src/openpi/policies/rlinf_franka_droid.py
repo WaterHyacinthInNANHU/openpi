@@ -37,3 +37,45 @@ class RLinfFrankaDroidRepack(_transforms.DataTransformFn):
         if "prompt" in data:
             out["prompt"] = data["prompt"]
         return out
+
+
+POLICY_IMAGE_SIZE = 224
+
+
+def letterbox_square_224(image: np.ndarray, size: int = POLICY_IMAGE_SIZE) -> np.ndarray:
+    """Pad to a centred black square, then ``cv2.resize`` to 224x224 (INTER_LINEAR) -- the exact
+    ops the letterboxed training data was built with (RLinf ``FrankaEnv._pad_to_square`` +
+    ``cv2.resize``; ``tasl/tools/make_centercrop_dataset.py::pad224``). A ``size``x``size`` input
+    is returned untouched (identity at train time), a raw 1280x720 camera frame at serve time
+    becomes the same pixels the checkpoint saw. `ResizeImages` afterwards is then a no-op; its
+    antialiased jax resize would not reproduce cv2's output.
+    """
+    image = np.asarray(image)
+    if image.ndim < 3:
+        raise ValueError(f"expected (..., H, W, C), got shape {image.shape}")
+    h, w = image.shape[-3], image.shape[-2]
+    if h == size and w == size:
+        return image
+    import cv2  # openpi depends on opencv-python; imported lazily
+
+    def one(frame: np.ndarray) -> np.ndarray:
+        side = max(frame.shape[0], frame.shape[1])
+        sq = np.zeros((side, side, frame.shape[2]), dtype=frame.dtype)
+        y, x = (side - frame.shape[0]) // 2, (side - frame.shape[1]) // 2
+        sq[y:y + frame.shape[0], x:x + frame.shape[1]] = frame
+        return cv2.resize(sq, (size, size))
+
+    if image.ndim == 3:
+        return one(np.ascontiguousarray(image))
+    flat = image.reshape(-1, h, w, image.shape[-1])
+    out = np.stack([one(np.ascontiguousarray(f)) for f in flat])
+    return out.reshape(*image.shape[:-3], size, size, image.shape[-1])
+
+
+@dataclasses.dataclass(frozen=True)
+class LetterboxImages(_transforms.DataTransformFn):
+    """Apply `letterbox_square_224` to every image in `data["image"]` (after DroidInputs)."""
+
+    def __call__(self, data: dict) -> dict:
+        data["image"] = {k: letterbox_square_224(v) for k, v in data["image"].items()}
+        return data

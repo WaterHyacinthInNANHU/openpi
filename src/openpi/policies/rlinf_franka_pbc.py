@@ -58,10 +58,36 @@ def pbc_center_square(image: np.ndarray) -> np.ndarray:
     return image[..., y0 : y0 + side, x0 : x0 + side, :]
 
 
+POLICY_IMAGE_SIZE = 224
+
+
+def pbc_center_square_224(image: np.ndarray, size: int = POLICY_IMAGE_SIZE) -> np.ndarray:
+    """`pbc_center_square` followed by the SAME resize the training data was built with:
+    ``cv2.resize(square, (224, 224))`` (INTER_LINEAR), as in
+    ``tasl/tools/make_centercrop_dataset.py::crop224`` and RLinf ``FrankaEnv._crop_frame``.
+    A ``size``x``size`` input is returned untouched, so at train time (dataset frames are
+    already 224x224) this is the identity and at serve time a raw 1280x720 camera frame becomes
+    exactly the pixels the checkpoint saw. Do NOT leave the resize to `ResizeImages`: its
+    jax bilinear filter is antialiased and does not reproduce cv2's output.
+    """
+    sq = pbc_center_square(image)
+    h, w = sq.shape[-3], sq.shape[-2]
+    if h == size and w == size:
+        return sq
+    import cv2  # openpi depends on opencv-python; imported lazily to keep this module light
+
+    if sq.ndim == 3:
+        return cv2.resize(np.ascontiguousarray(sq), (size, size))
+    flat = sq.reshape(-1, h, w, sq.shape[-1])
+    out = np.stack([cv2.resize(np.ascontiguousarray(f), (size, size)) for f in flat])
+    return out.reshape(*sq.shape[:-3], size, size, sq.shape[-1])
+
+
 @dataclasses.dataclass(frozen=True)
 class PbcCenterCropImages(_transforms.DataTransformFn):
-    """Apply `pbc_center_square` to every image in `data["image"]` (after DroidInputs, before ResizeImages)."""
+    """Apply `pbc_center_square_224` to every image in `data["image"]` (after DroidInputs, before
+    ResizeImages, which then sees a 224x224 square and is a no-op)."""
 
     def __call__(self, data: dict) -> dict:
-        data["image"] = {k: pbc_center_square(v) for k, v in data["image"].items()}
+        data["image"] = {k: pbc_center_square_224(v) for k, v in data["image"].items()}
         return data
