@@ -1065,8 +1065,12 @@ class LeRobotRLinfDROIDDataConfig(DataConfigFactory):
             inputs=[*quality_inputs, rlinf_franka_droid.RLinfFrankaDroidRepack()]
         )
         # Joint *velocity* actions (DROID-native): no delta transform.
+        # LetterboxImages = pad-to-square + cv2 resize to 224, the ops the letterboxed training
+        # data was built with; identity on the 224x224 dataset frames, so training is unchanged
+        # and a raw camera frame at serve time gets exactly the training geometry.
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type),
+                    rlinf_franka_droid.LetterboxImages()],
             outputs=[droid_policy.DroidOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
