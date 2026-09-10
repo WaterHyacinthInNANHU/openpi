@@ -11,7 +11,7 @@
 | `on_a100/` | AXIS Server 3 上的 PBC/CFG 启动脚本、环境说明、prompt 预检 |
 | `on_labserver/` | labserver 上的 DROID 线训练启动/监控/上传脚本 |
 | `filter_v2_pack/`, `HOW_TO_ENABLE_IDLE_FILTER.md` | 静止帧过滤（训练侧数据准备） |
-| `eval/` | **tasl-1 评测栈**：面板、RTC、NUC 客户端、启动脚本、文档 —— 见 `eval/README.md` |
+| （已迁出）| **tasl-1 评测栈**（面板、RTC、NUC 客户端、启动脚本）现在住在 tasl-lab/RLinf 分支 `franka-fr3/realworld` 的 `tasl/` 下；RLinf 通过 submodule `third_party/openpi` 钉住本仓库的提交，实验 config 在那边 `tasl/experiments/`。本仓库只保留训练/serve 配置与策略变换。 |
 
 ---
 
