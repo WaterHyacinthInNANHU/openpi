@@ -4125,6 +4125,179 @@ _CONFIGS = [
         keep_period=2_000,
         log_interval=100,
     ),
+    # REALALIGN-FIXED stage-2 twins: byte-identical to the base_realonly / realign ft recipe,
+    # initialised from the FIXED stage-1 finals. DROID norm stats (gs assets, cache-resolved)
+    # keep train/serve normalisation identical to the baseline's.
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_bc",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_bc/realignfx_lora_bc/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_awr",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_awr/realignfx_lora_awr/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_drop",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_drop/realignfx_lora_drop/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_cfg",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+            quality_tag=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_cfg/realignfx_lora_cfg/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_cfg_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+            quality_tag=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_cfg/realignfx_lora_cfg_v2/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_realignfx_lora_franka_10task_cfg_v2_notag",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRLinfDROIDDataConfig(
+            repo_id="ZhixuLi/tasl-fr3-10task-pbc-v2",
+            base_config=DataConfig(prompt_from_task=True, filter_dict_path=COTRAIN_FILTER_JSON),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/localdisk/dihong_workspace/runs/ckpts/pi05_axis_realignfx_lora_cfg/realignfx_lora_cfg_v2/19999/params"),
+        num_train_steps=16_000,
+        batch_size=64,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=15,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_600, peak_lr=2.5e-5, decay_steps=16_000, decay_lr=2.5e-6),
+        checkpoint_base_dir="/localdisk/tasl_franka_finetune/checkpoints",
+        save_interval=2_000, keep_period=2_000, log_interval=100,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
